@@ -1,5 +1,9 @@
 UNOFFICIAL PATCH
 
+v1.4.2
+- Added a loading bar and a Cancel button when using the bucket fill tool
+- Improved tooltip for the pattern bucket tool 
+
 v1.4.1
 - Fixed terrain and pattern bucket tools freezing DD on mildly complex maps
 - Fixed the bucket tool cursor being displayed over some menus
