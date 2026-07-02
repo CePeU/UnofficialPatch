@@ -5,6 +5,7 @@
 var _g
 var _left_edge := 0.0
 var _right_edge := 99999.0
+var _bottom_edge := 99999.0
 var _edge_cache_frame := -1
 
 # Per-frame cache for _has_visible_popup. Without this, every caller of
@@ -63,6 +64,10 @@ func _is_mouse_over_ui_impl(listener_node: Node) -> bool:
 	# Dynamic left/right panel edges
 	_update_panel_edges(tree, vp_size)
 	if mouse.x < _left_edge or mouse.x > _right_edge:
+		return true
+
+	# Barre du bas (floatbar / barre d'état)
+	if mouse.y > _bottom_edge:
 		return true
 
 	# Extra UI rects registered by floating mod panels (e.g. SelectFilterBar),
@@ -185,6 +190,7 @@ func _update_panel_edges(tree: SceneTree, vp_size: Vector2) -> void:
 
 	_left_edge = 0.0
 	_right_edge = vp_size.x
+	_bottom_edge = vp_size.y
 
 	_scan_edge_panels(tree.root, vp_size, 0)
 
@@ -207,11 +213,16 @@ func _scan_edge_panels(node: Node, vp_size: Vector2, depth: int) -> void:
 				if rect.position.x + rect.size.x > vp_size.x - 5:
 					if rect.position.x < _right_edge:
 						_right_edge = rect.position.x
+			# Barre du bas : large (>50% largeur), courte (<20% hauteur), collée au
+			# bas du viewport. Détectée seulement si présente (sinon pas de marge).
+			if (child is Panel or child is PanelContainer) and rect.size.x > vp_size.x * 0.5 and rect.size.y < vp_size.y * 0.2 and rect.position.y + rect.size.y > vp_size.y - 5:
+				if rect.position.y < _bottom_edge:
+					_bottom_edge = rect.position.y
 		_scan_edge_panels(child, vp_size, depth + 1)
 
 
 func _has_visible_popup(node: Node, depth: int = 0) -> bool:
-	if depth > 4:
+	if depth > 16:
 		return false
 	if node is Popup and node.visible:
 		return true

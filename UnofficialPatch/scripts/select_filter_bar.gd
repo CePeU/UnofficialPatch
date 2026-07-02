@@ -42,6 +42,11 @@ var _bar_button    : CheckButton = null
 var _checks        := {}    # key -> CheckBox  (incl. _ALL_KEY and _TEXT_KEY)
 var _filter_menu   : PopupMenu = null
 var _dragging      := false
+# True tant qu'un bouton souris pressé HORS de la barre est maintenu : une
+# opération canvas (drag/rotation/resize d'asset, box-select, pan) est en cours.
+# On laisse alors passer les events à travers la barre (sinon DD perd le mouvement
+# quand le curseur la traverse et l'action s'interrompt).
+var _canvas_op     := false
 var _drag_offset   := Vector2.ZERO
 var _over_bar       := false
 var _was_shown      := false
@@ -184,26 +189,34 @@ func _on_input(event) -> void:
 		if _dragging:
 			_update_drag(m)
 			_consume()
+		elif _canvas_op:
+			return   # opération canvas en cours → passer à travers la barre
 		elif over:
-			_consume()   # block hover-selection under the bar
+			_consume()   # block hover-selection under the bar (au repos seulement)
 		return
 
 	# Mouse button
-	if event.button_index == BUTTON_LEFT:
-		if event.pressed:
-			if not over:
-				return
+	if event.pressed:
+		if not over:
+			_canvas_op = true   # press hors barre → DD démarre une opération canvas
+			return
+		# Press sur la barre
+		if event.button_index == BUTTON_LEFT:
 			_handle_press(m)
+		_consume()
+	else:
+		# Release
+		var was_canvas_op = _canvas_op
+		_canvas_op = false
+		if event.button_index == BUTTON_LEFT and _dragging:
+			_dragging = false
+			_save_settings()
 			_consume()
-		else:
-			if _dragging:
-				_dragging = false
-				_save_settings()
-				_consume()
-			elif over:
-				_consume()
-	elif over:
-		_consume()   # swallow other buttons over the bar
+			return
+		if was_canvas_op:
+			return   # relâchement d'une opération canvas → laisser DD la finaliser
+		if over:
+			_consume()
 
 
 func _handle_press(m: Vector2) -> void:

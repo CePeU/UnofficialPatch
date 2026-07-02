@@ -138,6 +138,17 @@ var _crop_op_label  : Label = null
 var _crop_op_syncing := false
 var _crop_feather_dirty_node : Node2D = null
 var _crop_feather_dirty_ms := 0
+# ── Prompt de confirmation : changement de texture externe (mod tiers) ───────
+# Quand un mod tiers (ex. ChangeObjectTexture via SetTexture) remplace la texture
+# d'un prop qui porte un crop / edge crop, on demande à l'utilisateur :
+#   OK     = reset du crop, on garde la nouvelle texture
+#   Cancel = on annule le changement de texture (la texture/crop d'origine revient)
+var _tex_swap_dialog = null
+var _tex_swap_keys : Array = []   # keys de props en attente de décision
+var _tex_swap_confirmed := false
+var _tex_swap_resolving := false
+var _tex_swap_new : Dictionary = {}   # key -> {texture,region_enabled,region_rect} (nouvelle texture mémorisée)
+var _ft_geo_tex_ref : Dictionary = {}   # key distort -> {texture,size,region_enabled,region_rect} (réf. pré-swap)
 const CROP_SOFT_DEFAULT := 15            # douceur par défaut (%) = dureté 0.85
 
 # ── Edge Crop (érosion du contour, type « shrink selection ») ───────────────
@@ -1430,6 +1441,9 @@ func update(_delta: float) -> void:
 	_ft4 = OS.get_ticks_usec()
 	_restore_edgecrop_from_store(not pattern_tool_active)
 	_ftp("restore_edgecrop", _ft4)
+	_ft4 = OS.get_ticks_usec()
+	_ft_watch_geometric(not pattern_tool_active)
+	_ftp("watch_geo", _ft4)
 
 	# Auto-disable FT si on vient de quitter le SelectTool (et qu'on n'est pas locké)
 	if _was_select_active and not select_active and _enabled and not _lock_mode:
@@ -5851,6 +5865,10 @@ func _restore_edgecrop_from_store(select_active: bool = true) -> void:
 		if _crop_feather_dirty_node == nd and is_instance_valid(nd): continue
 		var sprite = _get_sprite_node(nd)
 		if sprite == null: continue
+		if key in _tex_swap_keys: continue
+		if _ft_external_swap_detected(nd, sprite, key):
+			_begin_texture_swap_prompt()
+			continue
 		var cur = sprite.texture
 		if cur != null and cur.has_meta("_ft_crop_baked"):
 			if cur.get_meta("_ft_crop_sig", "") == _edgecrop_baked_sig(nd):
@@ -6188,6 +6206,346 @@ func _unbake_crop_texture(node: Node2D) -> void:
 	_shadow_restore(node)
 
 
+func _ft_external_swap_detected(nd: Node2D, sprite, key: String) -> bool:
+	# Vrai si la texture du Sprite a été remplacée de l'extérieur (ex. mod tiers
+	# ChangeObjectTexture via SetTexture) : texture courante NON cuite et
+	# différente de l'originale mise en cache (crop/edge crop partagent ce cache).
+	if key == "" or not _crop_orig_tex.has(key):
+		return false
+	var cur = sprite.get("texture")
+	if cur == null:
+		return false
+	if cur.has_meta("_ft_crop_baked"):
+		return false
+	return cur != _crop_orig_tex[key].get("texture", null)
+
+
+func _ft_swap_is_crop(key) -> bool:
+	# Un crop/edge crop est cuit dans la texture : le swap le détruit toujours
+	# (géré par le path crop). Le distort, lui, n'est concerné que si la taille
+	# de texture change.
+	return _g.ModMapData.get("_ft_crop", {}).has(key) or _g.ModMapData.get("_ft_edgecrop", {}).has(key)
+
+
+func _ft_geo_swap_detected(nd, sprite, key) -> bool:
+	# Vrai si un prop avec distort a vu sa texture remplacée de l'extérieur ET que
+	# la nouvelle texture a une taille différente (seul cas où le warp se décale).
+	if _ft_swap_is_crop(key):
+		return false
+	if not _ft_geo_tex_ref.has(key):
+		return false
+	var cur = sprite.get("texture")
+	if cur == null or cur.has_meta("_ft_crop_baked"):
+		return false
+	var ref = _ft_geo_tex_ref[key]
+	if cur == ref["texture"]:
+		return false
+	return _crop_real_size(sprite) != ref["size"]
+
+
+func _ft_watch_geometric(select_active: bool = true) -> void:
+	# Maintient une référence de texture pour chaque prop avec distort et détecte
+	# un changement de texture externe. Même taille => le distort se réapplique à
+	# l'identique (préservé silencieusement). Taille différente => prompt.
+	if not select_active:
+		return
+	if not _tex_swap_keys.empty():
+		return
+	if not _g.ModMapData.has("_ft_distort"):
+		return
+	var trigger = false
+	var dead = []
+	for key in _g.ModMapData["_ft_distort"].keys():
+		if _ft_swap_is_crop(key):
+			continue
+		var nd = _ft_node_from_key(key)
+		if nd == null or not is_instance_valid(nd):
+			dead.append(key)
+			continue
+		if not _is_plain_prop(nd):
+			continue
+		var sprite = _get_sprite_node(nd)
+		if sprite == null:
+			continue
+		var cur = sprite.texture
+		if cur == null or cur.has_meta("_ft_crop_baked"):
+			continue
+		if not _ft_geo_tex_ref.has(key):
+			_ft_geo_tex_ref[key] = {
+				"texture": cur, "size": _crop_real_size(sprite),
+				"region_enabled": sprite.region_enabled, "region_rect": sprite.region_rect,
+			}
+			continue
+		var ref = _ft_geo_tex_ref[key]
+		if cur == ref["texture"]:
+			continue
+		if _crop_real_size(sprite) == ref["size"]:
+			# Même taille : on préserve et on met à jour la référence.
+			ref["texture"] = cur
+			ref["region_enabled"] = sprite.region_enabled
+			ref["region_rect"] = sprite.region_rect
+		else:
+			trigger = true
+	for k in dead:
+		_ft_geo_tex_ref.erase(k)
+	if trigger:
+		_begin_texture_swap_prompt()
+
+
+func _ft_collect_swapped_keys() -> Array:
+	# Recense tous les props (crop ET edge crop) dont la texture vient d'être
+	# remplacée de l'extérieur. ChangeObjectTexture traite la multi-sélection en
+	# UN seul enregistrement d'historique : on regroupe donc la décision.
+	var out = []
+	for store_name in ["_ft_crop", "_ft_edgecrop"]:
+		if not _g.ModMapData.has(store_name):
+			continue
+		for key in _g.ModMapData[store_name].keys():
+			if key in out:
+				continue
+			var nd = _ft_node_from_key(key)
+			if nd == null or not is_instance_valid(nd):
+				continue
+			var sprite = _get_sprite_node(nd)
+			if sprite == null:
+				continue
+			if _ft_external_swap_detected(nd, sprite, key):
+				out.append(key)
+	# Props avec distort : seulement si la taille de texture a changé.
+	if _g.ModMapData.has("_ft_distort"):
+		for key in _g.ModMapData["_ft_distort"].keys():
+			if key in out:
+				continue
+			var gnd = _ft_node_from_key(key)
+			if gnd == null or not is_instance_valid(gnd):
+				continue
+			var gsprite = _get_sprite_node(gnd)
+			if gsprite == null:
+				continue
+			if _ft_geo_swap_detected(gnd, gsprite, key):
+				out.append(key)
+	return out
+
+
+func _ft_dialog_button_outline(btn) -> void:
+	# Ajoute un contour blanc de 1 px autour d'un bouton, en conservant le fond
+	# du thème quand c'est un StyleBoxFlat (sinon fond transparent).
+	if btn == null:
+		return
+	for st in ["normal", "hover", "pressed", "focus", "disabled"]:
+		var sb = btn.get_stylebox(st)
+		var nb
+		if sb is StyleBoxFlat:
+			nb = sb.duplicate()
+		else:
+			nb = StyleBoxFlat.new()
+			nb.bg_color = Color(0, 0, 0, 0)
+			nb.content_margin_left = 10
+			nb.content_margin_right = 10
+			nb.content_margin_top = 4
+			nb.content_margin_bottom = 4
+		nb.set_border_width_all(1)
+		nb.border_color = Color(1, 1, 1, 1)
+		btn.add_stylebox_override(st, nb)
+
+
+func _begin_texture_swap_prompt() -> void:
+	# Ouvre une seule boîte de confirmation pour tous les props swappés.
+	if not _tex_swap_keys.empty():
+		return
+	var keys = _ft_collect_swapped_keys()
+	if keys.empty():
+		return
+	_tex_swap_keys = keys
+	_tex_swap_confirmed = false
+	# Affiche l'asset D'ORIGINE derrière le popup : le mod tiers a déjà posé la
+	# nouvelle texture, donc on la mémorise (pour la réappliquer si l'utilisateur
+	# confirme) puis on re-cuit le crop sur la texture initiale.
+	for k in _tex_swap_keys:
+		var nd = _ft_node_from_key(k)
+		if nd == null or not is_instance_valid(nd):
+			continue
+		var sp = _get_sprite_node(nd)
+		if sp == null:
+			continue
+		_tex_swap_new[k] = {
+			"texture": sp.texture,
+			"region_enabled": sp.region_enabled,
+			"region_rect": sp.region_rect,
+		}
+		if _ft_swap_is_crop(k):
+			if _g.ModMapData.has("_ft_edgecrop") and _g.ModMapData["_ft_edgecrop"].has(k):
+				_bake_edgecrop_texture(nd)
+			else:
+				var pts = _load_crop_points(nd)
+				if pts.size() >= 3:
+					_bake_crop_texture(nd, pts)
+		else:
+			# Distort : on remet la texture d'origine ; _restore_distort_from_store
+			# la ré-habillera automatiquement à la frame suivante.
+			var ref = _ft_geo_tex_ref.get(k)
+			if ref != null:
+				sp.texture = ref["texture"]
+				sp.region_enabled = ref.get("region_enabled", false)
+				if ref.get("region_rect", null) is Rect2:
+					sp.region_rect = ref["region_rect"]
+	var dlg = ConfirmationDialog.new()
+	dlg.window_title = "Free Transform"
+	var n = keys.size()
+	if n == 1:
+		dlg.dialog_text = "This object has a Free Transform.\nChanging its texture will reset that transform.\n\nReset the transform and keep the new texture?\nCancel to revert the texture change."
+	else:
+		dlg.dialog_text = "%d objects have a Free Transform.\nChanging their texture will reset those transforms.\n\nReset the transforms and keep the new textures?\nCancel to revert the texture change." % n
+	dlg.get_ok().text = "Reset transform"
+	dlg.get_cancel().text = "Cancel"
+	_ft_dialog_button_outline(dlg.get_ok())
+	_ft_dialog_button_outline(dlg.get_cancel())
+	dlg.connect("confirmed", self, "_on_tex_swap_confirmed")
+	dlg.connect("popup_hide", self, "_on_tex_swap_dialog_hide")
+	_tex_swap_dialog = dlg
+	# Parentage identique aux autres popups du mod (cf. welcome_popup).
+	var windows = _g.Editor.get_node_or_null("Windows") if _g.Editor else null
+	if windows != null:
+		windows.add_child(dlg)
+	elif _g.World != null and is_instance_valid(_g.World):
+		_g.World.get_tree().root.add_child(dlg)
+	else:
+		_tex_swap_keys = []
+		_tex_swap_dialog = null
+		return
+	dlg.popup_centered()
+
+
+func _on_tex_swap_confirmed() -> void:
+	# OK = "Reset crop". NB : AcceptDialog appelle hide() PUIS emit("confirmed"),
+	# donc popup_hide arrive AVANT ce signal. On se contente ici de marquer le
+	# choix ; la résolution est différée (cf. _on_tex_swap_dialog_hide).
+	_tex_swap_confirmed = true
+
+
+func _on_tex_swap_dialog_hide() -> void:
+	# Déclenché sur OK, Cancel, ESC et fermeture. Comme "confirmed" est émis
+	# juste APRÈS popup_hide, on diffère d'une frame pour connaître le vrai choix.
+	if _tex_swap_resolving:
+		return
+	_tex_swap_resolving = true
+	call_deferred("_resolve_tex_swap")
+
+
+func _resolve_tex_swap() -> void:
+	if _tex_swap_confirmed:
+		# Reset : on garde la nouvelle texture et on supprime le FT (crop OU distort/shear).
+		for key in _tex_swap_keys:
+			var nd = _ft_node_from_key(key)
+			if nd != null and is_instance_valid(nd):
+				if _ft_swap_is_crop(key):
+					_reset_crop_keep_texture(nd, key)
+				else:
+					_ft_reset_geo_keep_texture(nd, key)
+	else:
+		# Annulation : retour à la texture (et donc au transform) d'origine.
+		_revert_texture_swap()
+	for key in _tex_swap_keys:
+		_ft_geo_tex_ref.erase(key)
+	_tex_swap_keys = []
+	_tex_swap_new = {}
+	_tex_swap_confirmed = false
+	_tex_swap_resolving = false
+	if _tex_swap_dialog != null and is_instance_valid(_tex_swap_dialog):
+		_tex_swap_dialog.queue_free()
+	_tex_swap_dialog = null
+
+
+func _reset_crop_keep_texture(nd: Node2D, key: String) -> void:
+	# Garde la NOUVELLE texture et supprime toute trace de crop/edge crop. Le
+	# rendu courant montre l'original re-cuit (cf. _begin_texture_swap_prompt) :
+	# on réapplique donc d'abord la nouvelle texture mémorisée.
+	var sprite = _get_sprite_node(nd)
+	if sprite != null and _tex_swap_new.has(key):
+		var nt = _tex_swap_new[key]
+		sprite.texture = nt["texture"]
+		sprite.region_enabled = nt.get("region_enabled", false)
+		if nt.get("region_rect", null) is Rect2:
+			sprite.region_rect = nt["region_rect"]
+	_tex_swap_new.erase(key)
+	for store_name in ["_ft_crop", "_ft_crop_soft", "_ft_crop_feather", "_ft_crop_opacity", "_ft_edgecrop"]:
+		if _g.ModMapData.has(store_name):
+			_g.ModMapData[store_name].erase(key)
+	_crop_orig_tex.erase(key)
+	# Ombre vanilla (child 0) : la rattacher à la nouvelle texture pour une
+	# silhouette correcte, puis oublier l'état d'origine mémorisé.
+	var shadow = _get_shadow_sprite(nd)
+	if shadow != null and is_instance_valid(shadow) and sprite != null:
+		shadow.region_enabled = sprite.region_enabled
+		if sprite.region_rect is Rect2:
+			shadow.region_rect = sprite.region_rect
+		shadow.texture = sprite.texture
+	_ft_shadow_orig.erase(key)
+	# Nettoie l'état d'édition si c'était le node crop courant.
+	if _crop_node == nd:
+		_crop_node = null
+		_crop_points = []
+		_crop_active_pt = -1
+
+
+func _ft_reset_geo_keep_texture(nd: Node2D, key: String) -> void:
+	# Garde la NOUVELLE texture et remet le prop à son transform vanilla
+	# (suppression distort + shear/scale/rotation). Le rendu courant montre
+	# l'original : on réapplique d'abord la nouvelle texture mémorisée.
+	var sprite = _get_sprite_node(nd)
+	if sprite != null and _tex_swap_new.has(key):
+		var nt = _tex_swap_new[key]
+		sprite.texture = nt["texture"]
+		sprite.region_enabled = nt.get("region_enabled", false)
+		if nt.get("region_rect", null) is Rect2:
+			sprite.region_rect = nt["region_rect"]
+	_tex_swap_new.erase(key)
+	# Restaure le transform pré-FT si capturé, sinon neutralise.
+	var orig = _g.ModMapData.get("_ft_orig_xform", {})
+	if orig.has(key):
+		var o = orig[key]
+		nd.transform = Transform2D(Vector2(o.xx, o.xy), Vector2(o.yx, o.yy), Vector2(o.ox, o.oy))
+	else:
+		nd.scale = Vector2(1, 1)
+		nd.rotation = 0.0
+	if _g.ModMapData.has("_ft_orig_xform"):
+		_g.ModMapData["_ft_orig_xform"].erase(key)
+	_clear_shear_transform(nd)
+	_remove_distort_shader(nd)
+
+
+func _revert_texture_swap() -> void:
+	# Le rendu d'origine est déjà affiché (restauré dans _begin_texture_swap_prompt).
+	# ChangeObjectTexture crée UN enregistrement d'historique pour toute la
+	# (multi)sélection : un seul Undo le défait proprement (pile cohérente).
+	var hist = _g.Editor.History if _g.Editor else null
+	if hist != null and hist.has_method("Undo"):
+		hist.Undo()
+	for key in _tex_swap_keys:
+		_tex_swap_new.erase(key)
+		var nd = _ft_node_from_key(key)
+		if nd == null or not is_instance_valid(nd):
+			continue
+		if _ft_swap_is_crop(key):
+			# Re-cuit immédiatement le crop (pas de frame non cropée).
+			if _g.ModMapData.has("_ft_edgecrop") and _g.ModMapData["_ft_edgecrop"].has(key):
+				_bake_edgecrop_texture(nd)
+			else:
+				var pts = _load_crop_points(nd)
+				if pts.size() >= 3:
+					_bake_crop_texture(nd, pts)
+		else:
+			# Distort : la texture d'origine est revenue (Undo) et reste affichée ;
+			# le distort se réapplique automatiquement. Force la texture par sécurité.
+			var ref = _ft_geo_tex_ref.get(key)
+			var sprite = _get_sprite_node(nd)
+			if sprite != null and ref != null:
+				sprite.texture = ref["texture"]
+				sprite.region_enabled = ref.get("region_enabled", false)
+				if ref.get("region_rect", null) is Rect2:
+					sprite.region_rect = ref["region_rect"]
+
+
 func _restore_crop_from_store(select_active: bool = true) -> void:
 	if not select_active: return
 	if not _g.ModMapData.has("_ft_crop"): return
@@ -6207,6 +6565,10 @@ func _restore_crop_from_store(select_active: bool = true) -> void:
 		if _crop_feather_dirty_node == nd and is_instance_valid(nd): continue
 		var sprite = _get_sprite_node(nd)
 		if sprite == null: continue
+		if key in _tex_swap_keys: continue
+		if _ft_external_swap_detected(nd, sprite, key):
+			_begin_texture_swap_prompt()
+			continue
 		var pts = _load_crop_points(nd)
 		# Déjà cuite ? On ne saute que si la signature correspond aux données
 		# stockées ; sinon (store modifié après cuisson) on re-cuit.

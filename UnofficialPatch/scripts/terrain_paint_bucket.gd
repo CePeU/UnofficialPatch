@@ -760,55 +760,17 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 	var px = terrain.TextureToWorld(Vector2(1, 1)) - origin_w  # ~ (BlobSize, BlobSize)
 	var shift = px * BUCKET_EDGE_SHIFT  # samples décalés bas-droite → fill décalé haut-gauche
 
-	# Passe 1 : couverture fractionnaire de chaque texel par la région.
-	#   - test rapide du centre (décalé) pour classer intérieur/extérieur ;
-	#   - sur les texels de bordure (voisinage 3×3 mixte), supersampling pour une
-	#     couverture fractionnaire → bords lissés (anti-aliasing).
+	# Couverture fractionnaire de chaque texel par la région, en UNE passe :
+	# rasterisation SCANLINE suréchantillonnée (SS×SS). Par sous-ligne on calcule
+	# les intersections des arêtes, on trie, on remplit en pair/impair, et on
+	# accumule par texel. Coût O(sous-lignes × sommets + sous-cellules remplies),
+	# au lieu de l'ancienne passe 2 qui faisait un point-in-polygon O(sommets) par
+	# sous-échantillon de chaque texel de bordure (≈ region_pts × edge_texels × SS²,
+	# le vrai goulot — 15 s sur une grande région à 2000+ points).
 	# Aucune extension binaire vers l'extérieur : le débordement vient uniquement
 	# du BUCKET_EDGE_SHIFT (réglable) et du filtrage linéaire du splat.
 	var SS = BUCKET_SUPERSAMPLE
-	var ins = []
-	ins.resize(w * h)
-	for yy in range(h):
-		for xx in range(w):
-			# Centre du texel = TextureToWorld(i) + px*0.5 : même convention que le
-			# Square Brush (texel i couvre le monde [i*64, (i+1)*64)). Sans le
-			# +px*0.5, on testait le coin NO du texel → débordement asymétrique SE.
-			var wc = terrain.TextureToWorld(Vector2(x0 + xx, y0 + yy)) + px * 0.5 + shift
-			ins[yy * w + xx] = _in_fill(wc, fill_polys)
-
-	var cov = []
-	cov.resize(w * h)
-	for yy in range(h):
-		for xx in range(w):
-			var self_in = ins[yy * w + xx]
-			var is_edge = false
-			for dy in range(-1, 2):
-				for dx in range(-1, 2):
-					if dx == 0 and dy == 0: continue
-					var nx = xx + dx
-					var ny = yy + dy
-					var nb = false
-					if nx >= 0 and nx < w and ny >= 0 and ny < h:
-						nb = ins[ny * w + nx]
-					if nb != self_in:
-						is_edge = true
-						break
-				if is_edge: break
-			if not is_edge:
-				cov[yy * w + xx] = 1.0 if self_in else 0.0
-			else:
-				# Coin haut-gauche du texel = TextureToWorld(i) (le texel couvre
-				# [i*64, (i+1)*64)). On échantillonne SS×SS à l'intérieur.
-				var c = terrain.TextureToWorld(Vector2(x0 + xx, y0 + yy))
-				var tl = c + shift
-				var hits = 0
-				for sy in range(SS):
-					for sx in range(SS):
-						var sp = tl + Vector2(px.x * (sx + 0.5) / SS, px.y * (sy + 0.5) / SS)
-						if _in_fill(sp, fill_polys):
-							hits += 1
-				cov[yy * w + xx] = float(hits) / float(SS * SS)
+	var cov = _compute_coverage(fill_polys, x0, y0, w, h, origin_w, px, shift, terrain, SS)
 
 	var _m = _tse()
 	if _m != null and _m.is_extended_active():
@@ -856,10 +818,97 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 
 	_paint_end()  # snapshot après + record undo
 	var inside_count = 0
-	for v in ins:
-		if v: inside_count += 1
+	for v in cov:
+		if v >= 0.999: inside_count += 1
 	print("[TerrainBucket] région=%d pts, bbox=%dx%d texels, centres intérieurs=%d, peints=%d — %d ms" % [
 		outer.size(), w, h, inside_count, painted, OS.get_ticks_msec() - t0])
+
+
+# Couverture fractionnaire [0..1] de chaque texel par la région (règle pair/impair
+# sur fill_polys), via rasterisation SCANLINE suréchantillonnée SS×SS. Pour chaque
+# sous-ligne : intersections des arêtes triées, remplissage pair/impair, et on
+# incrémente le compteur du texel propriétaire de chaque sous-cellule remplie.
+# Bien plus rapide que le point-in-polygon par sous-échantillon (qui était O(N) en
+# sommets de région). Repli per-texel exact si l'orientation du splat est inhabituelle.
+#
+# Sous-échantillon (sous-colonne cc, sous-ligne r), mêmes positions que l'ancien AA :
+#   centre = origin_w + (x0*px.x, y0*px.y) + shift + ((cc+0.5)*px.x/SS, (r+0.5)*px.y/SS)
+func _compute_coverage(polys: Array, x0: int, y0: int, w: int, h: int, origin_w: Vector2, px: Vector2, shift: Vector2, terrain, SS: int) -> Array:
+	var cov = []
+	cov.resize(w * h)
+
+	# Repli : orientation inhabituelle → supersampling exact par texel (lent mais rare).
+	if px.x <= 0.0 or px.y == 0.0:
+		for yy in range(h):
+			for xx in range(w):
+				var tl = terrain.TextureToWorld(Vector2(x0 + xx, y0 + yy)) + shift
+				var hits = 0
+				for sy in range(SS):
+					for sx in range(SS):
+						var sp = tl + Vector2(px.x * (sx + 0.5) / SS, px.y * (sy + 0.5) / SS)
+						if _in_fill(sp, polys):
+							hits += 1
+				cov[yy * w + xx] = float(hits) / float(SS * SS)
+		return cov
+
+	var counts = []
+	counts.resize(w * h)
+	for i in range(w * h):
+		counts[i] = 0
+
+	var sub_x = px.x / SS
+	var sub_y = px.y / SS
+	var bx0 = origin_w.x + x0 * px.x + shift.x  # bord gauche du texel col 0
+	var by0 = origin_w.y + y0 * px.y + shift.y  # bord haut du texel row 0
+	var max_cc = w * SS - 1
+	var sub_rows = h * SS
+	var xs = []
+	for r in range(sub_rows):
+		var wy = by0 + (r + 0.5) * sub_y
+		var trow = r / SS  # division entière → texel row
+		xs.clear()
+		for poly in polys:
+			var n = poly.size()
+			if n < 3: continue
+			var j = n - 1
+			for k in range(n):
+				var a = poly[k]
+				var b = poly[j]
+				if (a.y > wy) != (b.y > wy):
+					var t = (wy - a.y) / (b.y - a.y)
+					xs.append(a.x + t * (b.x - a.x))
+				j = k
+		if xs.size() < 2:
+			continue
+		xs.sort()
+		var base = trow * w
+		var p = 0
+		while p + 1 < xs.size():
+			# Sous-colonnes dont le centre tombe dans [xs[p], xs[p+1]) → intérieures.
+			# centre_x(cc) = bx0 + (cc+0.5)*sub_x
+			var cc0 = int(ceil((xs[p] - bx0) / sub_x - 0.5))
+			var cc1 = int(floor((xs[p + 1] - bx0) / sub_x - 0.5))
+			if bx0 + (cc1 + 0.5) * sub_x >= xs[p + 1]:
+				cc1 -= 1  # bord droit ouvert
+			if cc0 < 0: cc0 = 0
+			if cc1 > max_cc: cc1 = max_cc
+			# Accumulation par texel : pour chaque texel recouvert par [cc0..cc1],
+			# nombre de ses sous-colonnes dans l'intervalle (évite une division par
+			# sous-colonne).
+			var tc = cc0 / SS
+			while tc * SS <= cc1:
+				var lo = tc * SS
+				var hi = lo + SS - 1
+				if lo < cc0: lo = cc0
+				if hi > cc1: hi = cc1
+				counts[base + tc] += (hi - lo + 1)
+				tc += 1
+			p += 2
+
+	var inv = 1.0 / float(SS * SS)
+	for i in range(w * h):
+		cov[i] = float(counts[i]) * inv
+	return cov
 
 
 # Appartenance à la zone remplie : règle pair/impair sur la liste de polygones.

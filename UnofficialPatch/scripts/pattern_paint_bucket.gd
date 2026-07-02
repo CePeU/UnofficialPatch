@@ -35,9 +35,7 @@ var _prev_mode := -1
 
 # Curseur
 var _bucket_cursor_tex: Texture = null
-var _bucket_cursor_crossed_tex: Texture = null
 var _cursor_applied := false
-var _cursor_is_crossed := false
 
 # Géométrie
 const BARRIER_THICKNESS = 2.0       # px de chaque côté de la polyline. Doit être suffisant
@@ -46,6 +44,9 @@ const BARRIER_THICKNESS = 2.0       # px de chaque côté de la polyline. Doit �
                                     # voir comme juste tangentes, et la peinture passe à travers).
 const EDGE_SNAP_THRESHOLD = 16.0    # endpoint à <N px d'un bord → snappé sur le bord
 const EDGE_OVERSHOOT = 2.0          # quand on snappe, on dépasse de N px pour bien couper
+# Au-delà de N sommets, on saute le test d'auto-intersection O(n²) et on offsette
+# directement en bande unique (un path aussi dense est une courbe lisse).
+const SELF_INTERSECT_CHECK_MAX = 512
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -65,14 +66,6 @@ func _load_cursor_texture():
 		return
 	_bucket_cursor_tex = ImageTexture.new()
 	_bucket_cursor_tex.create_from_image(img, 0)
-
-	var path_crossed = _g.Root + "icons/bucket_cursor_crossed.png"
-	var img_crossed = Image.new()
-	if img_crossed.load(path_crossed) != OK:
-		print("[PatternPaintBucket] bucket_cursor_crossed.png not found at ", path_crossed)
-		return
-	_bucket_cursor_crossed_tex = ImageTexture.new()
-	_bucket_cursor_crossed_tex.create_from_image(img_crossed, 0)
 
 
 func _load_icon_texture(filename: String) -> Texture:
@@ -231,19 +224,16 @@ func _install_listener():
 
 # ── Curseur ──────────────────────────────────────────────────────────────────
 
-func _apply_cursor(crossed := false):
-	var tex = _bucket_cursor_crossed_tex if crossed else _bucket_cursor_tex
-	if tex != null:
-		Input.set_custom_mouse_cursor(tex, Input.CURSOR_ARROW, Vector2(0, 0))
+func _apply_cursor():
+	if _bucket_cursor_tex != null:
+		Input.set_custom_mouse_cursor(_bucket_cursor_tex, Input.CURSOR_ARROW, Vector2(0, 0))
 		_cursor_applied = true
-		_cursor_is_crossed = crossed
 
 
 func _remove_cursor():
 	if _cursor_applied:
 		Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
 		_cursor_applied = false
-		_cursor_is_crossed = false
 
 
 func _get_mouse_world_pos() -> Vector2:
@@ -421,11 +411,17 @@ func _build_barriers(include_patterns: bool) -> Dictionary:
 	var level = _get_current_level()
 	if level == null: return result
 
+	# Layer-cible où le pattern va être posé : on ignore les murs/paths/patterns
+	# situés SOUS ce layer (le pattern les recouvre, ils ne doivent pas le borner).
+	# null = filtre désactivé (on garde tout, comportement d'avant).
+	var min_layer = _get_pattern_target_layer()
+
 	# Murs (ouverts ou fermés)
 	var walls_node = level.get("Walls")
 	if walls_node != null:
 		for child in walls_node.get_children():
 			if not is_instance_valid(child): continue
+			if _is_below_layer(child, min_layer): continue
 			var pts_raw = child.get("Points")
 			if pts_raw == null or pts_raw.size() < 2: continue
 			# Les Points d'un Wall sont en espace LOCAL au nœud : appliquer son
@@ -443,6 +439,7 @@ func _build_barriers(include_patterns: bool) -> Dictionary:
 	if paths_node != null:
 		for child in paths_node.get_children():
 			if not is_instance_valid(child): continue
+			if _is_below_layer(child, min_layer): continue
 			var pts = _get_path_polyline(child)
 			if pts.size() < 2: continue
 			var loop = bool(child.get("Loop"))
@@ -451,11 +448,48 @@ func _build_barriers(include_patterns: bool) -> Dictionary:
 	# PatternShapes (filled polygons soustraits APRÈS — pour qu'ils coupent à travers les pièces)
 	if include_patterns:
 		for shape in _get_all_pattern_shapes():
+			if _is_below_layer(shape, min_layer): continue
 			var pts = _get_pattern_polygon(shape)
 			if pts.size() >= 3:
 				result.subs_last.append(pts)
 
 	return result
+
+
+# Layer où le PatternShapeTool posera la prochaine forme. null si indéterminable.
+func _get_pattern_target_layer():
+	var pat_tool = _g.Editor.Tools["PatternShapeTool"]
+	if pat_tool == null: return null
+	var al = pat_tool.get("ActiveLayer")
+	if al == null: return null
+	return int(al)
+
+
+# Le nœud est-il strictement SOUS le layer-cible ? Faux si min_layer est null ou
+# si le layer du nœud est indéterminable (on garde alors la barrière par sécurité).
+# Lecture du calque alignée sur path_fix : GetLayer() si dispo (patterns), sinon
+# _effective_z() (murs/paths — un Pathway n'expose PAS GetLayer/layer, il faut
+# sommer les z_index le long de la chaîne parente).
+func _is_below_layer(node, min_layer) -> bool:
+	if min_layer == null: return false
+	if not (node is CanvasItem): return false
+	var l = node.GetLayer() if node.has_method("GetLayer") else _effective_z(node)
+	return int(l) < min_layer
+
+
+# z effectif d'un CanvasItem : somme des z_index le long de la chaîne parente tant
+# que z_as_relative est vrai (modèle DD : sous-conteneurs z_as_relative=true qui
+# héritent du z de la couche). Comparable à PatternShapeTool.ActiveLayer
+# (= prop.ZIndex assigné à la création).
+func _effective_z(ci) -> int:
+	var z = 0
+	var n = ci
+	while n != null and n is CanvasItem:
+		z += n.z_index
+		if not n.z_as_relative:
+			break
+		n = n.get_parent()
+	return z
 
 
 # Offsette CHAQUE segment de la polyline en rectangle convexe (END_SQUARE) et
@@ -513,11 +547,20 @@ func _classify_polyline_barrier(pts: Array, loop: bool, out: Dictionary):
 	if pts.size() < 2: return
 
 	if not loop:
-		# Polyline ouverte : snap endpoints au bord de map, puis soustraction
-		# par segment (cf. _append_segment_quads).
+		# Polyline ouverte : snap endpoints au bord de map.
 		pts[0] = _snap_endpoint_to_map_edge(pts[0], EDGE_SNAP_THRESHOLD)
 		pts[pts.size() - 1] = _snap_endpoint_to_map_edge(pts[pts.size() - 1], EDGE_SNAP_THRESHOLD)
-		_append_segment_quads(pts, false, out)
+		# Bande unique : 1 barrière au lieu d'1 quad par segment. C'est LE levier de
+		# perf : un path courbe a des centaines de points interpolés → autant de
+		# clips Clipper avec le découpage par segment. On ne retombe sur ce découpage
+		# (robuste aux croisements) que si la polyline se croise vraiment.
+		if pts.size() <= SELF_INTERSECT_CHECK_MAX and _polyline_self_intersects(pts, false):
+			_append_segment_quads(pts, false, out)
+		else:
+			var strip = Geometry.offset_polyline_2d(pts, BARRIER_THICKNESS, Geometry.JOIN_MITER, Geometry.END_SQUARE)
+			for poly in strip:
+				if poly.size() >= 3:
+					out.subs_last.append(_to_array(poly))
 		return
 
 	# Loop qui se croise lui-même (plusieurs cellules tracées par un seul mur,
@@ -727,17 +770,26 @@ func _compute_region(mouse_world: Vector2, include_patterns: bool) -> Dictionary
 	b.closed_pairs.sort_custom(self, "_sort_closed_pairs_by_outer_area_desc")
 
 	var regions = [map_rect]
+	# Cache des AABB parallèle à `regions` : permet le rejet broad-phase dans
+	# _subtract_and_combine (cf. note là-bas). Indispensable pour éviter le gel
+	# de plusieurs minutes sur les maps très chargées en murs/paths.
+	var region_bbs = [_aabb(map_rect)]
 
 	# Étape 1 : pour chaque mur fermé simple, entrelacer subtract+add
 	for pair in b.closed_pairs:
-		regions = _subtract_and_combine(regions, pair.outer)
+		var res = _subtract_and_combine(regions, region_bbs, pair.outer)
+		regions = res.regions
+		region_bbs = res.bbs
 		if regions.size() == 0: break
 		if pair.inner != null:
 			regions.append(pair.inner)
+			region_bbs.append(_aabb(pair.inner))
 
 	# Étape 2 : soustraire polylines ouvertes, loops auto-intersectants, patterns
 	for s in b.subs_last:
-		regions = _subtract_and_combine(regions, s)
+		var res = _subtract_and_combine(regions, region_bbs, s)
+		regions = res.regions
+		region_bbs = res.bbs
 		if regions.size() == 0: break
 
 	# La plus petite région (filled-area via even-odd) contenant le clic.
@@ -765,15 +817,36 @@ func _sort_closed_pairs_by_outer_area_desc(a, b) -> bool:
 # Le résultat est un pool de polygones simples ré-injectables dans la soustraction
 # suivante : le clip suivant voit les trous précédents comme des fentes, ce qui
 # permet de détacher les pièces fermées (cellules) progressivement.
-func _subtract_and_combine(regions: Array, barrier: Array) -> Array:
+func _subtract_and_combine(regions: Array, region_bbs: Array, barrier: Array) -> Dictionary:
 	var new_regions = []
-	for r in regions:
+	var new_bbs = []
+	var bb = _aabb(barrier).grow(1.0)
+	for ri in range(regions.size()):
+		var r = regions[ri]
+		var r_bb = region_bbs[ri]
+		# Rejet broad-phase : si l'AABB du barrier ne touche pas celle de la région,
+		# le clip ne retirerait rien → on garde la région telle quelle sans Clipper.
+		if not r_bb.intersects(bb):
+			new_regions.append(r)
+			new_bbs.append(r_bb)
+			continue
 		var clipped = Geometry.clip_polygons_2d(r, barrier)
 		var combined = _combine_outer_holes(clipped)
 		for c in combined:
 			if c.size() >= 3:
-				new_regions.append(_to_array(c))
-	return new_regions
+				var cc = _to_array(c)
+				new_regions.append(cc)
+				new_bbs.append(_aabb(cc))
+	return {"regions": new_regions, "bbs": new_bbs}
+
+
+func _aabb(poly: Array) -> Rect2:
+	if poly.size() == 0:
+		return Rect2()
+	var r = Rect2(poly[0], Vector2.ZERO)
+	for i in range(1, poly.size()):
+		r = r.expand(poly[i])
+	return r
 
 
 # Prend la sortie brute de clip_polygons_2d (peut contenir des paires outer+hole
@@ -1074,19 +1147,14 @@ func update(_delta):
 
 	if _bucket_active and _is_pattern_tool_active():
 		_hide_preview()
+		# Seau uniquement sur le canvas ; souris normale au-dessus de l'UI (menus,
+		# panneaux, floatbar, popups). On peut peindre partout, donc plus de curseur
+		# « croix » et plus de test de zone fillable.
 		if ui_util != null and ui_util.is_mouse_over_ui(input_listener):
-			if _cursor_applied:
-				Input.set_custom_mouse_cursor(null, Input.CURSOR_ARROW)
-				_cursor_applied = false
-				_cursor_is_crossed = false
+			_remove_cursor()
 		else:
-			var over_zone = _is_over_fillable_zone()
-			if over_zone:
-				if not _cursor_applied or _cursor_is_crossed:
-					_apply_cursor(false)
-			else:
-				if not _cursor_applied or not _cursor_is_crossed:
-					_apply_cursor(true)
+			if not _cursor_applied:
+				_apply_cursor()
 
 	if _bucket_active:
 		var pat_tool = _g.Editor.Tools["PatternShapeTool"]

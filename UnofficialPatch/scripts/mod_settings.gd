@@ -505,6 +505,20 @@ func update(delta: float) -> void:
 		return
 	if _tt_panel == null or not is_instance_valid(_tt_panel):
 		return
+	# Garde anti-tooltip-fantome : si le tool mod_settings n'est plus actif
+	# (les deux panels Mod Settings et Mod Debug vivent sous ce tool), on
+	# force le tooltip a se cacher. Godot ne fire PAS mouse_exited quand un
+	# control devient invisible sous le curseur (cas du switch de tool ou la
+	# souris est encore sur une row), donc _on_tt_exit n'est jamais appele et
+	# le tooltip resterait colle a l'ecran, repositionne chaque frame.
+	var _active_tool = ""
+	if _g != null and _g.Editor != null and is_instance_valid(_g.Editor):
+		_active_tool = str(_g.Editor.get("ActiveToolName"))
+	if _active_tool != TOOL_ID:
+		if _tt_panel.visible:
+			_tt_panel.visible = false
+		_tt_hover_time = -1.0
+		return
 	if _tt_hover_time < 0.0:
 		return  # pas en hover
 	# Compte le delai avant affichage

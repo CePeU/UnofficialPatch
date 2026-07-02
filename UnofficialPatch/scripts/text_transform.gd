@@ -47,6 +47,16 @@ var _pbox_cur    := Vector2.ZERO
 var _mod_alt   := false
 var _mod_shift := false
 
+# ── Nudge (flèches) sur textes sélectionnés ───────────────────────────────────
+# nudge_tool (mod tiers) ignore les textes car ils ne sont pas dans
+# SelectTool.Selectables ; on gère donc le nudge des textes ici. Valeurs alignées
+# sur les défauts de nudge_tool : base / Shift = super / Shift+Ctrl = über.
+const NUDGE_BASE   := 2.0
+const NUDGE_SUPER  := 16.0
+const NUDGE_UBER   := 128.0
+const NUDGE_DELAY  := 0.175
+var _nudge_cooldown := 0.0
+
 # ── Undo stack ────────────────────────────────────────────────────────────────
 # Each entry: {type: "paste"|"delete", data: [...]}
 var _undo_stack : Array = []
@@ -381,6 +391,8 @@ func update(_delta: float) -> void:
 				_reset_cursor()
 	elif _mouse_over_ui:
 		_reset_cursor()
+
+	_handle_text_nudge(_delta)
 
 	_update_align_visibility()
 
@@ -1201,8 +1213,79 @@ func _finish_group_move() -> void:
 	_move_offsets.clear()
 
 
+# Récupère l'instance GDScript du mod Custom Snap (snappy_mod) si présent et
+# exposant get_snapped_position, sinon null. Le C# renvoie un wrapper, il faut
+# passer par get_ScriptInstance() pour atteindre le script GDScript réel.
+func _get_custom_snap_api():
+	var editor = _g.Editor if _g else null
+	if editor == null or not ("Tools" in editor): return null
+	var tools = editor.Tools
+	if not tools.has("snappy_mod"): return null
+	var snappy_tool = tools["snappy_mod"]
+	if snappy_tool == null or not snappy_tool.has_method("get_ScriptInstance"): return null
+	var script_instance = snappy_tool.get_ScriptInstance()
+	if script_instance == null: return null
+	if script_instance.has_method("get_snapped_position"): return script_instance
+	return null
+
+
+# Déplace les textes sélectionnés avec les flèches (mêmes actions que nudge_tool).
+# Ne fait rien s'il n'y a pas de texte sélectionné, si on édite en ligne, si on
+# est en plein drag, ou si le focus est sur un champ UI (saisie de texte).
+func _handle_text_nudge(delta: float) -> void:
+	if _nudge_cooldown > 0.0:
+		_nudge_cooldown -= delta
+	if _selected_texts.size() == 0: return
+	if _inline_edit_node != null or _group_moving or _active_handle >= 0: return
+	if _g.Editor.Toolset.get_focus_owner() != null: return
+	if _nudge_cooldown > 0.0: return
+
+	var step := NUDGE_BASE
+	if Input.is_key_pressed(KEY_SHIFT) and Input.is_key_pressed(KEY_CONTROL):
+		step = NUDGE_UBER
+	elif Input.is_key_pressed(KEY_SHIFT):
+		step = NUDGE_SUPER
+
+	var move := Vector2.ZERO
+	if InputMap.has_action("nudge_left") and Input.is_action_pressed("nudge_left"):
+		move.x -= step
+	if InputMap.has_action("nudge_right") and Input.is_action_pressed("nudge_right"):
+		move.x += step
+	if InputMap.has_action("nudge_up") and Input.is_action_pressed("nudge_up"):
+		move.y -= step
+	if InputMap.has_action("nudge_down") and Input.is_action_pressed("nudge_down"):
+		move.y += step
+
+	if move != Vector2.ZERO:
+		nudge_selected_texts(move)
+		_nudge_cooldown = NUDGE_DELAY
+
+
+# Décale tous les textes sélectionnés de `delta` (en pixels écran/rect_position).
+# Utilisé par le mod Nudge : les textes ne sont pas dans SelectTool.Selectables,
+# il faut donc les déplacer via notre propre sélection. Renvoie true si au moins
+# un texte a bougé. On resynchronise dataOnFocus + l'ancre après déplacement.
+func nudge_selected_texts(delta: Vector2) -> bool:
+	var moved := false
+	for t in _selected_texts:
+		if not is_instance_valid(t): continue
+		t.rect_position += delta
+		_refresh_dof(t)
+		moved = true
+	if moved:
+		_call_ttf_anchor_update()
+	return moved
+
+
 func _snap_pos(t: Control, pos: Vector2) -> Vector2:
 	if not _g.Editor.IsSnapping: return pos
+	# Custom Snap (snappy_mod) : quand le "custom snap" du mod ET le "snap to grid"
+	# vanilla de DD sont tous deux actifs, on snappe à la grille custom. La garde
+	# IsSnapping ci-dessus couvre déjà l'exigence vanilla ; il ne reste qu'à
+	# vérifier custom_snap_enabled et à router vers sa fonction de snapping.
+	var custom_snap = _get_custom_snap_api()
+	if custom_snap != null and custom_snap.custom_snap_enabled:
+		return custom_snap.get_snapped_position(pos)
 	var wu = _g.WorldUI
 	if wu and wu.has_method("GetSnappedPosition"):
 		return wu.GetSnappedPosition(pos)
