@@ -26,6 +26,10 @@ var ui_util
 var input_listener: Node
 const _META_KEY = "PatternPaintBucketListener"
 
+# Barre de progression + Annuler (opérations longues)
+var _progress_script = null
+var _filling := false
+
 # UI
 var _bucket_button: Button = null
 var _bucket_active := false
@@ -53,9 +57,21 @@ const SELF_INTERSECT_CHECK_MAX = 512
 
 func initialize():
 	_load_cursor_texture()
+	_progress_script = ResourceLoader.load(_g.Root + "library/progress_dialog.gd", "GDScript", true)
+	if _progress_script == null:
+		print("[PatternPaintBucket] WARNING: library/progress_dialog.gd introuvable; pas de barre de progression")
 	_inject_ui()
 	_install_listener()
 	print("[PatternPaintBucket] initialized")
+
+
+func _new_progress(title: String):
+	if _progress_script == null:
+		return null
+	var pg = _progress_script.new()
+	pg._g = _g
+	pg.start(title)
+	return pg
 
 
 func _load_cursor_texture():
@@ -128,7 +144,7 @@ func _inject_ui():
 
 	_bucket_button = Button.new()
 	_bucket_button.toggle_mode = true
-	_bucket_button.hint_tooltip = "Paint Bucket: click any region bounded by walls, paths, or map edges. Shift to include existing pattern shapes as barriers."
+	_bucket_button.hint_tooltip = "Paint Bucket: click any region bounded by walls, paths, or map edges.\nPress SHIFT to include existing pattern shapes as barriers.\nNote: walls, paths and patterns below the target layer are ignored (the pattern covers them),\nso set the active layer as high as possible before filling to speed up the computation."
 	var icon = _load_icon_texture("bucket.png")
 	if icon != null:
 		_bucket_button.icon = icon
@@ -759,15 +775,21 @@ func _segment_crosses_polygon(p1: Vector2, p2: Vector2, polygon: Array) -> bool:
 # (_eliminate_holes), qui produit des ponts non-croisants — contrairement à
 # l'ancien pontage par projection qui pouvait générer des polygones
 # auto-intersectants refusés par DrawPolygon ("Bad Polygon").
-func _compute_region(mouse_world: Vector2, include_patterns: bool) -> Dictionary:
+func _compute_region(mouse_world: Vector2, include_patterns: bool, progress = null) -> Dictionary:
 	var map_rect = _get_map_bounds_polygon()
 	if map_rect.size() < 3:
-		return {"outer": [], "holes": []}
+		return {"outer": [], "holes": [], "cancelled": false}
 
 	var b = _build_barriers(include_patterns)
 
 	# Tri des paires fermées par aire de l'outer décroissante (extérieur d'abord)
 	b.closed_pairs.sort_custom(self, "_sort_closed_pairs_by_outer_area_desc")
+
+	var total = b.closed_pairs.size() + b.subs_last.size()
+	if total <= 0:
+		total = 1
+	var done = 0
+	var tree = _g.Editor.get_tree()
 
 	var regions = [map_rect]
 	# Cache des AABB parallèle à `regions` : permet le rejet broad-phase dans
@@ -780,17 +802,29 @@ func _compute_region(mouse_world: Vector2, include_patterns: bool) -> Dictionary
 		var res = _subtract_and_combine(regions, region_bbs, pair.outer)
 		regions = res.regions
 		region_bbs = res.bbs
+		done += 1
 		if regions.size() == 0: break
 		if pair.inner != null:
 			regions.append(pair.inner)
 			region_bbs.append(_aabb(pair.inner))
+		if progress != null and progress.pump():
+			progress.set_progress(float(done) / total, "Clipping barriers… %d / %d" % [done, total])
+			yield(tree, "idle_frame")
+			if progress.cancelled:
+				return {"outer": [], "holes": [], "cancelled": true}
 
 	# Étape 2 : soustraire polylines ouvertes, loops auto-intersectants, patterns
 	for s in b.subs_last:
 		var res = _subtract_and_combine(regions, region_bbs, s)
 		regions = res.regions
 		region_bbs = res.bbs
+		done += 1
 		if regions.size() == 0: break
+		if progress != null and progress.pump():
+			progress.set_progress(float(done) / total, "Clipping barriers… %d / %d" % [done, total])
+			yield(tree, "idle_frame")
+			if progress.cancelled:
+				return {"outer": [], "holes": [], "cancelled": true}
 
 	# La plus petite région (filled-area via even-odd) contenant le clic.
 	# Les polygones sont déjà recombinés (trous pontés) par _subtract_and_combine.
@@ -805,7 +839,7 @@ func _compute_region(mouse_world: Vector2, include_patterns: bool) -> Dictionary
 			outer = r
 
 	# Holes vide : le polygone retourné encode déjà ses trous via bridge cuts.
-	return {"outer": outer, "holes": []}
+	return {"outer": outer, "holes": [], "cancelled": false}
 
 
 func _sort_closed_pairs_by_outer_area_desc(a, b) -> bool:
@@ -1101,16 +1135,33 @@ func _create_pattern_at(points: Array):
 # ── Fill ─────────────────────────────────────────────────────────────────────
 
 func _do_fill(mouse_world: Vector2, include_patterns: bool):
+	if _filling:
+		return
+	_filling = true
+	var progress = _new_progress("Filling pattern…")
 	var t_start = OS.get_ticks_msec()
-	var region = _compute_region(mouse_world, include_patterns)
-	var t_compute = OS.get_ticks_msec() - t_start
 
+	var region = _compute_region(mouse_world, include_patterns, progress)
+	if region is GDScriptFunctionState:
+		region = yield(region, "completed")
+
+	if progress != null:
+		var was_cancelled = region.get("cancelled") == true
+		progress.close()
+		if was_cancelled:
+			print("[PatternPaintBucket] Remplissage annulé par l'utilisateur")
+			_filling = false
+			return
+
+	var t_compute = OS.get_ticks_msec() - t_start
 	if region.outer.size() < 3:
 		print("[PatternPaintBucket] Aucune région trouvée (clic sur un mur ?) — %d ms" % t_compute)
+		_filling = false
 		return
 
 	print("[PatternPaintBucket] Région : %d points — calcul %d ms" % [region.outer.size(), t_compute])
 	_create_pattern_at(region.outer)
+	_filling = false
 
 
 # ── Input ─────────────────────────────────────────────────────────────────────

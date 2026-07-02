@@ -55,6 +55,10 @@ var _bucket_button: Button = null
 var _bucket_active := false
 var _region_geo = null  # instance de library/region_geometry.gd
 
+# Barre de progression + Annuler (opérations longues)
+var _progress_script = null
+var _filling := false
+
 # Curseur du mode Bucket (bucket_cursor.png, comme l'outil Pattern).
 var _bucket_cursor_tex: ImageTexture = null
 var _bucket_cursor_active := false
@@ -97,6 +101,10 @@ func initialize():
 		_region_geo._g = _g
 	else:
 		print("[TerrainSquareBrush] WARNING: could not load library/region_geometry.gd; bucket fill disabled")
+	# Barre de progression partagée (bucket fill long).
+	_progress_script = ResourceLoader.load(_g.Root + "library/progress_dialog.gd", "GDScript", true)
+	if _progress_script == null:
+		print("[TerrainSquareBrush] WARNING: library/progress_dialog.gd introuvable; pas de barre de progression")
 	_inject_ui()
 	_install_listener()
 	print("[TerrainSquareBrush] initialized")
@@ -160,7 +168,7 @@ func _inject_ui():
 	_square_brush_button = _make_mode_button(_load_icon_tex("icons/brush_square.png", 0.8), "S", \
 		"Square brush — paint squares aligned to the splat grid.\nSlider Size = splat pixels per side.", grp, MODE_SQUARE)
 	_bucket_button = _make_mode_button(_load_icon_tex("icons/bucket.png", 0.8), "B", \
-		"Bucket fill — fill the region (bounded by walls, paths and map edges) under the click.\nShift: also use pattern shapes as borders.", grp, MODE_BUCKET)
+		"Paint Bucket: click any region bounded by walls, paths, or map edges.\nPress SHIFT to include existing pattern shapes as barriers.", grp, MODE_BUCKET)
 
 	var row = HBoxContainer.new()
 	row.name = "TerrainBrushModeRow"
@@ -683,7 +691,27 @@ func _square_brush_paint(mouse_world: Vector2):
 # de géométrie partagée, puis écrit dans le splat tous les texels dont le centre
 # tombe dans la région. Résolution = grille splat (BlobSize), bords nets.
 
+func _new_progress(title: String):
+	if _progress_script == null:
+		return null
+	var pg = _progress_script.new()
+	pg._g = _g
+	pg.start(title)
+	return pg
+
+
+# Wrapper : garde de ré-entrance (ignore les clics pendant un remplissage en cours).
 func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
+	if _filling:
+		return
+	_filling = true
+	var st = _bucket_fill_impl(mouse_world, include_patterns)
+	if st is GDScriptFunctionState:
+		yield(st, "completed")
+	_filling = false
+
+
+func _bucket_fill_impl(mouse_world: Vector2, include_patterns: bool):
 	if _region_geo == null:
 		print("[TerrainBucket] region_geometry indisponible")
 		return
@@ -693,9 +721,19 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 	if splat_img == null: return
 
 	var t0 = OS.get_ticks_msec()
-	var region = _region_geo.compute_region(mouse_world, include_patterns)
+	var progress = _new_progress("Filling terrain…")
+
+	var region = _region_geo.compute_region_async(mouse_world, include_patterns, progress)
+	if region is GDScriptFunctionState:
+		region = yield(region, "completed")
+	if progress != null and region.get("cancelled") == true:
+		progress.close()
+		print("[TerrainBucket] Remplissage annulé par l'utilisateur")
+		return
+
 	var outer = region.outer
 	if outer.size() < 3:
+		if progress != null: progress.close()
 		print("[TerrainBucket] aucune région trouvée (clic sur un mur ?) — %d ms" % (OS.get_ticks_msec() - t0))
 		return
 
@@ -723,7 +761,9 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 		fill_polys = [outer]
 
 	var terrain_tool = _g.Editor.Tools["TerrainBrush"]
-	if terrain_tool == null: return
+	if terrain_tool == null:
+		if progress != null: progress.close()
+		return
 	var terrain_id = terrain_tool.get("TerrainID")
 	if terrain_id == null: terrain_id = 0
 
@@ -731,7 +771,9 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 	var splat_target = refs[0]
 	var splat_other = refs[1]
 	var channel = refs[2]
-	if splat_target == null: return
+	if splat_target == null:
+		if progress != null: progress.close()
+		return
 
 	var tw = splat_target.get_width()
 	var th = splat_target.get_height()
@@ -749,8 +791,6 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 	var x1 = int(clamp(ceil(max(t_min.x, t_max.x)) + 1, 0, tw - 1))
 	var y0 = int(clamp(floor(min(t_min.y, t_max.y)) - 1, 0, th - 1))
 	var y1 = int(clamp(ceil(max(t_min.y, t_max.y)) + 1, 0, th - 1))
-
-	_paint_start()  # snapshot avant
 
 	var w = x1 - x0 + 1
 	var h = y1 - y0 + 1
@@ -770,7 +810,19 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 	# Aucune extension binaire vers l'extérieur : le débordement vient uniquement
 	# du BUCKET_EDGE_SHIFT (réglable) et du filtrage linéaire du splat.
 	var SS = BUCKET_SUPERSAMPLE
-	var cov = _compute_coverage(fill_polys, x0, y0, w, h, origin_w, px, shift, terrain, SS)
+	var cov = _compute_coverage(fill_polys, x0, y0, w, h, origin_w, px, shift, terrain, SS, progress)
+	if cov is GDScriptFunctionState:
+		cov = yield(cov, "completed")
+	if cov == null:
+		if progress != null: progress.close()
+		print("[TerrainBucket] Remplissage annulé par l'utilisateur")
+		return
+	if progress != null:
+		progress.close()
+
+	# snapshot AVANT peinture (après la région + la couverture : une annulation en
+	# amont ne laisse donc aucun snapshot orphelin à nettoyer).
+	_paint_start()
 
 	var _m = _tse()
 	if _m != null and _m.is_extended_active():
@@ -833,13 +885,20 @@ func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
 #
 # Sous-échantillon (sous-colonne cc, sous-ligne r), mêmes positions que l'ancien AA :
 #   centre = origin_w + (x0*px.x, y0*px.y) + shift + ((cc+0.5)*px.x/SS, (r+0.5)*px.y/SS)
-func _compute_coverage(polys: Array, x0: int, y0: int, w: int, h: int, origin_w: Vector2, px: Vector2, shift: Vector2, terrain, SS: int) -> Array:
+# Renvoie null si l'utilisateur annule via la boîte de progression.
+func _compute_coverage(polys: Array, x0: int, y0: int, w: int, h: int, origin_w: Vector2, px: Vector2, shift: Vector2, terrain, SS: int, progress = null):
 	var cov = []
 	cov.resize(w * h)
+	var _tree = _g.Editor.get_tree()
 
 	# Repli : orientation inhabituelle → supersampling exact par texel (lent mais rare).
 	if px.x <= 0.0 or px.y == 0.0:
 		for yy in range(h):
+			if progress != null and progress.pump():
+				progress.set_progress(float(yy) / max(1, h), "Rasterizing… %d / %d" % [yy, h])
+				yield(_tree, "idle_frame")
+				if progress.cancelled:
+					return null
 			for xx in range(w):
 				var tl = terrain.TextureToWorld(Vector2(x0 + xx, y0 + yy)) + shift
 				var hits = 0
@@ -864,6 +923,11 @@ func _compute_coverage(polys: Array, x0: int, y0: int, w: int, h: int, origin_w:
 	var sub_rows = h * SS
 	var xs = []
 	for r in range(sub_rows):
+		if progress != null and progress.pump():
+			progress.set_progress(float(r) / max(1, sub_rows), "Rasterizing… %d / %d" % [r, sub_rows])
+			yield(_tree, "idle_frame")
+			if progress.cancelled:
+				return null
 		var wy = by0 + (r + 0.5) * sub_y
 		var trow = r / SS  # division entière → texel row
 		xs.clear()
