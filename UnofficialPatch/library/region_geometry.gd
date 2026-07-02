@@ -74,6 +74,70 @@ func compute_region(mouse_world: Vector2, include_patterns: bool) -> Dictionary:
 	return {"outer": outer, "holes": []}
 
 
+# Variante coroutine de compute_region : rafraîchit `progress` et yield
+# périodiquement pour garder l'UI réactive (barre + bouton Annuler). Le dictionnaire
+# renvoyé contient un champ "cancelled" (true si l'utilisateur a annulé). `progress`
+# peut être null (comportement identique à compute_region, sans UI). Conserve le
+# cache d'AABB (rejet broad-phase) de _subtract_and_combine.
+func compute_region_async(mouse_world: Vector2, include_patterns: bool, progress) -> Dictionary:
+	var map_rect = _get_map_bounds_polygon()
+	if map_rect.size() < 3:
+		return {"outer": [], "holes": [], "cancelled": false}
+
+	var b = _build_barriers(include_patterns)
+	b.closed_pairs.sort_custom(self, "_sort_closed_pairs_by_outer_area_desc")
+
+	var total = b.closed_pairs.size() + b.subs_last.size()
+	if total <= 0:
+		total = 1
+	var done = 0
+	var tree = _g.Editor.get_tree()
+
+	var regions = [map_rect]
+	var region_bbs = [_aabb(map_rect)]
+
+	for pair in b.closed_pairs:
+		var res = _subtract_and_combine(regions, region_bbs, pair.outer)
+		regions = res.regions
+		region_bbs = res.bbs
+		done += 1
+		if regions.size() == 0:
+			break
+		if pair.inner != null:
+			regions.append(pair.inner)
+			region_bbs.append(_aabb(pair.inner))
+		if progress != null and progress.pump():
+			progress.set_progress(float(done) / total, "Clipping barriers… %d / %d" % [done, total])
+			yield(tree, "idle_frame")
+			if progress.cancelled:
+				return {"outer": [], "holes": [], "cancelled": true}
+
+	for s in b.subs_last:
+		var res = _subtract_and_combine(regions, region_bbs, s)
+		regions = res.regions
+		region_bbs = res.bbs
+		done += 1
+		if regions.size() == 0:
+			break
+		if progress != null and progress.pump():
+			progress.set_progress(float(done) / total, "Clipping barriers… %d / %d" % [done, total])
+			yield(tree, "idle_frame")
+			if progress.cancelled:
+				return {"outer": [], "holes": [], "cancelled": true}
+
+	var outer = []
+	var outer_area = INF
+	for r in regions:
+		if r.size() < 3: continue
+		if not _point_in_polygon(mouse_world, r): continue
+		var a = _polygon_area(r)
+		if a < outer_area:
+			outer_area = a
+			outer = r
+
+	return {"outer": outer, "holes": [], "cancelled": false}
+
+
 # Test even-odd : le point est-il dans l'aire remplie du polygone ponté ?
 func point_in_region(point: Vector2, region_outer: Array) -> bool:
 	return _point_in_polygon(point, region_outer)
