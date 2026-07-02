@@ -23,6 +23,10 @@ var _g
 const BARRIER_THICKNESS = 2.0
 const EDGE_SNAP_THRESHOLD = 16.0   # endpoint à <N px d'un bord → snappé sur le bord
 const EDGE_OVERSHOOT = 2.0         # quand on snappe, on dépasse de N px pour bien couper
+# Au-delà de N sommets, on saute le test d'auto-intersection O(n²) et on offsette
+# directement en bande unique (un path aussi dense est une courbe lisse, pas un
+# tracé qui se croise).
+const SELF_INTERSECT_CHECK_MAX = 512
 
 
 # ── API publique ─────────────────────────────────────────────────────────────
@@ -36,15 +40,25 @@ func compute_region(mouse_world: Vector2, include_patterns: bool) -> Dictionary:
 	b.closed_pairs.sort_custom(self, "_sort_closed_pairs_by_outer_area_desc")
 
 	var regions = [map_rect]
+	# Cache des boîtes englobantes (AABB) parallèle à `regions` : permet à
+	# _subtract_and_combine de rejeter en broad-phase les barrières qui ne touchent
+	# pas une région (clip Clipper sauté → résultat identique mais des milliers de
+	# fois plus rapide sur les maps chargées en murs/paths).
+	var region_bbs = [_aabb(map_rect)]
 
 	for pair in b.closed_pairs:
-		regions = _subtract_and_combine(regions, pair.outer)
+		var res = _subtract_and_combine(regions, region_bbs, pair.outer)
+		regions = res.regions
+		region_bbs = res.bbs
 		if regions.size() == 0: break
 		if pair.inner != null:
 			regions.append(pair.inner)
+			region_bbs.append(_aabb(pair.inner))
 
 	for s in b.subs_last:
-		regions = _subtract_and_combine(regions, s)
+		var res = _subtract_and_combine(regions, region_bbs, s)
+		regions = res.regions
+		region_bbs = res.bbs
 		if regions.size() == 0: break
 
 	var outer = []
@@ -272,7 +286,17 @@ func _classify_polyline_barrier(pts: Array, loop: bool, out: Dictionary):
 	if not loop:
 		pts[0] = _snap_endpoint_to_map_edge(pts[0], EDGE_SNAP_THRESHOLD)
 		pts[pts.size() - 1] = _snap_endpoint_to_map_edge(pts[pts.size() - 1], EDGE_SNAP_THRESHOLD)
-		_append_segment_quads(pts, false, out)
+		# Bande unique : 1 barrière au lieu d'1 quad par segment. C'est LE levier de
+		# perf : un path courbe a des centaines de points interpolés → autant de
+		# clips Clipper avec le découpage par segment. On ne retombe sur ce découpage
+		# (robuste aux croisements) que si la polyline se croise vraiment.
+		if pts.size() <= SELF_INTERSECT_CHECK_MAX and _polyline_self_intersects(pts, false):
+			_append_segment_quads(pts, false, out)
+		else:
+			var strip = Geometry.offset_polyline_2d(pts, BARRIER_THICKNESS, Geometry.JOIN_MITER, Geometry.END_SQUARE)
+			for poly in strip:
+				if poly.size() >= 3:
+					out.subs_last.append(_to_array(poly))
 		return
 
 	if _polyline_self_intersects(pts, true):
@@ -305,15 +329,38 @@ func _sort_closed_pairs_by_outer_area_desc(a, b) -> bool:
 	return _polygon_area(a.outer) > _polygon_area(b.outer)
 
 
-func _subtract_and_combine(regions: Array, barrier: Array) -> Array:
+# Soustrait `barrier` de chaque région, recombine, et maintient un cache d'AABB
+# parallèle. Rejet broad-phase : une région dont l'AABB ne croise pas celle du
+# barrier ne peut pas être découpée → on la conserve telle quelle sans appeler
+# Clipper (le clip d'un polygone disjoint renverrait le sujet inchangé).
+func _subtract_and_combine(regions: Array, region_bbs: Array, barrier: Array) -> Dictionary:
 	var new_regions = []
-	for r in regions:
+	var new_bbs = []
+	var bb = _aabb(barrier).grow(1.0)
+	for ri in range(regions.size()):
+		var r = regions[ri]
+		var r_bb = region_bbs[ri]
+		if not r_bb.intersects(bb):
+			new_regions.append(r)
+			new_bbs.append(r_bb)
+			continue
 		var clipped = Geometry.clip_polygons_2d(r, barrier)
 		var combined = _combine_outer_holes(clipped)
 		for c in combined:
 			if c.size() >= 3:
-				new_regions.append(_to_array(c))
-	return new_regions
+				var cc = _to_array(c)
+				new_regions.append(cc)
+				new_bbs.append(_aabb(cc))
+	return {"regions": new_regions, "bbs": new_bbs}
+
+
+func _aabb(poly: Array) -> Rect2:
+	if poly.size() == 0:
+		return Rect2()
+	var r = Rect2(poly[0], Vector2.ZERO)
+	for i in range(1, poly.size()):
+		r = r.expand(poly[i])
+	return r
 
 
 func _combine_outer_holes(polygons_pool: Array) -> Array:
