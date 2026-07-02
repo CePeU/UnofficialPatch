@@ -1,4 +1,15 @@
-v1.4.0 - GitHub & Cartography Assets Release
+UNOFFICIAL PATCH
+
+v1.4.1
+- Fixed terrain and pattern bucket tools freezing DD on mildly complex maps
+- Fixed the bucket tool cursor being displayed over some menus
+- Fixed tooltips from the mod settings and debug menus sticking to the mouse even after closing the tools
+- Fixed transform actions being stopped by the filter floatbar
+- Added a warning when a transformed asset is swapped via Change Object Texture from uchideshi34 (will reset transform)
+- Text snapping now works with Custom Snap from Hieronymos
+- Text selection now works with the Nudge mod from JChunik
+
+v1.4.0 - GitHub Release
 - Added the ability to change level directly in the Level Settings Tool
 - Added the ability to clone a level with a right click in the Level Settings Tool (sets the correct level to clone in the popup)
 - Added a way to show the area covered by the current terrain slot by right clicking on the map in the terrain tool (Area Viewer)
