@@ -230,43 +230,6 @@ func make_lib_configs():
 
 #########################################################################################################
 ##
-## VERSION CHECKER FUNCTIONS
-##
-#########################################################################################################
-
-# Check whether a semver strng 2 is greater than string one. Only works on simple comparisons - DO NOT USE THIS FUNCTION OUTSIDE THIS CONTEXT
-func compare_semver(semver1: String, semver2: String) -> bool:
-
-	outputlog("compare_semver: semver1: " + str(semver1) + " semver2" + str(semver2),2)
-	var semver1data = get_semver_data(semver1)
-	var semver2data = get_semver_data(semver2)
-
-	if semver1data == null || semver2data == null : return false
-
-	if semver1data["major"] != semver2data["major"]:
-		return semver1data["major"] < semver2data["major"]
-	if semver1data["minor"] != semver2data["minor"]:
-		return semver1data["minor"] < semver2data["minor"]
-	if semver1data["patch"] != semver2data["patch"]:
-		return semver1data["patch"] < semver2data["patch"]
-	
-	return false
-
-# Parse the semver string
-func get_semver_data(semver: String):
-
-	var data = {}
-
-	if semver.split(".").size() < 3: return null
-
-	return {
-		"major": int(semver.split(".")[0]),
-		"minor": int(semver.split(".")[1]),
-		"patch": int(semver.split(".")[2].split("-")[0])
-	}
-
-#########################################################################################################
-##
 ## MAIN START FUNCTION
 ##
 #########################################################################################################
@@ -276,20 +239,12 @@ func start() -> void:
 
 	outputlog("ExportTraceImage Mod Has been loaded.")
 
-	# If _Lib is installed, use ModConfigApi and ModRegistry directly without
-	# registering via emit_signal (crashes when _g is not yet injected by UnofficialPatch)
+	# If _Lib is installed, use ModConfigApi directly without registering via
+	# emit_signal (crashes when _g is not yet injected by UnofficialPatch).
+	# NOTE: pas d'enregistrement UpdateChecker ici — l'enregistrement du suite
+	# est fait une seule fois dans Main.gd.
 	if Engine.has_signal("_lib_register_mod"):
 		make_lib_configs()
-		if _g != null and _g.get("API") != null and _g.API.get("ModRegistry") != null:
-			var _lib_info = _g.API.ModRegistry.get_mod_info("CreepyCre._Lib")
-			if _lib_info != null:
-				var _lib_mod_meta = _lib_info.get("mod_meta")
-				if _lib_mod_meta != null and compare_semver("1.1.2", _lib_mod_meta["version"]):
-					var update_checker = _g.API.UpdateChecker
-					update_checker.register(_g.API.UpdateChecker.builder()\
-						.fetcher(update_checker.github_fetcher("uchideshi34", "ExportTraceImage"))\
-						.downloader(update_checker.github_downloader("uchideshi34", "ExportTraceImage"))\
-						.build())
 
 	# Find the export window
 	var export_dialog = _g.Editor.Windows["Export"]

@@ -14,6 +14,10 @@ var _edge_cache_frame := -1
 var _popup_cache_frame := -1
 var _popup_cache_value := false
 
+# Cache par frame pour is_mouse_over_hud (walk d'arbre pour la floatbar).
+var _hud_cache_frame := -1
+var _hud_cache_value := false
+
 # Cache for find_aso_terrain_window. The full scene-tree scan it performs is
 # O(scene nodes) and was being run multiple times per frame by asset_cycle's
 # terrain sync (update() → _do_terrain_sync → _is_terrain_window_visible).
@@ -82,6 +86,51 @@ func _is_mouse_over_ui_impl(listener_node: Node) -> bool:
 						return true
 
 	return false
+
+
+# Comme is_mouse_over_ui, mais ajoute un hit-test direct des Controls interactifs du
+# HUD sous la souris (floatbar, boutons flottants, sliders…), en excluant les Controls
+# quasi plein écran (le canvas). Filet de sécurité pour les outils custom (bucket,
+# square brush) au cas où un élément flottant échapperait aux heuristiques de bords.
+func is_mouse_over_hud(listener_node: Node) -> bool:
+	if is_mouse_over_ui(listener_node):
+		return true
+	var frame = Engine.get_frames_drawn()
+	if frame == _hud_cache_frame:
+		return _hud_cache_value
+	_hud_cache_frame = frame
+	_hud_cache_value = false
+	var vp = listener_node.get_viewport()
+	var tree = listener_node.get_tree()
+	if vp == null or tree == null:
+		return false
+	var mouse = vp.get_mouse_position()
+	_hud_cache_value = _find_hud_control_at(tree.root, mouse, vp.size, 0) != null
+	return _hud_cache_value
+
+
+# DFS : le Control interactif le plus profond sous la souris gagne. Exclut le canvas
+# (Controls quasi plein écran) et les Controls en MOUSE_FILTER_IGNORE.
+func _find_hud_control_at(node: Node, mouse: Vector2, vp_size: Vector2, depth: int):
+	if depth > 8 or not is_instance_valid(node):
+		return null
+	if node is CanvasItem and not node.is_visible_in_tree():
+		return null
+	for child in node.get_children():
+		var found = _find_hud_control_at(child, mouse, vp_size, depth + 1)
+		if found != null:
+			return found
+	if node is Control and node.mouse_filter != Control.MOUSE_FILTER_IGNORE:
+		if node is Panel or node is PanelContainer or node is BaseButton \
+			or node is Slider or node is OptionButton or node is SpinBox \
+			or node is LineEdit:
+			var rect = node.get_global_rect()
+			var area = rect.size.x * rect.size.y
+			if rect.size.x > 4.0 and rect.size.y > 4.0 \
+				and area < vp_size.x * vp_size.y * 0.8 \
+				and rect.has_point(mouse):
+				return node
+	return null
 
 
 # Check if mouse is directly over a popup/window dialog

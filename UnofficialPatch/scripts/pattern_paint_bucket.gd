@@ -37,6 +37,12 @@ var _shape_buttons: Array = []
 var _shape_hbox = null
 var _prev_mode := -1
 
+# Options "Stopped by" (types de barrières qui bloquent le remplissage)
+var _opts_hbox = null
+var _cb_walls: CheckBox = null
+var _cb_paths: CheckBox = null
+var _cb_patterns: CheckBox = null
+
 # Curseur
 var _bucket_cursor_tex: Texture = null
 var _cursor_applied := false
@@ -144,7 +150,7 @@ func _inject_ui():
 
 	_bucket_button = Button.new()
 	_bucket_button.toggle_mode = true
-	_bucket_button.hint_tooltip = "Paint Bucket: click any region bounded by walls, paths, or map edges.\nPress SHIFT to include existing pattern shapes as barriers.\nNote: walls, paths and patterns below the target layer are ignored (the pattern covers them),\nso set the active layer as high as possible before filling to speed up the computation."
+	_bucket_button.hint_tooltip = "Paint Bucket: click any region bounded by the enabled barrier types (see the Stopped by options).\nNote: walls, paths and patterns below the target layer are ignored (the pattern covers them), so set the active layer as high as possible before filling to speed up the computation."
 	var icon = _load_icon_texture("bucket.png")
 	if icon != null:
 		_bucket_button.icon = icon
@@ -152,7 +158,40 @@ func _inject_ui():
 
 	_shape_hbox.add_child(_bucket_button)
 
+	_build_options_row(align)
+
 	print("[PatternPaintBucket] Bucket button injected in shape buttons row (%d existing buttons)" % _shape_buttons.size())
+
+
+# Rangée "Stopped by: [x] Walls [x] Paths [ ] Patterns", visible uniquement quand
+# l'outil bucket est actif.
+func _build_options_row(align):
+	_opts_hbox = HBoxContainer.new()
+	_opts_hbox.visible = false
+
+	var lbl = Label.new()
+	lbl.text = "Stopped by:"
+	_opts_hbox.add_child(lbl)
+
+	_cb_walls = CheckBox.new()
+	_cb_walls.text = "Walls"
+	_cb_walls.pressed = true
+	_opts_hbox.add_child(_cb_walls)
+
+	_cb_paths = CheckBox.new()
+	_cb_paths.text = "Paths"
+	_cb_paths.pressed = true
+	_opts_hbox.add_child(_cb_paths)
+
+	_cb_patterns = CheckBox.new()
+	_cb_patterns.text = "Patterns"
+	_cb_patterns.pressed = false
+	_opts_hbox.add_child(_cb_patterns)
+
+	# Insérer la rangée juste SOUS la rangée des boutons de forme/bucket.
+	var parent = _shape_hbox.get_parent()
+	parent.add_child(_opts_hbox)
+	parent.move_child(_opts_hbox, _shape_hbox.get_index() + 1)
 
 
 # ── Quand l'utilisateur clique un bouton de forme DD (rect/circle/polygon) ───
@@ -167,6 +206,8 @@ func _on_shape_button_pressed():
 
 func _on_bucket_toggled(pressed: bool):
 	_bucket_active = pressed
+	if _opts_hbox != null:
+		_opts_hbox.visible = pressed
 
 	var pat_tool = _g.Editor.Tools["PatternShapeTool"]
 	if pat_tool == null: return
@@ -413,7 +454,7 @@ func _snap_endpoint_to_map_edge(p: Vector2, threshold: float) -> Vector2:
 
 # ── Construction des barriers ────────────────────────────────────────────────
 
-func _build_barriers(include_patterns: bool) -> Dictionary:
+func _build_barriers(stop_walls: bool, stop_paths: bool, stop_patterns: bool) -> Dictionary:
 	# Retourne un Dictionary :
 	#   closed_pairs : liste de {outer: Array, inner: Array (ou null)} pour les
 	#       polylines fermées. Pour chaque mur fermé : on soustrait outer (offset
@@ -433,7 +474,7 @@ func _build_barriers(include_patterns: bool) -> Dictionary:
 	var min_layer = _get_pattern_target_layer()
 
 	# Murs (ouverts ou fermés)
-	var walls_node = level.get("Walls")
+	var walls_node = level.get("Walls") if stop_walls else null
 	if walls_node != null:
 		for child in walls_node.get_children():
 			if not is_instance_valid(child): continue
@@ -451,7 +492,7 @@ func _build_barriers(include_patterns: bool) -> Dictionary:
 			_classify_polyline_barrier(pts, loop, result)
 
 	# Paths (ouverts ou fermés)
-	var paths_node = level.get("Pathways")
+	var paths_node = level.get("Pathways") if stop_paths else null
 	if paths_node != null:
 		for child in paths_node.get_children():
 			if not is_instance_valid(child): continue
@@ -462,7 +503,7 @@ func _build_barriers(include_patterns: bool) -> Dictionary:
 			_classify_polyline_barrier(pts, loop, result)
 
 	# PatternShapes (filled polygons soustraits APRÈS — pour qu'ils coupent à travers les pièces)
-	if include_patterns:
+	if stop_patterns:
 		for shape in _get_all_pattern_shapes():
 			if _is_below_layer(shape, min_layer): continue
 			var pts = _get_pattern_polygon(shape)
@@ -775,71 +816,147 @@ func _segment_crosses_polygon(p1: Vector2, p2: Vector2, polygon: Array) -> bool:
 # (_eliminate_holes), qui produit des ponts non-croisants — contrairement à
 # l'ancien pontage par projection qui pouvait générer des polygones
 # auto-intersectants refusés par DrawPolygon ("Bad Polygon").
-func _compute_region(mouse_world: Vector2, include_patterns: bool, progress = null) -> Dictionary:
+func _compute_region(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool, progress = null) -> Dictionary:
 	var map_rect = _get_map_bounds_polygon()
 	if map_rect.size() < 3:
 		return {"outer": [], "holes": [], "cancelled": false}
-
-	var b = _build_barriers(include_patterns)
-
-	# Tri des paires fermées par aire de l'outer décroissante (extérieur d'abord)
-	b.closed_pairs.sort_custom(self, "_sort_closed_pairs_by_outer_area_desc")
-
-	var total = b.closed_pairs.size() + b.subs_last.size()
-	if total <= 0:
-		total = 1
-	var done = 0
 	var tree = _g.Editor.get_tree()
-
-	var regions = [map_rect]
-	# Cache des AABB parallèle à `regions` : permet le rejet broad-phase dans
-	# _subtract_and_combine (cf. note là-bas). Indispensable pour éviter le gel
-	# de plusieurs minutes sur les maps très chargées en murs/paths.
-	var region_bbs = [_aabb(map_rect)]
-
-	# Étape 1 : pour chaque mur fermé simple, entrelacer subtract+add
-	for pair in b.closed_pairs:
-		var res = _subtract_and_combine(regions, region_bbs, pair.outer)
-		regions = res.regions
-		region_bbs = res.bbs
-		done += 1
-		if regions.size() == 0: break
-		if pair.inner != null:
-			regions.append(pair.inner)
-			region_bbs.append(_aabb(pair.inner))
+	# 0–20 % : lecture/offset des barrières ; 20–90 % : fenêtre + union ;
+	# 90 % : extraction ; 95–100 % posés par _do_fill (création du pattern).
+	var solids = _build_barrier_solids(stop_walls, stop_paths, stop_patterns, progress, tree, 0.0, 0.2)
+	if solids is GDScriptFunctionState:
+		solids = yield(solids, "completed")
+	if solids == null:
+		return {"outer": [], "holes": [], "cancelled": true}
+	var solid_bbs = []
+	for spoly in solids:
+		solid_bbs.append(_aabb(spoly.outer))
+	var map_bb = _aabb(map_rect)
+	var eps = 1.0
+	var half = _initial_half_extent()
+	var box = Rect2(mouse_world - half, half * 2.0).clip(map_bb)
+	var out_outer = []
+	var out_holes = []
+	var iter = 0
+	# Union INCRÉMENTALE entre agrandissements de fenêtre : l'union étant
+	# commutative/associative, on repart des composantes déjà fusionnées et on
+	# n'ajoute que les nouveaux solides entrés dans la boîte — le coût total
+	# est celui d'UNE seule union (plus des re-fusions marginales), au lieu de
+	# tout refusionner à chaque doublement. La progression publiée est la
+	# fraction de solides intégrés, affinée par les fusions dans
+	# _union_components — plus de saut 0→90 % ni de plateau.
+	var included = {}
+	var comps = []
+	while true:
+		iter += 1
+		var full = _rect_covers(box, map_bb, eps)
+		var frac_before = float(included.size()) / max(1.0, float(solids.size()))
+		var added = 0
+		for i in range(solids.size()):
+			if included.has(i): continue
+			if solid_bbs[i].intersects(box):
+				included[i] = true
+				comps.append(_solid_to_comp(solids[i]))
+				added += 1
+		var frac_now = float(included.size()) / max(1.0, float(solids.size()))
 		if progress != null and progress.pump():
-			progress.set_progress(float(done) / total, "Clipping barriers… %d / %d" % [done, total])
+			progress.set_progress(0.2 + 0.7 * frac_before, "Computing fill region\u2026")
 			yield(tree, "idle_frame")
 			if progress.cancelled:
 				return {"outer": [], "holes": [], "cancelled": true}
-
-	# Étape 2 : soustraire polylines ouvertes, loops auto-intersectants, patterns
-	for s in b.subs_last:
-		var res = _subtract_and_combine(regions, region_bbs, s)
-		regions = res.regions
-		region_bbs = res.bbs
-		done += 1
-		if regions.size() == 0: break
-		if progress != null and progress.pump():
-			progress.set_progress(float(done) / total, "Clipping barriers… %d / %d" % [done, total])
-			yield(tree, "idle_frame")
-			if progress.cancelled:
+		if added > 0:
+			var merged = _union_components(comps, progress, tree, 0.2 + 0.7 * frac_before, 0.2 + 0.7 * frac_now)
+			if merged is GDScriptFunctionState:
+				merged = yield(merged, "completed")
+			if merged == null:
 				return {"outer": [], "holes": [], "cancelled": true}
+			comps = merged
+		var pool = _flatten_pool(comps)
+		var res = _extract_click_region(pool, map_rect, mouse_world)
+		if res.kind == "room":
+			# N'accepter la pièce que si elle tient entièrement DANS la fenêtre :
+			# une pièce qui atteint un bord intérieur de la boîte peut ignorer des
+			# barrières (cloisons/îlots) situées plus loin dans la pièce, dont
+			# l'AABB ne touche pas encore la boîte → il faut étendre et réessayer.
+			var rb = _aabb(res.outer)
+			if full or not _touches_interior_edge(rb, box, map_bb, eps):
+				out_outer = res.outer
+				out_holes = res.holes
+				break
+		elif res.kind == "wall":
+			out_outer = []
+			out_holes = []
+			break
+		else:
+			if full:
+				out_outer = res.outer
+				out_holes = res.holes
+				break
+		if full or iter > 24:
+			break
+		var c = box.position + box.size * 0.5
+		var ns = box.size * 2.0
+		box = Rect2(c - ns * 0.5, ns).clip(map_bb)
+	if progress != null:
+		progress.set_progress(0.9, "Extracting region\u2026")
+		yield(tree, "idle_frame")
+		if progress.cancelled:
+			return {"outer": [], "holes": [], "cancelled": true}
+	if out_outer.size() < 3:
+		return {"outer": [], "holes": [], "cancelled": false}
+	return {"outer": out_outer, "holes": out_holes, "cancelled": false}
 
-	# La plus petite région (filled-area via even-odd) contenant le clic.
-	# Les polygones sont déjà recombinés (trous pontés) par _subtract_and_combine.
-	var outer = []
-	var outer_area = INF
-	for r in regions:
-		if r.size() < 3: continue
-		if not _point_in_polygon(mouse_world, r): continue
-		var a = _polygon_area(r)
-		if a < outer_area:
-			outer_area = a
-			outer = r
 
-	# Holes vide : le polygone retourné encode déjà ses trous via bridge cuts.
-	return {"outer": outer, "holes": [], "cancelled": false}
+func _initial_half_extent() -> Vector2:
+	var world = _g.get("World") if _g != null else null
+	if world != null:
+		var cs = world.get("GridCellSize")
+		if cs != null:
+			return cs * 3.0
+	var mb = _aabb(_get_map_bounds_polygon())
+	return mb.size * 0.1 + Vector2(1, 1)
+
+
+# Ne conserve que les morceaux de région contenant le clic (au plus un, morceaux
+# disjoints). Si aucun ne le contient (transitoire : clic dans un trou en attente
+# d'un inner ré-ajouté), on ne prune pas — on garde tout par sécurité.
+func _keep_click_piece(regions: Array, region_bbs: Array, mouse_world: Vector2) -> Dictionary:
+	# Prune par AABB uniquement : on ne jette qu'un morceau dont la boîte englobante
+	# ne contient PAS le clic — toujours sûr (le clic lui est extérieur, et une
+	# soustraction ne fait que rétrécir/jamais fusionner). INDÉPENDANT DE L'ORDRE.
+	# (Ne PAS utiliser _point_in_polygon ici : les murs ouverts créent des polygones
+	# à bridge-cuts sur lesquels le test even-odd est peu fiable → jetait parfois le
+	# vrai morceau du clic, résultat dépendant de l'ordre des murs.)
+	var kr = []
+	var kb = []
+	for i in range(regions.size()):
+		if region_bbs[i].grow(1.0).has_point(mouse_world):
+			kr.append(regions[i])
+			kb.append(region_bbs[i])
+	if kr.size() > 0:
+		return {"regions": kr, "bbs": kb}
+	return {"regions": regions, "bbs": region_bbs}
+
+
+func _rect_to_poly(r: Rect2) -> Array:
+	return [r.position, r.position + Vector2(r.size.x, 0), r.end, r.position + Vector2(0, r.size.y)]
+
+
+func _rect_covers(box: Rect2, map_bb: Rect2, eps: float) -> bool:
+	return box.position.x <= map_bb.position.x + eps and box.position.y <= map_bb.position.y + eps \
+		and box.end.x >= map_bb.end.x - eps and box.end.y >= map_bb.end.y - eps
+
+
+func _touches_interior_edge(rb: Rect2, box: Rect2, map_bb: Rect2, eps: float) -> bool:
+	if box.position.x > map_bb.position.x + eps and rb.position.x <= box.position.x + eps:
+		return true
+	if box.end.x < map_bb.end.x - eps and rb.end.x >= box.end.x - eps:
+		return true
+	if box.position.y > map_bb.position.y + eps and rb.position.y <= box.position.y + eps:
+		return true
+	if box.end.y < map_bb.end.y - eps and rb.end.y >= box.end.y - eps:
+		return true
+	return false
 
 
 func _sort_closed_pairs_by_outer_area_desc(a, b) -> bool:
@@ -1095,7 +1212,87 @@ func _find_immediate_parent_idx(p_idx: int, polygons: Array) -> int:
 
 # ── Création du pattern shape ────────────────────────────────────────────────
 
-func _create_pattern_at(points: Array):
+func _draw_pattern_poly(ps_node, pts: Array, invert: bool, rot: float) -> bool:
+	var node_id = _g.World.nextNodeID
+	ps_node.DrawPolygon(pts, invert)
+	if _g.World.HasNodeID(node_id):
+		var shape = _g.World.GetNodeByID(node_id)
+		if shape.has_method("SetNewRotation"):
+			shape.SetNewRotation(rot)
+		_g.World.AssignNodeID(shape)
+		return true
+	return false
+
+
+# Dédoublonne les sommets consécutifs et supprime les « darts » (pointes de
+# largeur nulle : le contour part et revient sur la même direction), artefacts
+# des fusions Clipper des quads de segments. Ne modifie pas la forme utile.
+func _clean_ring_basic(poly: Array) -> Array:
+	var pts = []
+	for p in poly:
+		if pts.size() == 0 or pts[pts.size() - 1].distance_to(p) > 0.03:
+			pts.append(p)
+	while pts.size() >= 2 and pts[0].distance_to(pts[pts.size() - 1]) <= 0.03:
+		pts.pop_back()
+	var changed = true
+	while changed and pts.size() >= 3:
+		changed = false
+		var n = pts.size()
+		for i in range(n):
+			var b = pts[i]
+			var ab = (pts[(i - 1 + n) % n] - b)
+			var cb = (pts[(i + 1) % n] - b)
+			if ab.length() < 0.03 or cb.length() < 0.03:
+				pts.remove(i)
+				changed = true
+				break
+			# pointe : les deux arêtes repartent quasi dans la même direction
+			if ab.normalized().dot(cb.normalized()) > 0.999:
+				pts.remove(i)
+				changed = true
+				break
+	return pts
+
+
+# Décompose un anneau qui repasse par (quasi) le même sommet — pincement,
+# artefact fréquent des fusions Clipper — en sous-anneaux strictement simples.
+func _split_pinched_ring(pts: Array) -> Array:
+	var n = pts.size()
+	if n < 3: return []
+	for i in range(n):
+		for j in range(i + 2, n):
+			if i == 0 and j == n - 1: continue
+			if pts[i].distance_to(pts[j]) <= 0.03:
+				var r1 = []
+				for k in range(i, j): r1.append(pts[k])
+				var r2 = []
+				for k in range(j, n): r2.append(pts[k])
+				for k in range(0, i): r2.append(pts[k])
+				return _split_pinched_ring(r1) + _split_pinched_ring(r2)
+	return [pts]
+
+
+# Nettoie un anneau et le rend triangulable : dédoublonnage + darts, et si la
+# triangulation échoue encore, décomposition des pincements en lobes (chaque
+# lobe sera dessiné comme un pattern à part — une région pincée EST deux zones
+# reliées par un point). Renvoie la liste des anneaux exploitables.
+func _ring_to_lobes(poly: Array) -> Array:
+	var c = _clean_ring_basic(poly)
+	if c.size() < 3: return []
+	if Geometry.triangulate_polygon(PoolVector2Array(c)).size() >= 3:
+		return [c]
+	var lobes = []
+	for r in _split_pinched_ring(c):
+		var rc = _clean_ring_basic(r)
+		if rc.size() >= 3 and _polygon_area(rc) > 1.0 \
+				and Geometry.triangulate_polygon(PoolVector2Array(rc)).size() >= 3:
+			lobes.append(rc)
+	if lobes.size() == 0:
+		lobes = [c]  # dernier recours : DrawPolygon avertira
+	return lobes
+
+
+func _create_pattern_at(points: Array, holes: Array = [], click_pt = null):
 	var pat_tool = _g.Editor.Tools["PatternShapeTool"]
 	if pat_tool == null: return
 
@@ -1111,56 +1308,86 @@ func _create_pattern_at(points: Array):
 	if rot_ctrl != null and rot_ctrl.has_method("get_value"):
 		rotation_val = deg2rad(rot_ctrl.get_value())
 
-	var node_id = _g.World.nextNodeID
-	# DrawPolygon crée la PatternShape via le Tool : elle hérite directement de la
-	# texture/couleur/rotation COURANTES du tool, exactement comme un tracé natif
-	# (rect/circle), qui peint correctement les patterns de TOUS les packs, custom
-	# inclus. On ne ré-applique donc PAS la texture nous-mêmes : l'ancien
-	# SetOptions(texture, ...) avec une texture résolue à la main écrasait la bonne
-	# texture par une fausse (null pour les custom packs, car ResourceLoader ne sait
-	# pas charger res://packs/...) → couleur unie. On laisse DrawPolygon gérer la
-	# texture et on ajuste seulement la rotation.
-	ps_node.DrawPolygon(points, false)
-
-	if _g.World.HasNodeID(node_id):
-		var patternshape = _g.World.GetNodeByID(node_id)
-		if patternshape.has_method("SetNewRotation"):
-			patternshape.SetNewRotation(rotation_val)
-		_g.World.AssignNodeID(patternshape)
-		print("[PatternPaintBucket] Pattern créé avec %d points (aire=%.0f)" % [points.size(), _polygon_area(points)])
-	else:
+	# DrawPolygon hérite de la texture/couleur/rotation COURANTES du tool. Les
+	# anneaux issus de Clipper peuvent être « faiblement simples » (darts,
+	# pincements) : nettoyés/décomposés en lobes triangulables. Les trous sont
+	# PONTÉS dans leur lobe via _eliminate_holes (ponts earcut non-croisants).
+	# NE PAS utiliser DrawPolygon(h, invertAction=true) : PatternShapes.AddPolygon
+	# IGNORE ce flag (la découpe vit dans PatternShapeTool) → chaque « trou »
+	# créait un 2e pattern PLEIN par-dessus.
+	var lobes = _ring_to_lobes(points)
+	if lobes.size() == 0:
+		print("[PatternPaintBucket] Erreur: région dégénérée")
+		return
+	var parts = []
+	for l in lobes:
+		parts.append({"outer": l, "holes": []})
+	for h in holes:
+		for hl in _ring_to_lobes(h):
+			var cen = _ring_centroid(hl)
+			for part in parts:
+				if _point_in_polygon(cen, part.outer):
+					part.holes.append(hl)
+					break
+	var made = 0
+	var total_holes = 0
+	for part in parts:
+		var poly = part.outer
+		if part.holes.size() > 0:
+			poly = _eliminate_holes(part.outer, part.holes)
+		if _draw_pattern_poly(ps_node, poly, false, rotation_val):
+			made += 1
+			total_holes += part.holes.size()
+	if made == 0:
 		print("[PatternPaintBucket] Erreur: impossible de créer le pattern")
+		return
+	print("[PatternPaintBucket] Pattern créé : %d forme(s), %d trou(s) ponté(s)" % [made, total_holes])
 
 
 # ── Fill ─────────────────────────────────────────────────────────────────────
 
-func _do_fill(mouse_world: Vector2, include_patterns: bool):
+func _do_fill(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool):
 	if _filling:
 		return
 	_filling = true
 	var progress = _new_progress("Filling pattern…")
+	if progress != null:
+		# Yield une frame pour que le 0 % soit réellement AFFICHÉ (sinon la
+		# première frame rendue arrive au premier pump(), déjà à quelques %).
+		progress.set_progress(0.0, "Computing fill region\u2026")
+		yield(_g.Editor.get_tree(), "idle_frame")
 	var t_start = OS.get_ticks_msec()
 
-	var region = _compute_region(mouse_world, include_patterns, progress)
+	var region = _compute_region(mouse_world, stop_walls, stop_paths, stop_patterns, progress)
 	if region is GDScriptFunctionState:
 		region = yield(region, "completed")
 
-	if progress != null:
-		var was_cancelled = region.get("cancelled") == true
+	if progress != null and region.get("cancelled") == true:
 		progress.close()
-		if was_cancelled:
-			print("[PatternPaintBucket] Remplissage annulé par l'utilisateur")
-			_filling = false
-			return
+		print("[PatternPaintBucket] Remplissage annulé par l'utilisateur")
+		_filling = false
+		return
 
 	var t_compute = OS.get_ticks_msec() - t_start
 	if region.outer.size() < 3:
+		if progress != null: progress.close()
 		print("[PatternPaintBucket] Aucune région trouvée (clic sur un mur ?) — %d ms" % t_compute)
 		_filling = false
 		return
 
+	if progress != null:
+		# Jalon rendu avant le pontage + DrawPolygon.
+		progress.set_progress(0.95, "Creating pattern\u2026")
+		yield(_g.Editor.get_tree(), "idle_frame")
+
 	print("[PatternPaintBucket] Région : %d points — calcul %d ms" % [region.outer.size(), t_compute])
-	_create_pattern_at(region.outer)
+	_create_pattern_at(region.outer, region.get("holes", []), mouse_world)
+	if progress != null:
+		# Deux frames pour que le 100 % soit visible avant fermeture.
+		progress.set_progress(1.0, "Done")
+		yield(_g.Editor.get_tree(), "idle_frame")
+		yield(_g.Editor.get_tree(), "idle_frame")
+		progress.close()
 	_filling = false
 
 
@@ -1173,7 +1400,7 @@ func _on_input(event) -> bool:
 	if not event.pressed: return false
 	if event.button_index != BUTTON_LEFT: return false
 
-	if ui_util != null and ui_util.is_mouse_over_ui(input_listener):
+	if ui_util != null and ui_util.is_mouse_over_hud(input_listener):
 		return false
 
 	var world_ui = _g.get("WorldUI")
@@ -1181,8 +1408,10 @@ func _on_input(event) -> bool:
 	var canvas_xform = world_ui.get_viewport().get_canvas_transform()
 	var mouse_world: Vector2 = canvas_xform.affine_inverse().xform(event.position)
 
-	var include_patterns = event.shift
-	_do_fill(mouse_world, include_patterns)
+	var stop_walls = _cb_walls.pressed if _cb_walls != null else true
+	var stop_paths = _cb_paths.pressed if _cb_paths != null else true
+	var stop_patterns = _cb_patterns.pressed if _cb_patterns != null else false
+	_do_fill(mouse_world, stop_walls, stop_paths, stop_patterns)
 	return true
 
 
@@ -1201,7 +1430,7 @@ func update(_delta):
 		# Seau uniquement sur le canvas ; souris normale au-dessus de l'UI (menus,
 		# panneaux, floatbar, popups). On peut peindre partout, donc plus de curseur
 		# « croix » et plus de test de zone fillable.
-		if ui_util != null and ui_util.is_mouse_over_ui(input_listener):
+		if ui_util != null and ui_util.is_mouse_over_hud(input_listener):
 			_remove_cursor()
 		else:
 			if not _cursor_applied:
@@ -1226,3 +1455,470 @@ func update(_delta):
 				_remove_cursor()
 				_show_preview()
 				return
+
+
+# Si `progress` est fourni : publie la lecture des barrières sur [p_from, p_to]
+# et pompe l'UI (yield) — c'était la phase silencieuse responsable du saut
+# initial de la barre. Renvoie null si annulé ; synchrone sans progress.
+func _build_barrier_solids(stop_walls: bool, stop_paths: bool, stop_patterns: bool, progress = null, tree = null, p_from := 0.0, p_to := 0.0):
+	var solids = []
+	var level = _get_current_level()
+	if level == null: return solids
+	var min_layer = _get_pattern_target_layer()
+
+	var items = []
+	var walls_node = level.get("Walls") if stop_walls else null
+	if walls_node != null:
+		for child in walls_node.get_children():
+			if is_instance_valid(child) and not _is_below_layer(child, min_layer):
+				items.append(["wall", child])
+	var paths_node = level.get("Pathways") if stop_paths else null
+	if paths_node != null:
+		for child in paths_node.get_children():
+			if is_instance_valid(child) and not _is_below_layer(child, min_layer):
+				items.append(["path", child])
+	if stop_patterns:
+		for shape in _get_all_pattern_shapes():
+			if not _is_below_layer(shape, min_layer):
+				items.append(["pattern", shape])
+
+	var total = max(1, items.size())
+	for idx in range(items.size()):
+		var kind = items[idx][0]
+		var node = items[idx][1]
+		if not is_instance_valid(node): continue
+		if kind == "wall":
+			var pts_raw = node.get("Points")
+			if pts_raw != null and pts_raw.size() >= 2:
+				var xform = node.get_global_transform()
+				var pts = []
+				for pp in pts_raw:
+					pts.append(xform.xform(pp))
+				_append_barrier_solids(pts, bool(node.get("Loop")), solids)
+		elif kind == "path":
+			var pts = _get_path_polyline(node)
+			if pts.size() >= 2:
+				_append_barrier_solids(pts, bool(node.get("Loop")), solids)
+		else:
+			var pts = _get_pattern_polygon(node)
+			if pts.size() >= 3:
+				solids.append({"outer": _ensure_ccw(_to_array(pts)), "holes": []})
+		if progress != null and progress.pump():
+			progress.set_progress(p_from + (p_to - p_from) * float(idx + 1) / float(total), "Reading barriers\u2026 (%d/%d)" % [idx + 1, total])
+			yield(tree, "idle_frame")
+			if progress.cancelled:
+				return null
+
+	return solids
+
+
+# Simplification Ramer–Douglas–Peucker. Les points lissés (Chaikin) des paths
+# sont quasi colinéaires : les décimer avant l'offset réduit fortement la
+# taille des polygones manipulés par Clipper (tolérance invisible < 1 px vs
+# une bande de ±2 px), donc le coût des fusions sur les grosses maps.
+const DECIMATE_EPS = 0.5
+
+func _decimate_polyline(pts: Array, eps: float) -> Array:
+	if pts.size() <= 2:
+		return pts
+	var keep = []
+	keep.resize(pts.size())
+	for i in range(pts.size()):
+		keep[i] = false
+	keep[0] = true
+	keep[pts.size() - 1] = true
+	var stack = [[0, pts.size() - 1]]
+	while stack.size() > 0:
+		var seg = stack.pop_back()
+		var a = seg[0]
+		var b = seg[1]
+		if b - a < 2: continue
+		var pa = pts[a]
+		var ab = pts[b] - pa
+		var ab_len = ab.length()
+		var best_d = -1.0
+		var best_i = -1
+		for i in range(a + 1, b):
+			var d = 0.0
+			if ab_len < 0.0001:
+				d = pts[i].distance_to(pa)
+			else:
+				d = abs((pts[i] - pa).cross(ab)) / ab_len
+			if d > best_d:
+				best_d = d
+				best_i = i
+		if best_d > eps:
+			keep[best_i] = true
+			stack.append([a, best_i])
+			stack.append([best_i, b])
+	var out = []
+	for i in range(pts.size()):
+		if keep[i]:
+			out.append(pts[i])
+	return out
+
+
+# Convertit la sortie d'offset_polyline_2d (anneaux CCW = contours, CW = trous)
+# en composantes {outer, holes} ajoutées à `out`. NE PAS retourner les anneaux
+# CW en solides : pour un tracé dense qui se recouvre (main levée, boucle
+# repassée — >SELF_INTERSECT_CHECK_MAX pts donc branche bande unique), l'offset
+# ressort le trou intérieur + des micro-trous entre les passes ; les retourner
+# en solides remplissait tout l'intérieur (clic → « wall », erratique).
+func _strip_to_components(strip, out: Array):
+	var outers = []
+	var holes = []
+	for poly in strip:
+		if poly.size() < 3: continue
+		if Geometry.is_polygon_clockwise(poly):
+			holes.append(_ensure_ccw(_to_array(poly)))
+		else:
+			outers.append(_to_array(poly))
+	var comps = []
+	for o in outers:
+		comps.append({"outer": o, "holes": []})
+	for h in holes:
+		var cen = _ring_centroid(h)
+		var best = -1
+		var best_a = INF
+		for ci in range(comps.size()):
+			if not _point_in_polygon(cen, comps[ci].outer): continue
+			var oa = _polygon_area(comps[ci].outer)
+			if oa < best_a:
+				best_a = oa
+				best = ci
+		if best >= 0:
+			comps[best].holes.append(h)
+	for c in comps:
+		out.append(c)
+
+
+func _append_barrier_solids(pts_in: Array, loop: bool, solids: Array):
+	var pts = []
+	for pp in pts_in:
+		pts.append(pp)
+	if pts.size() >= 2 and pts[0].distance_to(pts[pts.size() - 1]) < 2.0:
+		pts.pop_back()
+		loop = true
+	if pts.size() < 2: return
+	if pts.size() > 16:
+		pts = _decimate_polyline(pts, DECIMATE_EPS)
+	if not loop:
+		pts[0] = _snap_endpoint_to_map_edge(pts[0], EDGE_SNAP_THRESHOLD)
+		pts[pts.size() - 1] = _snap_endpoint_to_map_edge(pts[pts.size() - 1], EDGE_SNAP_THRESHOLD)
+		# Bande unique en UN appel Clipper. Depuis que les anneaux CW sont
+		# conservés comme trous (_strip_to_components), l'offset est correct
+		# même pour un tracé qui se croise : plus besoin du test O(n²) ni du
+		# quad-par-segment pour les polylines ouvertes.
+		var strip = Geometry.offset_polyline_2d(pts, BARRIER_THICKNESS, Geometry.JOIN_MITER, Geometry.END_SQUARE)
+		_strip_to_components(strip, solids)
+		return
+	# Boucle fermée : bande annulaire en UN appel END_JOINED (outer + trou =
+	# la pièce enclose, déjà sous la bonne forme pour l'extraction) au lieu
+	# d'un quad par segment fusionnés en O(n²) dans _union_components — c'était le
+	# point de gel des grosses maps. Repli quads seulement si l'anneau se
+	# croise (offset END_JOINED non fiable sur entrée auto-croisée).
+	if pts.size() <= SELF_INTERSECT_CHECK_MAX and _polyline_self_intersects(pts, true):
+		_append_solid_quads(pts, true, solids)
+		return
+	var band = Geometry.offset_polyline_2d(pts, BARRIER_THICKNESS, Geometry.JOIN_MITER, Geometry.END_JOINED)
+	_strip_to_components(band, solids)
+
+
+func _append_solid_quads(pts: Array, closed: bool, solids: Array):
+	var n = pts.size()
+	if n < 2: return
+	var seg_count = n if closed else n - 1
+	for i in range(seg_count):
+		var a = pts[i]
+		var b = pts[(i + 1) % n]
+		if a.distance_to(b) < 0.01: continue
+		var seg_offset = Geometry.offset_polyline_2d([a, b], BARRIER_THICKNESS, Geometry.JOIN_MITER, Geometry.END_SQUARE)
+		_strip_to_components(seg_offset, solids)
+
+
+func _ensure_ccw(ring: Array) -> Array:
+	if Geometry.is_polygon_clockwise(ring):
+		var r = ring.duplicate()
+		r.invert()
+		return r
+	return ring
+
+
+# Convertit un solide {outer, holes} en composante normalisée avec AABB.
+func _solid_to_comp(p: Dictionary) -> Dictionary:
+	var o = _ensure_ccw(p.outer)
+	var hs = []
+	for h in p.holes:
+		if h.size() >= 3:
+			hs.append(_ensure_ccw(h))
+	return {"outer": o, "holes": hs, "bb": _aabb(o)}
+
+
+# Fusionne les composantes jusqu'au point fixe (voir _merge_components pour la
+# sémantique trous). Renvoie la liste fusionnée, ou null si annulé. Si
+# `progress` est fourni : pompe l'UI et publie une progression réelle basée sur
+# les fusions effectuées, mappée sur [p_from, p_to] ; sans progress, purement
+# synchrone (aucun yield exécuté).
+func _union_components(comps: Array, progress = null, tree = null, p_from := 0.0, p_to := 0.0):
+	var total = max(1, comps.size())
+	var done = 0
+	var changed = true
+	var passes = 0
+	while changed and passes < 8:
+		passes += 1
+		changed = false
+		var i = 0
+		while i < comps.size():
+			var did = false
+			var j = i + 1
+			while j < comps.size():
+				if comps[i].bb.grow(0.5).intersects(comps[j].bb) and _filled_overlap(comps[i], comps[j]):
+					var m = _merge_components(comps[i], comps[j])
+					comps.remove(j)
+					if m.size() > 0:
+						comps[i] = m[0]
+						for k in range(1, m.size()):
+							comps.append(m[k])
+					else:
+						comps.remove(i)
+					changed = true
+					did = true
+					done += 1
+					if progress != null and progress.pump():
+						if p_to > p_from:
+							progress.set_progress(p_from + (p_to - p_from) * min(1.0, float(done) / float(total)), "Merging barriers\u2026 (%d/%d)" % [done, total])
+						yield(tree, "idle_frame")
+						if progress.cancelled:
+							return null
+					break
+				j += 1
+			if not did:
+				i += 1
+	return comps
+
+
+# Aplatit des composantes en pool typé pour _extract_click_region.
+func _flatten_pool(comps: Array) -> Array:
+	var pool = []
+	for c in comps:
+		pool.append({"ring": c.outer, "hole": false})
+		for h in c.holes:
+			pool.append({"ring": h, "hole": true})
+	return pool
+
+
+# Les aires PLEINES (outer − trous) de a et b se chevauchent-elles vraiment ?
+func _filled_overlap(a: Dictionary, b: Dictionary) -> bool:
+	var inter = Geometry.intersect_polygons_2d(a.outer, b.outer)
+	if inter == null or inter.size() == 0:
+		return false
+	var pieces = []
+	for p in inter:
+		if p.size() >= 3 and not Geometry.is_polygon_clockwise(p):
+			pieces.append(_to_array(p))
+	pieces = _clip_pieces(pieces, a.holes)
+	pieces = _clip_pieces(pieces, b.holes)
+	for p in pieces:
+		if _polygon_area(p) > 0.25:
+			return true
+	return false
+
+
+# Soustrait successivement chaque polygone de `clips` de chaque morceau de
+# `pieces` (broad-phase AABB). Les sorties CW (trou strictement inclus) sont
+# ignorées : impossible dans nos cas d'usage (composantes connexes), et les
+# ignorer ne fait que surestimer légèrement l'aire — sans danger.
+func _clip_pieces(pieces: Array, clips: Array) -> Array:
+	var cur = pieces
+	for c in clips:
+		if c.size() < 3: continue
+		var cbb = _aabb(c).grow(0.5)
+		var nxt = []
+		for s in cur:
+			if s.size() < 3: continue
+			if not cbb.intersects(_aabb(s)):
+				nxt.append(s)
+				continue
+			var res = Geometry.clip_polygons_2d(s, c)
+			for r in res:
+				if r.size() >= 3 and not Geometry.is_polygon_clockwise(r):
+					nxt.append(_to_array(r))
+		cur = nxt
+	return cur
+
+
+# Fusionne deux composantes dont les aires pleines se chevauchent.
+# Aire pleine résultante = (Oa − Ha) ∪ (Ob − Hb). Trous du résultat :
+#   • trous d'enceinte créés par Oa ∪ Ob (deux formes en C qui se referment),
+#   • morceaux de chaque trou de a hors du disque de b (ha − Ob) — c'est ici
+#     qu'un trou se SCINDE quand une cloison le traverse,
+#   • symétriquement (hb − Oa),
+#   • zones dans un trou de CHACUNE (ha ∩ hb).
+# Ces familles sont disjointes par construction. Chaque trou est rattaché au
+# plus petit outer qui contient son centroïde.
+func _merge_components(a: Dictionary, b: Dictionary) -> Array:
+	var m = Geometry.merge_polygons_2d(a.outer, b.outer)
+	var outers = []
+	var new_holes = []
+	for p in m:
+		if p.size() < 3: continue
+		if Geometry.is_polygon_clockwise(p):
+			new_holes.append(_ensure_ccw(_to_array(p)))
+		else:
+			outers.append(_to_array(p))
+	if outers.size() == 0:
+		return [a]
+	for h in a.holes:
+		for r in _clip_pieces([h], [b.outer]):
+			new_holes.append(r)
+	for h in b.holes:
+		for r in _clip_pieces([h], [a.outer]):
+			new_holes.append(r)
+	for ha in a.holes:
+		if ha.size() < 3: continue
+		var ha_bb = _aabb(ha).grow(0.5)
+		for hb in b.holes:
+			if hb.size() < 3: continue
+			if not ha_bb.intersects(_aabb(hb)): continue
+			var inter = Geometry.intersect_polygons_2d(ha, hb)
+			for r in inter:
+				if r.size() >= 3 and not Geometry.is_polygon_clockwise(r):
+					new_holes.append(_to_array(r))
+	var comps = []
+	for o in outers:
+		comps.append({"outer": o, "holes": [], "bb": _aabb(o)})
+	for h in new_holes:
+		if _polygon_area(h) < 0.25: continue
+		var cen = _ring_centroid(h)
+		var best = -1
+		var best_a = INF
+		for ci in range(comps.size()):
+			if not _point_in_polygon(cen, comps[ci].outer): continue
+			var oa = _polygon_area(comps[ci].outer)
+			if oa < best_a:
+				best_a = oa
+				best = ci
+		if best >= 0:
+			comps[best].holes.append(h)
+	return comps
+
+
+# Le pool est "typé" : [{ring, hole}] — l'appartenance trou/plein est explicite
+# (plus de dépendance à l'orientation CW/CCW des anneaux de Clipper).
+func _extract_click_region(pool: Array, map_rect: Array, mouse: Vector2) -> Dictionary:
+	var smallest_idx = -1
+	var smallest_area = INF
+	for i in range(pool.size()):
+		if pool[i].ring.size() < 3: continue
+		if not _point_in_polygon(mouse, pool[i].ring): continue
+		var a = _polygon_area(pool[i].ring)
+		if a < smallest_area:
+			smallest_area = a
+			smallest_idx = i
+	if smallest_idx < 0:
+		# Extérieur : on soustrait RÉELLEMENT les composantes de premier niveau
+		# du rectangle de map, puis on garde le morceau contenant le clic.
+		# (Avant : map_rect + toutes les barrières en trous → une barrière
+		# reliée aux bords de map ne séparait pas les zones, et une barrière
+		# DÉBORDANT de la map donnait un trou sortant de l'outer → pontage
+		# auto-croisé, « Bad Polygon ».)
+		var pieces = [{"outer": map_rect, "holes": []}]
+		for i in range(pool.size()):
+			if pool[i].hole: continue
+			if pool[i].ring.size() < 3: continue
+			if _smallest_container_idx(i, pool) >= 0: continue
+			pieces = _subtract_solid_from_pieces(pieces, pool[i].ring)
+		for piece in pieces:
+			if not _point_in_polygon(mouse, piece.outer): continue
+			var in_hole = false
+			for h in piece.holes:
+				if _point_in_polygon(mouse, h):
+					in_hole = true
+					break
+			if in_hole: continue
+			return {"kind": "exterior", "outer": piece.outer, "holes": piece.holes}
+		return {"kind": "wall", "outer": [], "holes": []}
+	if not pool[smallest_idx].hole:
+		return {"kind": "wall", "outer": [], "holes": []}
+	var room = _ensure_ccw(pool[smallest_idx].ring)
+	var islands = []
+	for i in range(pool.size()):
+		if i == smallest_idx: continue
+		if pool[i].hole: continue
+		if pool[i].ring.size() < 3: continue
+		if _smallest_container_idx(i, pool) == smallest_idx:
+			islands.append(pool[i].ring)
+	return {"kind": "room", "outer": room, "holes": islands}
+
+
+# Soustrait un solide (anneau plein) de chaque morceau {outer, holes} ; les
+# anneaux CW produits (solide strictement inclus) deviennent des trous du
+# morceau qui les contient. Broad-phase AABB.
+func _subtract_solid_from_pieces(pieces: Array, solid: Array) -> Array:
+	var sbb = _aabb(solid).grow(1.0)
+	var result = []
+	for piece in pieces:
+		if not sbb.intersects(_aabb(piece.outer)):
+			result.append(piece)
+			continue
+		var clipped = Geometry.clip_polygons_2d(piece.outer, solid)
+		var newp = []
+		var hs = []
+		for r in clipped:
+			if r.size() < 3: continue
+			if Geometry.is_polygon_clockwise(r):
+				hs.append(_ensure_ccw(_to_array(r)))
+			else:
+				newp.append({"outer": _to_array(r), "holes": []})
+		for h in hs:
+			_attach_hole_to_piece(newp, h)
+		for h in piece.holes:
+			_attach_hole_to_piece(newp, h)
+		for p in newp:
+			result.append(p)
+	return result
+
+
+func _attach_hole_to_piece(pieces: Array, h: Array):
+	var cen = _ring_centroid(h)
+	var best = -1
+	var best_a = INF
+	for i in range(pieces.size()):
+		if not _point_in_polygon(cen, pieces[i].outer): continue
+		var a = _polygon_area(pieces[i].outer)
+		if a < best_a:
+			best_a = a
+			best = i
+	if best >= 0:
+		pieces[best].holes.append(h)
+
+
+func _ring_centroid(ring: Array) -> Vector2:
+	var c = Vector2(0, 0)
+	for p in ring:
+		c += p
+	if ring.size() > 0:
+		c /= ring.size()
+	return c
+
+
+func _smallest_container_idx(idx: int, pool: Array) -> int:
+	# Containment robuste : on teste un point REPRÉSENTATIF (centroïde) de l'anneau
+	# intérieur, pas tous ses points — un seul point effleurant le bord suffisait
+	# sinon à rejeter le rattachement (l'oval ratait sa pièce).
+	var area_i = _polygon_area(pool[idx].ring)
+	var cen = _ring_centroid(pool[idx].ring)
+	var best = -1
+	var best_a = INF
+	for j in range(pool.size()):
+		if j == idx: continue
+		if pool[j].ring.size() < 3: continue
+		var aj = _polygon_area(pool[j].ring)
+		if aj <= area_i: continue
+		if not _point_in_polygon(cen, pool[j].ring): continue
+		if aj < best_a:
+			best_a = aj
+			best = j
+	return best
+
+

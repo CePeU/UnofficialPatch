@@ -52,6 +52,12 @@ var _UndoRecordScript = null
 
 # Bucket fill (région bornée par murs/paths/bords de map)
 var _bucket_button: Button = null
+
+# Options "Stopped by" (types de barrières qui bloquent le bucket)
+var _opts_hbox = null
+var _cb_walls: CheckBox = null
+var _cb_paths: CheckBox = null
+var _cb_patterns: CheckBox = null
 var _bucket_active := false
 var _region_geo = null  # instance de library/region_geometry.gd
 
@@ -168,7 +174,7 @@ func _inject_ui():
 	_square_brush_button = _make_mode_button(_load_icon_tex("icons/brush_square.png", 0.8), "S", \
 		"Square brush — paint squares aligned to the splat grid.\nSlider Size = splat pixels per side.", grp, MODE_SQUARE)
 	_bucket_button = _make_mode_button(_load_icon_tex("icons/bucket.png", 0.8), "B", \
-		"Paint Bucket: click any region bounded by walls, paths, or map edges.\nPress SHIFT to include existing pattern shapes as barriers.", grp, MODE_BUCKET)
+		"Bucket fill — fill the region (bounded by the enabled barrier types) under the click. See the Stopped by options.", grp, MODE_BUCKET)
 
 	var row = HBoxContainer.new()
 	row.name = "TerrainBrushModeRow"
@@ -193,6 +199,28 @@ func _inject_ui():
 	elif _size_container != null:
 		target_idx = _size_container.get_index()
 	align.move_child(row, target_idx)
+
+	# Rangée "Stopped by" juste SOUS la rangée de modes (visible en mode Bucket).
+	_opts_hbox = HBoxContainer.new()
+	_opts_hbox.name = "TerrainBucketStoppedByRow"
+	_opts_hbox.visible = false
+	var lbl_sb = Label.new()
+	lbl_sb.text = "Stopped by:"
+	_opts_hbox.add_child(lbl_sb)
+	_cb_walls = CheckBox.new()
+	_cb_walls.text = "Walls"
+	_cb_walls.pressed = true
+	_opts_hbox.add_child(_cb_walls)
+	_cb_paths = CheckBox.new()
+	_cb_paths.text = "Paths"
+	_cb_paths.pressed = true
+	_opts_hbox.add_child(_cb_paths)
+	_cb_patterns = CheckBox.new()
+	_cb_patterns.text = "Patterns"
+	_cb_patterns.pressed = false
+	_opts_hbox.add_child(_cb_patterns)
+	align.add_child(_opts_hbox)
+	align.move_child(_opts_hbox, row.get_index() + 1)
 
 	# Mode par défaut : brush normale.
 	_normal_button.pressed = true
@@ -241,6 +269,8 @@ func _set_mode(mode: int):
 	_set_square_active(mode == MODE_SQUARE)
 	# État Bucket.
 	_bucket_active = (mode == MODE_BUCKET)
+	if _opts_hbox != null:
+		_opts_hbox.visible = _bucket_active
 	# Grisage/lock des contrôles selon le mode.
 	_apply_mode_locks(mode)
 	# Curseur.
@@ -701,17 +731,17 @@ func _new_progress(title: String):
 
 
 # Wrapper : garde de ré-entrance (ignore les clics pendant un remplissage en cours).
-func _bucket_fill(mouse_world: Vector2, include_patterns: bool):
+func _bucket_fill(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool):
 	if _filling:
 		return
 	_filling = true
-	var st = _bucket_fill_impl(mouse_world, include_patterns)
+	var st = _bucket_fill_impl(mouse_world, stop_walls, stop_paths, stop_patterns)
 	if st is GDScriptFunctionState:
 		yield(st, "completed")
 	_filling = false
 
 
-func _bucket_fill_impl(mouse_world: Vector2, include_patterns: bool):
+func _bucket_fill_impl(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool):
 	if _region_geo == null:
 		print("[TerrainBucket] region_geometry indisponible")
 		return
@@ -722,8 +752,15 @@ func _bucket_fill_impl(mouse_world: Vector2, include_patterns: bool):
 
 	var t0 = OS.get_ticks_msec()
 	var progress = _new_progress("Filling terrain…")
+	if progress != null:
+		# Yield une frame pour que le 0 % soit réellement AFFICHÉ (sinon la
+		# première frame rendue arrive au premier pump(), déjà à quelques %).
+		progress.set_progress(0.0, "Computing fill region\u2026")
+		yield(_g.Editor.get_tree(), "idle_frame")
 
-	var region = _region_geo.compute_region_async(mouse_world, include_patterns, progress)
+	# Échelle UNIQUE sur toute l'opération : région 0–60 %, rasterisation
+	# 60–98 %, 100 % avant fermeture (plus de barre qui « repart de zéro »).
+	var region = _region_geo.compute_region_async(mouse_world, stop_walls, stop_paths, stop_patterns, progress, 0.0, 0.6)
 	if region is GDScriptFunctionState:
 		region = yield(region, "completed")
 	if progress != null and region.get("cancelled") == true:
@@ -818,6 +855,10 @@ func _bucket_fill_impl(mouse_world: Vector2, include_patterns: bool):
 		print("[TerrainBucket] Remplissage annulé par l'utilisateur")
 		return
 	if progress != null:
+		# Deux frames pour que le 100 % soit visible avant fermeture.
+		progress.set_progress(1.0, "Done")
+		yield(_g.Editor.get_tree(), "idle_frame")
+		yield(_g.Editor.get_tree(), "idle_frame")
 		progress.close()
 
 	# snapshot AVANT peinture (après la région + la couverture : une annulation en
@@ -895,7 +936,7 @@ func _compute_coverage(polys: Array, x0: int, y0: int, w: int, h: int, origin_w:
 	if px.x <= 0.0 or px.y == 0.0:
 		for yy in range(h):
 			if progress != null and progress.pump():
-				progress.set_progress(float(yy) / max(1, h), "Rasterizing… %d / %d" % [yy, h])
+				progress.set_progress(0.6 + 0.38 * float(yy) / max(1, h), "Rasterizing… %d / %d" % [yy, h])
 				yield(_tree, "idle_frame")
 				if progress.cancelled:
 					return null
@@ -924,7 +965,7 @@ func _compute_coverage(polys: Array, x0: int, y0: int, w: int, h: int, origin_w:
 	var xs = []
 	for r in range(sub_rows):
 		if progress != null and progress.pump():
-			progress.set_progress(float(r) / max(1, sub_rows), "Rasterizing… %d / %d" % [r, sub_rows])
+			progress.set_progress(0.6 + 0.38 * float(r) / max(1, sub_rows), "Rasterizing… %d / %d" % [r, sub_rows])
 			yield(_tree, "idle_frame")
 			if progress.cancelled:
 				return null
@@ -1003,7 +1044,7 @@ func _on_input(event) -> bool:
 			return true
 		return false
 
-	if ui_util != null and ui_util.is_mouse_over_ui(input_listener): return false
+	if ui_util != null and ui_util.is_mouse_over_hud(input_listener): return false
 
 	var world_ui = _g.get("WorldUI")
 	if world_ui == null: return false
@@ -1014,7 +1055,10 @@ func _on_input(event) -> bool:
 	# Bucket : remplissage one-shot au clic gauche.
 	if _bucket_active:
 		if event is InputEventMouseButton and event.button_index == BUTTON_LEFT and event.pressed:
-			_bucket_fill(mouse_w, event.shift)
+			var sw = _cb_walls.pressed if _cb_walls != null else true
+			var sp = _cb_paths.pressed if _cb_paths != null else true
+			var spat = _cb_patterns.pressed if _cb_patterns != null else false
+			_bucket_fill(mouse_w, sw, sp, spat)
 			return true
 		return false
 
@@ -1083,7 +1127,7 @@ func update(_delta):
 		_hide_dd_cursor()
 		_update_square_preview()
 		if _square_preview != null and is_instance_valid(_square_preview):
-			if ui_util != null and ui_util.is_mouse_over_ui(input_listener):
+			if ui_util != null and ui_util.is_mouse_over_hud(input_listener):
 				_square_preview.visible = false
 		# Forcer l'affichage correct de la valeur (2 décimales)
 		if _size_spinbox != null:
@@ -1098,7 +1142,7 @@ func update(_delta):
 	# (curseur normal au-dessus de l'UI).
 	if _bucket_active:
 		_hide_dd_cursor()
-		var over_ui = (ui_util != null and ui_util.is_mouse_over_ui(input_listener))
+		var over_ui = (ui_util != null and ui_util.is_mouse_over_hud(input_listener))
 		if over_ui:
 			_clear_bucket_cursor()
 		else:
