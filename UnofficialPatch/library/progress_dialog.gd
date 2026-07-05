@@ -39,6 +39,19 @@ var _shown := false
 var _closing := false
 var _t_start := 0
 var _t_last := 0
+# Cible d'affichage (0..100), monotone croissante. La barre AFFICHÉE poursuit
+# cette cible par lissage exponentiel à CHAQUE frame (signal idle_frame du
+# SceneTree) : vitesse continue, pas d'à-coups quand les phases avancent à des
+# rythmes différents ni de redémarrage d'animation à chaque mise à jour. À
+# l'apparition (après le seuil), la barre part visuellement de 0 et rattrape.
+var _target := 0.0
+var _tree = null
+var _t_frame := 0
+# Estimation continue de la durée totale (s) : temps écoulé / fraction réelle,
+# lissée. L'affichage avance à la vitesse moyenne estimée (quasi constante),
+# PLAFONNÉ par la progression réelle : les segments rapides sont aplatis, les
+# segments lents restent honnêtes (la barre ne dépasse jamais le travail fait).
+var _t_total := -1.0
 
 
 func start(title: String = "Filling…"):
@@ -46,6 +59,8 @@ func start(title: String = "Filling…"):
 	_shown = false
 	_closing = false
 	_title = title
+	_target = 0.0
+	_t_total = -1.0
 	_t_start = OS.get_ticks_msec()
 	_t_last = _t_start
 
@@ -71,14 +86,58 @@ func pump() -> bool:
 
 
 func set_progress(frac: float, status: String = ""):
-	if _bar != null and is_instance_valid(_bar):
-		_bar.value = clamp(frac, 0.0, 1.0) * 100.0
+	_target = max(_target, clamp(frac, 0.0, 1.0) * 100.0)
 	if _label != null and is_instance_valid(_label) and status != "":
 		_label.text = status
 
 
+# Appelé à chaque frame rendue tant que la boîte est visible. Poursuite
+# exponentielle (rapide quand loin, douce à l'approche) + léger avancement
+# linéaire pour ne jamais paraître figée entre deux mises à jour.
+func _on_frame():
+	if _bar == null or not is_instance_valid(_bar):
+		return
+	var now = OS.get_ticks_msec()
+	var dt = clamp(float(now - _t_frame) / 1000.0, 0.0, 0.05)
+	_t_frame = now
+	var elapsed = float(now - _t_start) / 1000.0
+	var frac = _target / 100.0
+	if frac > 0.02 and not _closing:
+		var t_est = elapsed / frac
+		_t_total = t_est if _t_total <= 0.0 else lerp(_t_total, t_est, min(1.0, dt * 1.5))
+	# Valeur "idéale" à vitesse moyenne constante, plafonnée par le réel.
+	var desired = _target
+	if _t_total > 0.0 and not _closing:
+		desired = min(_target, 100.0 * elapsed / _t_total)
+	if _bar.value < desired:
+		var k = 8.0 if _closing else 4.0
+		var lin = 60.0 if _closing else 1.0
+		var v = _bar.value + (desired - _bar.value) * min(1.0, dt * k) + dt * lin
+		_bar.value = min(desired, v)
+	if _closing and _bar.value >= _target - 0.01:
+		_finalize_close()
+
+
 func close():
 	_closing = true
+	if _layer != null and is_instance_valid(_layer) and _shown and not cancelled and _g != null and _g.get("Editor") != null:
+		# Laisse la poursuite atteindre 100 % avant de fermer (différé, non
+		# bloquant ; _on_frame déclenche _finalize_close une fois la cible
+		# atteinte, timer de sécurité sinon). IMPORTANT : l'appelant lâche sa
+		# référence après close() et cet objet est une Reference — sans
+		# keep-alive, l'objet meurt et le popup reste orphelin, figé sous
+		# 100 %. La meta sur le layer nous garde en vie jusqu'au queue_free.
+		_layer.set_meta("pg_keepalive", self)
+		var t = _g.Editor.get_tree().create_timer(1.2)
+		t.connect("timeout", self, "_finalize_close")
+		return
+	_finalize_close()
+
+
+func _finalize_close():
+	if _tree != null and _tree.is_connected("idle_frame", self, "_on_frame"):
+		_tree.disconnect("idle_frame", self, "_on_frame")
+	_tree = null
 	if _layer != null and is_instance_valid(_layer):
 		_layer.queue_free()
 	_layer = null
@@ -138,6 +197,12 @@ func _build_and_popup():
 	_win.connect("popup_hide", self, "_on_popup_hide")
 	_win.popup_centered(Vector2(340, 130))
 	_register_blur()
+	# Poursuite animée à chaque frame ; la barre part de 0 et rattrape la
+	# progression déjà accomplie pendant le seuil.
+	_tree = _g.Editor.get_tree()
+	_t_frame = OS.get_ticks_msec()
+	if not _tree.is_connected("idle_frame", self, "_on_frame"):
+		_tree.connect("idle_frame", self, "_on_frame")
 
 
 # Blur d'arrière-plan via le mod popup_blur (singleton exposé dans Engine). Le
