@@ -1,5 +1,10 @@
 UNOFFICIAL PATCH
 
+v1.4.3
+- Full rework of the bucket fill tools to improve accuracy
+- Added checkboxes in the bucket fill options to select what you want to stop the fill (walls, paths, patterns)
+- Fixed an issue with _Lib's version checker
+
 v1.4.2
 - Added a loading bar and a Cancel button when using the bucket fill tool
 - Improved tooltip for the pattern bucket tool 
