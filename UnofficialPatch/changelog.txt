@@ -1,5 +1,49 @@
 UNOFFICIAL PATCH
 
+v1.5.0
+- Added an option to place all the libraries on the right side of the screen
+- Added the ability to copy portals when you copy walls (before, portals were lost on copy)
+- Added freestanding portals to be seen as walls in the bucket fill tools
+- Added a way for portals to be selectable with a drag box
+- Added the Bevel Corners button for walls in the Selection Tool
+- Added right click options to the Map Gallery (Open, Duplicate, Rename, View Packs, Move, Delete)
+- Added a "Hide" option on a right click in the library
+- Added the option to copy, cut, paste, paste in place and delete a placed asset on a right click
+- Added Alt To Deselect to walls selection boxes
+- Added the last search being displayed again after switching back to the Object Tool or the Scatter Tool (with selected assets)
+- Added Rotate with Mousewheel and Resize with Mouswheel+Alt in the Scatter Tool
+- Changed the Favorites ON/OFF button to a three way button : All, Favorites, Hidden
+- Walls and Lights are now compatible with Free Transform's symmetry options
+- Improved multi-selection mixing texts and assets
+- Optimized text related processing in the selection tool
+- Optimized map reloadings (after 10 reloads, it tended to freeze every 2s for a few frames)
+- Optimized and improved Pack Cache Purge
+- Improved the Profiler (F10)
+- Improved preview size capping
+- Reduced a memory leak (?)
+- Fixed a general bug that could happen when you had Enlarge UI activated
+- Fixed Objects selection in the library being lost after a tool switch (scrolling was bringing you back to the top of the list)
+- Fixed scrolling on a spinbox or a slider causing to scroll the panel as a whole
+- Fixed lights not being selectable over patterns when Overlay was ON
+- Fixed the Terrain Area Viewer opening the slots 9-16
+- Fixed differences between the Pattern Bucket Tool and the Terrain Bucket Tool
+- Fixed an issue with paths being displayed at the wrong place during draw after disabling Snap To Grid
+- Fixed Free Transform glitches with patterns
+- Fixed symmetry issues with patterns and paths
+- Fixed clicking outside of the Map Gallery closing it
+- Fixed right clicking while the Map Gallery was open causing other menus to appear
+- Fixed spacing issues with the View Packs window in the Map Gallery
+- Fixed various issues when grouped assets were copied
+- Fixed Additional Search Options terrain grid not showing on the left panel of the terrain tool
+- Fixed an offset issue when pasting occuring for some users
+- Fixed a compatibility issue between Path Arcs and Fade Distance from Colour And Modify Things
+- Fixed the transform box sometimes appearing in the Objects Tool after placement
+- Fixed a vanilla bug that reorders assets in a multiselection (copy button and prefabs)
+- Fixed a vanilla bug that didn't let freestanding portals block light on overlay level in the export window
+- Fixed a vanilla bug that colored light sources with ambient light color when focus or brightness were below 100%
+- Fixed a vanilla bug that created overflowing water in some specific cases
+- Fixed a vanilla bug that messes the selection if you change tool while making a dragbox (with X for example)
+
 v1.4.3
 - Full rework of the bucket fill tools to improve accuracy
 - Added checkboxes in the bucket fill options to select what you want to stop the fill (walls, paths, patterns)

@@ -10,6 +10,21 @@ var script_class = "tool"
 var _prof_on := false
 var _prof_acc := {}
 var _prof_frames := 0
+var _prof_max := {}           # nom -> pire cout sur UNE frame (us)
+var _prof_spikes := {}        # nom -> nb de frames ou ce submod seul >= _PROF_SPIKE_US
+var _prof_peak_frame := {}    # nom -> index de la frame du pic de ce submod
+var _prof_cur := 0            # total courant (tous submods _pu) de la frame en cours
+var _prof_frame_peak := 0     # pire total sur UNE frame (somme de tous les submods _pu)
+var _prof_frame_peak_at := 0  # index de cette pire total-frame
+var _prof_over_8ms := 0       # nb de frames dont le total _pu >= 8333 us (moitie du budget)
+var _prof_over_16ms := 0      # nb de frames dont le total _pu >= 16666 us (frame droppee @60fps)
+const _PROF_SPIKE_US := 2000  # cout single-frame d'un submod compte comme un hitch
+var _prof_prev_tick := 0      # OS.get_ticks_usec() au debut de la derniere update()
+var _prof_gap_max := 0        # plus grand intervalle REEL entre deux frames (us)
+var _prof_gap_max_at := 0     # index de frame de ce pire intervalle
+var _prof_gap_33 := 0         # nb de frames reelles >= 33 ms (frame ratee @30fps)
+var _prof_gap_50 := 0         # >= 50 ms
+var _prof_gap_100 := 0        # >= 100 ms (gros freeze visible)
 var _prof_key_was := false
 var _prof_state := "idle"   # idle → running → shown → (idle)
 var _prof_overlay = null
@@ -67,6 +82,9 @@ var select_fix
 var ScatterMultiselectFixScript
 var scatter_multiselect_fix
 
+var ScatterTransformScript
+var scatter_transform
+
 var SelectCursorFixScript
 var select_cursor_fix
 
@@ -81,6 +99,12 @@ var select_layer_pick_fix
 
 var CompareFixScript
 var compare_fix
+
+var ExportLightFixScript
+var export_light_fix
+
+var ExportBrightnessFixScript
+var export_brightness_fix
 
 var PathFixScript
 var path_fix
@@ -118,6 +142,9 @@ var pan_fix
 var WallAllowLightScript
 var wall_allow_light
 
+var WallBevelScript
+var wall_bevel
+
 var DropFixScript
 var drop_fix
 
@@ -132,6 +159,8 @@ var favorites
 
 var PackCacheFixScript
 var pack_cache_fix
+var SearchPersistScript
+var search_persist
 
 var RoofSelectScript
 var roof_select
@@ -245,6 +274,9 @@ var trace_extended
 var SelectCollapseScript
 var select_collapse
 
+var SliderScrollFixScript
+var slider_scroll_fix
+
 var SelectRotationScript
 var select_rotation
 
@@ -257,6 +289,9 @@ var grid_ruler
 var SelectFilterBarScript
 var select_filter_bar
 
+var LibraryRightPanelScript
+var library_right_panel
+
 var UIRescalerScript
 var ui_rescaler
 
@@ -267,6 +302,7 @@ var RightClickUtilScript
 var right_click_util
 var ft_context
 var rotate_context
+var clipboard_context
 
 var MapExplorerScript
 var map_explorer
@@ -354,7 +390,7 @@ func _close_loading_popup() -> void:
 
 func start() -> void:
 
-	# Register with _lib if available (active le verificateur de mise a jour _Lib)
+	# Register with _lib if available (enables the _Lib update checker)
 	if Engine.has_signal("_lib_register_mod"):
 		Engine.emit_signal("_lib_register_mod", self)
 		if "API" in Global and Global.API.has("UpdateChecker"):
@@ -386,11 +422,11 @@ func start() -> void:
 	# DebugSettings — loaded right after mod_settings (before everything else)
 	# so it can gate every subsequent ResourceLoader.load. State is read from
 	# disk; toggles only take effect on next launch.
-	# Toujours charge — meme si "Display Debug Panel" est OFF, on garde
-	# debug_settings en memoire pour pouvoir afficher le panel a chaud quand
-	# le user toggle ON. Le panel est juste hide au boot si display_debug_tool
-	# est false. Le bouton du tool dans la barre verticale est de toute facon
-	# force invisible chaque frame par mod_settings.update.
+	# Always loaded — even if "Display Debug Panel" is OFF, we keep
+	# debug_settings in memory so the panel can be shown at runtime when
+	# the user toggles it ON. The panel is simply hidden at boot if
+	# display_debug_tool is false. The tool button in the vertical bar is
+	# forced invisible every frame by mod_settings.update anyway.
 	var DebugSettingsScript = ResourceLoader.load(Global.Root + "scripts/debug_settings.gd", "GDScript", true)
 	if DebugSettingsScript != null:
 		debug_settings = DebugSettingsScript.new()
@@ -402,9 +438,9 @@ func start() -> void:
 			mod_settings.debug_settings = debug_settings
 		print("[UnofficialPatch] DebugSettings loaded.")
 
-	# WelcomePopup — affiche au premier lancement (jusqu'a ce que l'user
-	# coche "Do not show again"). Le show effectif est differe dans
-	# update() pour apparaitre apres le Patching DD popup.
+	# WelcomePopup — shown on first launch (until the user checks
+	# "Do not show again"). The actual show is deferred to update()
+	# so it appears after the Patching DD popup.
 	var WelcomePopupScript = ResourceLoader.load(Global.Root + "scripts/welcome_popup.gd", "GDScript", true)
 	if WelcomePopupScript != null:
 		welcome_popup = WelcomePopupScript.new()
@@ -413,7 +449,7 @@ func start() -> void:
 		print("[UnofficialPatch] WelcomePopup loaded.")
 
 	if mod_settings != null:
-		# Sections + toggles (tooltips en anglais).
+		# Sections + toggles (tooltips in English).
 		mod_settings.register_section("general", "GENERAL")
 		mod_settings.register_section("ui", "UI")
 		mod_settings.register_section("controls", "CONTROLS")
@@ -492,6 +528,10 @@ func start() -> void:
 			"Shows the 'Overlays' toggle button in the bottom floatbar\nnext to Grid/Snap/Lighting (turns wall+path highlighting\non/off, remembering each one's previous state).\nThe Shift+O shortcut keeps working either way.",
 			true, self, "_on_overlay_bar_button_toggled",
 			false, "walls_paths_overlay")
+		mod_settings.register_toggle(
+			"library_right_panel", "ui", "Libraries in Right Panel",
+			"Moves the asset libraries out of the left tool panels and into a\ndedicated right-side panel, next to the Object and Path libraries.\nCovers Floor/Wall (Building), Wall, Portal, Cave, Pattern, Roof,\nMaterial and Light tools, plus the Select Tool libraries.\nThe panel width is draggable from its left edge.",
+			true, self, "_on_library_right_panel_toggled")
 		mod_settings.register_toggle(
 			"select_filter_bar_bar_button", "ui", "Filters Floatbar Button",
 			"Shows the 'Filters' toggle button in the bottom floatbar\nnext to Grid/Snap/Lighting to show/hide the Select Tool\nfilter bar.",
@@ -735,6 +775,18 @@ func start() -> void:
 		compare_fix._g = Global
 		compare_fix.initialize()
 
+	if _debug_enabled("export_light_fix"):
+		ExportLightFixScript = ResourceLoader.load(Global.Root + "scripts/export_light_fix.gd", "GDScript", true)
+		export_light_fix = ExportLightFixScript.new()
+		export_light_fix._g = Global
+		export_light_fix.initialize()
+
+	if _debug_enabled("export_brightness_fix"):
+		ExportBrightnessFixScript = ResourceLoader.load(Global.Root + "scripts/export_brightness_fix.gd", "GDScript", true)
+		export_brightness_fix = ExportBrightnessFixScript.new()
+		export_brightness_fix._g = Global
+		export_brightness_fix.initialize()
+
 	if _debug_enabled("level_settings_fix"):
 		LevelSettingsFixScript = ResourceLoader.load(Global.Root + "scripts/level_settings_fix.gd", "GDScript", true)
 		level_settings_fix = LevelSettingsFixScript.new()
@@ -753,8 +805,8 @@ func start() -> void:
 		ui_util = UIUtilScript.new()
 		ui_util._g = Global
 
-	# select_layer_pick_fix est enregistre plus haut (avant ui_util) : on lui
-	# injecte ui_util ici, une fois ce dernier disponible.
+	# select_layer_pick_fix is registered earlier (before ui_util): we
+	# inject ui_util into it here, once the latter is available.
 	if select_layer_pick_fix != null:
 		select_layer_pick_fix.ui_util = ui_util
 
@@ -820,6 +872,13 @@ func start() -> void:
 		rotation_snap.initialize()
 		print("[UnofficialPatch] RotationSnap loaded.")
 
+	if _debug_enabled("scatter_transform"):
+		ScatterTransformScript = ResourceLoader.load(Global.Root + "scripts/scatter_transform.gd", "GDScript", true)
+		scatter_transform = ScatterTransformScript.new()
+		scatter_transform._g = Global
+		scatter_transform.ui_util = ui_util
+		scatter_transform.initialize()
+
 	if _debug_enabled("transform_box_fix"):
 		TransformBoxFixScript = ResourceLoader.load(Global.Root + "scripts/transform_box_fix.gd", "GDScript", true)
 		transform_box_fix = TransformBoxFixScript.new()
@@ -847,6 +906,12 @@ func start() -> void:
 		wall_allow_light = WallAllowLightScript.new()
 		wall_allow_light._g = Global
 		wall_allow_light.initialize()
+
+	if _debug_enabled("wall_bevel"):
+		WallBevelScript = ResourceLoader.load(Global.Root + "scripts/wall_bevel.gd", "GDScript", true)
+		wall_bevel = WallBevelScript.new()
+		wall_bevel._g = Global
+		wall_bevel.initialize()
 
 	if _debug_enabled("drop_fix"):
 		DropFixScript = ResourceLoader.load(Global.Root + "scripts/drop_fix.gd", "GDScript", true)
@@ -882,15 +947,21 @@ func start() -> void:
 		pack_cache_fix._g = Global
 		pack_cache_fix.initialize()
 
+	if _debug_enabled("search_persist"):
+		SearchPersistScript = ResourceLoader.load(Global.Root + "scripts/search_persist.gd", "GDScript", true)
+		search_persist = SearchPersistScript.new()
+		search_persist._g = Global
+		search_persist.initialize()
+
 	if _debug_enabled("roof_select"):
 		RoofSelectScript = ResourceLoader.load(Global.Root + "scripts/roof_select.gd", "GDScript", true)
 		roof_select = RoofSelectScript.new()
 		roof_select._g = Global
 		roof_select.initialize()
 
-	# grid_fix : toujours charge (multi-feature : custom layer + opacity
-	# slider + autres). Pas de toggle settings dedie pour eviter de
-	# desactiver tout le mod en meme temps que le custom layer.
+	# grid_fix: always loaded (multi-feature: custom layer + opacity
+	# slider + others). No dedicated settings toggle, to avoid disabling
+	# the whole mod along with the custom layer.
 	_load_grid_fix()
 
 	if mod_settings == null or mod_settings.is_enabled("draw_over_ui"):
@@ -994,17 +1065,17 @@ func start() -> void:
 		portal_reposition_ui = PortalReposUIScript.new()
 		portal_reposition_ui._g = Global
 		portal_reposition_ui.initialize()
-	# Sync l'etat initial avec le toggle "Reposition Portals" (qui pilote
-	# reposition_enabled). Setter directement (pas via set_enabled) car les
-	# boutons n'existent pas encore au boot — ils seront crees plus tard
-	# par wall_tool_portal_fix avec la valeur courante de reposition_enabled.
+	# Sync the initial state with the "Reposition Portals" toggle (which
+	# drives reposition_enabled). Set it directly (not via set_enabled)
+	# because the buttons don't exist yet at boot — they will be created
+	# later by wall_tool_portal_fix with the current reposition_enabled value.
 	if mod_settings != null:
 		portal_reposition_ui.reposition_enabled = mod_settings.is_enabled("reposition_portals")
 
 	WallToolPortalFixScript = ResourceLoader.load(Global.Root + "scripts/wall_tool_portal_fix.gd", "GDScript", true)
 	wall_tool_portal_fix = WallToolPortalFixScript.new()
 	wall_tool_portal_fix._g = Global
-	wall_tool_portal_fix.ui = portal_reposition_ui  # mettre null pour vanilla
+	wall_tool_portal_fix.ui = portal_reposition_ui  # set to null for vanilla
 	wall_tool_portal_fix.initialize()
 
 
@@ -1042,6 +1113,9 @@ func start() -> void:
 	if mod_settings == null or mod_settings.is_enabled("collapsable_controls"):
 		_load_select_collapse()
 
+	if mod_settings == null or mod_settings.is_enabled("slider_scroll_fix"):
+		_load_slider_scroll_fix()
+
 	if mod_settings == null or mod_settings.is_enabled("rotation_slider"):
 		_load_select_rotation()
 
@@ -1073,11 +1147,17 @@ func start() -> void:
 	if mod_settings == null or mod_settings.is_enabled("select_filter_bar"):
 		_load_select_filter_bar()
 
-	# GroupAssets — Group/Ungroup sans prefab
+	# LibraryRightPanel — moves the left-panel asset libraries to the right.
+	# At startup it keeps its BOOT_DELAY so AdditionalSearchOptions can build
+	# its search bars first (they then travel with their library).
+	if mod_settings == null or mod_settings.is_enabled("library_right_panel"):
+		_load_library_right_panel()
+
+	# GroupAssets — Group/Ungroup without prefabs
 	if mod_settings == null or mod_settings.is_enabled("group_assets"):
 		_load_group_assets()
 
-	# RightClickUtil — menu contextuel centralisé pour le SelectTool
+	# RightClickUtil — centralized context menu for the SelectTool
 	if _debug_enabled("right_click_util"):
 		RightClickUtilScript = ResourceLoader.load(Global.Root + "scripts/right_click_util.gd", "GDScript", true)
 	if RightClickUtilScript != null:
@@ -1088,8 +1168,8 @@ func start() -> void:
 			right_click_util.register(favorites)
 		if group_assets != null:
 			right_click_util.register(group_assets)
-		# FTContext : toujours charge, fournit l'item "Free Transform" du
-		# menu contextuel meme si Favorite Assets est desactive.
+		# FTContext: always loaded, provides the "Free Transform" item of
+		# the context menu even when Favorite Assets is disabled.
 		var FTContextScript = ResourceLoader.load(Global.Root + "scripts/ft_context.gd", "GDScript", true)
 		if FTContextScript != null:
 			ft_context = FTContextScript.new()
@@ -1097,28 +1177,27 @@ func start() -> void:
 			ft_context.free_transform = free_transform
 			ft_context.initialize()
 			right_click_util.register(ft_context)
-		# RotateContext : ajoute "Rotate 90°" au menu contextuel et neutralise
-		# la rotation auto sur clic droit du mod tiers RotateAndJiggle (Jiggle.gd),
-		# qui se declenchait en meme temps que notre menu.
+		# RotateContext: adds "Rotate 90°" to the context menu and neutralizes
+		# the auto-rotation on right-click from the third-party mod
+		# RotateAndJiggle (Jiggle.gd), which fired at the same time as our menu.
 		var RotateContextScript = ResourceLoader.load(Global.Root + "scripts/rotate_context.gd", "GDScript", true)
 		if RotateContextScript != null:
 			rotate_context = RotateContextScript.new()
 			rotate_context._g = Global
 			rotate_context.initialize()
 			right_click_util.register(rotate_context)
-		# PatternScaleBake : test mod — bakes a PatternShape's node.scale
-		# into its polygon so DD's snap pipeline (which uses node.position
-		# as reference) sees corner positions that match the rendered ones.
-		# Manually invoked via right-click; visual rendering may or may
-		# not be preserved depending on DD's pattern shader.
-		if _debug_enabled("pattern_scale_bake"):
-			var PatternScaleBakeScript = ResourceLoader.load(Global.Root + "scripts/pattern_scale_bake.gd", "GDScript", true)
-			if PatternScaleBakeScript != null:
-				var pattern_scale_bake = PatternScaleBakeScript.new()
-				pattern_scale_bake._g = Global
-				pattern_scale_bake.ui_util = ui_util
-				pattern_scale_bake.initialize()
-				right_click_util.register(pattern_scale_bake)
+		# ClipboardContext: adds Copy / Cut / Paste / Paste in Place / Delete
+		# to the context menu (selection items when there is a selection,
+		# paste items when the clipboard holds something, incl. right-click in
+		# empty space). Delegates all actions to clipboard_fix.
+		if clipboard_fix != null:
+			var ClipboardContextScript = ResourceLoader.load(Global.Root + "scripts/clipboard_context.gd", "GDScript", true)
+			if ClipboardContextScript != null:
+				clipboard_context = ClipboardContextScript.new()
+				clipboard_context._g = Global
+				clipboard_context.clipboard_fix = clipboard_fix
+				clipboard_context.initialize()
+				right_click_util.register(clipboard_context)
 		right_click_util.initialize()
 		print("[UnofficialPatch] RightClickUtil loaded.")
 
@@ -1126,18 +1205,18 @@ func start() -> void:
 	if mod_settings == null or mod_settings.is_enabled("map_gallery"):
 		_load_map_explorer()
 
-	# ArcDraw — Trace des arcs de cercle (90°/180°) avec Ctrl+Molette
+	# ArcDraw — Draws circle arcs (90°/180°) with Ctrl+Wheel
 	if mod_settings == null or mod_settings.is_enabled("arc_draw"):
 		_load_arc_draw()
 
-	# AxisLock — contrainte d'axe Photoshop (Ctrl/Cmd) en draw/edit points
+	# AxisLock — Photoshop-style axis constraint (Ctrl/Cmd) in draw/edit points
 	if mod_settings == null or mod_settings.is_enabled("axis_lock"):
 		_load_axis_lock()
 	
-	# EditPointsUndo — enregistre dans l'historique les modifications faites
-	# en mode Edit Points sur un Pathway (drag, ajout, suppression de point).
-	# Injecté avec les refs aux mods qui mutent aussi les paths, pour
-	# coordonner et éviter les double records.
+	# EditPointsUndo — records into history the changes made in Edit
+	# Points mode on a Pathway (drag, point addition, point removal).
+	# Injected with refs to the mods that also mutate paths, to
+	# coordinate and avoid double records.
 	if _debug_enabled("edit_points_undo"):
 		EditPointsUndoScript = ResourceLoader.load(Global.Root + "scripts/edit_points_undo.gd", "GDScript", true)
 	if EditPointsUndoScript != null:
@@ -1153,8 +1232,8 @@ func start() -> void:
 	if mod_settings == null or mod_settings.is_enabled("undo_preserves_selection"):
 		_load_preserve_selection_undo()
 
-	# Charger SplitPath uniquement si pas deja charge comme mod standalone
-	var _sp_already_loaded = false  # priorite a notre version amelioree
+	# Load SplitPath only if not already loaded as a standalone mod
+	var _sp_already_loaded = false  # our improved version takes priority
 	if _sp_already_loaded:
 		print("[UnofficialPatch] SplitPath already loaded as standalone mod, skipping.")
 	else:
@@ -1169,7 +1248,7 @@ func start() -> void:
 			print("[UnofficialPatch] SplitPath.gd not found, skipping.")
 
 	# MergePath — merges two selected Pathways sharing an endpoint (like vanilla Merge Walls)
-	var _mp_already_loaded = false  # priorite a notre version amelioree
+	var _mp_already_loaded = false  # our improved version takes priority
 	if _mp_already_loaded:
 		print("[UnofficialPatch] MergePaths already loaded as standalone mod, skipping.")
 	else:
@@ -1183,18 +1262,18 @@ func start() -> void:
 		else:
 			print("[UnofficialPatch] merge_path.gd not found, skipping.")
 
-	# DragSelectWalls — toujours charge si pas pris par un mod externe.
-	# Le drag-select des walls ne depend PAS du toggle "Move, Transform
-	# and Copy Walls" : on veut pouvoir drag-selectionner les walls meme
-	# quand le transform/move/copy est desactive. Le mod peut quand meme
-	# etre desactive individuellement via le panel Mod Debug.
-	var _dsw_already_loaded = false  # priorite a notre version amelioree
+	# DragSelectWalls — always loaded if not claimed by an external mod.
+	# Wall drag-select does NOT depend on the "Move, Transform and Copy
+	# Walls" toggle: we want to be able to drag-select walls even when
+	# transform/move/copy is disabled. The mod can still be disabled
+	# individually via the Mod Debug panel.
+	var _dsw_already_loaded = false  # our improved version takes priority
 	if _dsw_already_loaded:
 		print("[UnofficialPatch] DragSelectWalls already loaded as standalone mod, skipping.")
 	else:
 		_load_drag_select_walls()
 
-	# ExportTraceImage - toujours charger notre version (elle prend le relais sur le standalone)
+	# ExportTraceImage - always load our version (it takes over from the standalone)
 	if _debug_enabled("ExportTraceImage"):
 		ExportTraceImageScript = ResourceLoader.load(Global.Root + "scripts/ExportTraceImage.gd", "GDScript", true)
 	if ExportTraceImageScript != null:
@@ -1209,7 +1288,7 @@ func start() -> void:
 	if mod_settings == null or mod_settings.is_enabled("tool_hints"):
 		_load_tool_hint()
 
-	# EditPointsToggle — bascule Edit Points <-> derniere shape dans FloorShapeTool et PatternShapeTool
+	# EditPointsToggle — toggles Edit Points <-> last shape in FloorShapeTool and PatternShapeTool
 	if _debug_enabled("edit_points_toggle"):
 		EditPointsToggleScript = ResourceLoader.load(Global.Root + "scripts/edit_points_toggle.gd", "GDScript", true)
 	if EditPointsToggleScript != null:
@@ -1225,20 +1304,20 @@ func start() -> void:
 	# Build the Mod Debug panel (full mod list).
 	if debug_settings != null:
 		debug_settings.build_panel()
-		# Visibilite initiale du panel debug : suit "Display Debug Panel".
-		# Sans ca, le panel debug serait visible au boot meme quand le
-		# toggle est OFF en disque (parce qu'on charge toujours le mod).
+		# Initial visibility of the debug panel: follows "Display Debug Panel".
+		# Without this, the debug panel would be visible at boot even when
+		# the toggle is OFF on disk (because we always load the mod).
 		if mod_settings != null and not mod_settings.is_enabled("display_debug_tool"):
 			debug_settings.set_visible(false)
-		# Sync initial bidirectionnel pour aligner les deux JSON :
-		# 1) settings -> debug : pour chaque toggle settings dont la valeur
-		#    est false, force OFF les mods debug correspondants. Couvre le
-		#    cas ou l'utilisateur a fait Uncheck All sur settings au run
-		#    precedent (les deux JSON deviennent coherents au prochain boot).
-		# 2) debug -> settings : pour chaque settings_id qui a au moins un
-		#    mod debug OFF, lock le toggle settings correspondant.
-		# L'ordre est important : d'abord settings -> debug (pour aligner
-		# l'etat debug en memoire avant le sync inverse).
+		# Initial two-way sync to align the two JSON files:
+		# 1) settings -> debug: for each settings toggle whose value is
+		#    false, force OFF the corresponding debug mods. Covers the case
+		#    where the user did Uncheck All on settings in a previous run
+		#    (both JSONs become consistent on the next boot).
+		# 2) debug -> settings: for each settings_id that has at least one
+		#    debug mod OFF, lock the corresponding settings toggle.
+		# Order matters: settings -> debug first (to align the in-memory
+		# debug state before the reverse sync).
 		if mod_settings != null:
 			for sid in debug_settings._settings_id_to_mod_ids:
 				var sval = mod_settings.is_enabled(sid)
@@ -1261,9 +1340,9 @@ func _load_save_reminder() -> void:
 	save_reminder._g = Global
 	if popup_blur != null:
 		save_reminder.popup_blur = popup_blur
-	# Injection welcome_popup : save_reminder differe son timer tant que
-	# le welcome popup est encore affiche (sinon les deux popups se
-	# chevauchent et bloquent l'ecran).
+	# welcome_popup injection: save_reminder defers its timer while the
+	# welcome popup is still displayed (otherwise the two popups overlap
+	# and block the screen).
 	save_reminder.welcome_popup = welcome_popup
 	save_reminder.initialize()
 	print("[UnofficialPatch] SaveReminder loaded.")
@@ -1345,8 +1424,8 @@ func _on_map_gallery_toggled(enabled) -> void:
 
 
 func _on_create_pack_from_favorites_toggled(enabled) -> void:
-	# Affiche un warning uniquement quand on passe OFF -> ON, pour rappeler
-	# que le pack genere est a usage personnel et ne doit pas etre redistribue.
+	# Shows a warning only when going OFF -> ON, as a reminder that the
+	# generated pack is for personal use and must not be redistributed.
 	if enabled:
 		_show_pack_redistribution_warning()
 
@@ -1406,8 +1485,8 @@ func _show_pack_redistribution_warning() -> void:
 	var ok_btn := Button.new()
 	ok_btn.text = "I understand"
 	ok_btn.rect_min_size = Vector2(250, 0)
-	# Contour blanc 1px : on override les styleboxes normal/hover/pressed
-	# avec un StyleBoxFlat (fond sombre semi-transparent + bordure blanche).
+	# 1px white outline: we override the normal/hover/pressed styleboxes
+	# with a StyleBoxFlat (semi-transparent dark background + white border).
 	for state in ["normal", "hover", "pressed"]:
 		var sb := StyleBoxFlat.new()
 		sb.bg_color = Color(0.15, 0.14, 0.13, 0.6 if state == "normal" else 0.85)
@@ -1491,7 +1570,7 @@ func _load_no_micro_drag() -> void:
 	no_micro_drag = NoMicroDragScript.new()
 	no_micro_drag._g = Global
 	no_micro_drag.initialize()
-	# Re-wire les refs croisees si les autres mods sont la.
+	# Re-wire the cross-refs if the other mods are there.
 	if overlay_tool != null:
 		no_micro_drag.overlay_tool = overlay_tool
 	if wall_move != null:
@@ -1543,6 +1622,36 @@ func _on_collapsable_controls_toggled(enabled) -> void:
 		_load_select_collapse()
 	else:
 		_unload_select_collapse()
+
+
+func _load_slider_scroll_fix() -> void:
+	if slider_scroll_fix != null:
+		return
+	if _debug_enabled("slider_scroll_fix"):
+		SliderScrollFixScript = ResourceLoader.load(Global.Root + "scripts/slider_scroll_fix.gd", "GDScript", true)
+	if SliderScrollFixScript == null:
+		return
+	slider_scroll_fix = SliderScrollFixScript.new()
+	slider_scroll_fix._g = Global
+	slider_scroll_fix.ui_util = ui_util
+	slider_scroll_fix.initialize()
+	print("[UnofficialPatch] SliderScrollFix loaded.")
+
+
+func _unload_slider_scroll_fix() -> void:
+	if slider_scroll_fix == null:
+		return
+	if slider_scroll_fix.has_method("cleanup"):
+		slider_scroll_fix.cleanup()
+	slider_scroll_fix = null
+	print("[UnofficialPatch] SliderScrollFix unloaded.")
+
+
+func _on_slider_scroll_fix_toggled(enabled) -> void:
+	if enabled:
+		_load_slider_scroll_fix()
+	else:
+		_unload_slider_scroll_fix()
 
 
 # --- SelectRotation / Rotation Slider ---
@@ -1618,10 +1727,10 @@ func _load_group_assets() -> void:
 	group_assets = GroupAssetsScript.new()
 	group_assets._g = Global
 	group_assets.initialize()
-	# Re-register avec le menu contextuel s'il est deja la (hot-toggle ON
-	# apres le boot initial — ordre normal : group_assets est registered
-	# au boot avant right_click_util.initialize, mais en hot-toggle on est
-	# post-boot donc on register a chaud).
+	# Re-register with the context menu if it's already there (hot-toggle
+	# ON after the initial boot — normal order: group_assets is registered
+	# at boot before right_click_util.initialize, but on a hot-toggle we
+	# are post-boot so we register at runtime).
 	if right_click_util != null and right_click_util.has_method("register"):
 		right_click_util.register(group_assets)
 	print("[UnofficialPatch] GroupAssets loaded.")
@@ -1676,9 +1785,9 @@ func _on_custom_grid_layer_toggled(enabled) -> void:
 
 
 # --- PathDrawFix / Draw Over UI ---
-# Permet a path/wall/pattern (et autres tools de dessin) de continuer a
-# tracker la souris quand le curseur sort du viewport, pour pouvoir
-# dessiner par-dessus l'UI.
+# Allows path/wall/pattern (and other drawing tools) to keep tracking
+# the mouse when the cursor leaves the viewport, so you can draw over
+# the UI.
 func _load_path_draw_fix() -> void:
 	if path_draw_fix != null:
 		return
@@ -1688,6 +1797,7 @@ func _load_path_draw_fix() -> void:
 		return
 	path_draw_fix = PathDrawFixScript.new()
 	path_draw_fix._g = Global
+	path_draw_fix.ui_util = ui_util
 	path_draw_fix.initialize()
 	print("[UnofficialPatch] PathDrawFix loaded.")
 
@@ -1771,9 +1881,9 @@ func _on_axis_lock_toggled(enabled) -> void:
 		_unload_axis_lock()
 
 
-# --- Free Transform : runtime gate du context-menu + hide/show du
-# bouton FT du SelectTool panel. ft_context.gd reste toujours charge,
-# c'est lui qui implemente les deux. ---
+# --- Free Transform: runtime gate of the context menu + hide/show of
+# the FT button in the SelectTool panel. ft_context.gd stays always
+# loaded; it implements both. ---
 func _on_free_transform_toggled(enabled) -> void:
 	if ft_context != null and ft_context.has_method("set_button_visible"):
 		ft_context.set_button_visible(enabled)
@@ -1802,8 +1912,8 @@ func _load_curve_edits() -> void:
 			pattern_curve_edit = PatternCurveEditScript.new()
 			pattern_curve_edit._g = Global
 			pattern_curve_edit.initialize()
-	# Re-wire les refs croisees (arc_draw partage les 3 curve_edits, et
-	# edit_points_undo aussi).
+	# Re-wire the cross-refs (arc_draw shares the 3 curve_edits, and so
+	# does edit_points_undo).
 	if arc_draw != null:
 		arc_draw.path_curve_edit = path_curve_edit
 		arc_draw.wall_curve_edit = wall_curve_edit
@@ -1823,7 +1933,7 @@ func _unload_curve_edits() -> void:
 	if pattern_curve_edit != null and pattern_curve_edit.has_method("cleanup"):
 		pattern_curve_edit.cleanup()
 	pattern_curve_edit = null
-	# Clear les refs croisees.
+	# Clear the cross-refs.
 	if arc_draw != null:
 		arc_draw.path_curve_edit = null
 		arc_draw.wall_curve_edit = null
@@ -1841,10 +1951,10 @@ func _on_edit_curves_toggled(enabled) -> void:
 
 
 # --- Wall Move + DragSelectWalls hot-toggle ---
-# Les deux mods bossent ensemble pour permettre de bouger les walls dans
-# le SelectTool (clic-drag d'un wall via wall_move, et inclusion des walls
-# dans les multi-selections via DragSelectWalls). On les active/desactive
-# ensemble derriere le meme toggle.
+# Both mods work together to allow moving walls in the SelectTool
+# (click-dragging a wall via wall_move, and including walls in
+# multi-selections via DragSelectWalls). We enable/disable them
+# together behind the same toggle.
 func _load_wall_move() -> void:
 	if wall_move == null:
 		if _debug_enabled("wall_move"):
@@ -1855,7 +1965,7 @@ func _load_wall_move() -> void:
 			wall_move.overlay_tool = overlay_tool
 			wall_move.ui_util = ui_util
 			wall_move.initialize()
-			# Re-wire vers no_micro_drag s'il est la.
+			# Re-wire to no_micro_drag if it's there.
 			if no_micro_drag != null:
 				no_micro_drag.wall_move = wall_move
 			print("[UnofficialPatch] WallMove loaded.")
@@ -1866,7 +1976,7 @@ func _unload_wall_move() -> void:
 		if wall_move.has_method("cleanup"):
 			wall_move.cleanup()
 		wall_move = null
-		# Clear ref dans no_micro_drag.
+		# Clear the ref in no_micro_drag.
 		if no_micro_drag != null:
 			no_micro_drag.wall_move = null
 		print("[UnofficialPatch] WallMove unloaded.")
@@ -1875,7 +1985,7 @@ func _unload_wall_move() -> void:
 func _load_drag_select_walls() -> void:
 	if drag_select_walls != null:
 		return
-	# Priorite a notre version amelioree : on ne cede plus a uchideshi34.
+	# Our improved version takes priority: we no longer yield to uchideshi34.
 	if _debug_enabled("DragSelectWalls"):
 		DragSelectWallsScript = ResourceLoader.load(Global.Root + "scripts/DragSelectWalls.gd", "GDScript", true)
 	if DragSelectWallsScript == null:
@@ -1901,37 +2011,37 @@ func _unload_drag_select_walls() -> void:
 
 
 func _on_wall_move_transform_toggled(enabled) -> void:
-	# Note : drag_select_walls n'est PAS controle par ce toggle. Il reste
-	# toujours actif (sauf desactivation manuelle dans Mod Debug). Le
-	# toggle ne pilote que wall_move (= la transform box / move / copy
-	# sur walls). Le drag-select reste utile independamment.
+	# Note: drag_select_walls is NOT controlled by this toggle. It stays
+	# always active (unless manually disabled in Mod Debug). The toggle
+	# only drives wall_move (= the transform box / move / copy on walls).
+	# Drag-select remains useful independently.
 	if enabled:
 		_load_wall_move()
 	else:
 		_unload_wall_move()
 
 
-# --- Reposition Portals : runtime flag, delegate a portal_reposition_ui
-# qui sait synchroniser ses boutons "Reposition Portals (Beta)" avec
-# l'etat. wall_tool_portal_fix lit le flag a chaque edit pour faire
-# le reposition ou tomber sur le comportement vanilla. ---
+# --- Reposition Portals: runtime flag, delegated to portal_reposition_ui
+# which knows how to sync its "Reposition Portals (Beta)" buttons with
+# the state. wall_tool_portal_fix reads the flag on every edit to do
+# the reposition or fall back to the vanilla behavior. ---
 func _on_reposition_portals_toggled(enabled) -> void:
 	if portal_reposition_ui != null and portal_reposition_ui.has_method("set_enabled"):
 		portal_reposition_ui.set_enabled(enabled)
 
 
-# Toggle "Display Debug Tool" (haut du panel mod_settings).
-# OFF (hot effect) :
-#   - Hide le panel debug et son bouton dans la barre d'outils Settings
-#   - Reset tous les mods debug a enabled=true (= state initial propre)
-#   - Unlock tous les locked_off de mod_settings (puisque plus aucun mod
-#     debug n'est OFF)
-# ON :
-#   - Re-show le panel + bouton (le tool est deja loaded — il est juste
-#     cache).
-# Si debug_settings n'a jamais ete loaded au boot (display_debug_tool
-# etait OFF en disque), on ne fait rien : le toggle prend effet au
-# prochain launch via le gate dans start().
+# "Display Debug Tool" toggle (top of the mod_settings panel).
+# OFF (hot effect):
+#   - Hide the debug panel and its button in the Settings toolbar
+#   - Reset all debug mods to enabled=true (= clean initial state)
+#   - Unlock all locked_off entries in mod_settings (since no debug
+#     mod is OFF anymore)
+# ON:
+#   - Re-show the panel + button (the tool is already loaded — it is
+#     just hidden).
+# If debug_settings was never loaded at boot (display_debug_tool was
+# OFF on disk), we do nothing: the toggle takes effect on the next
+# launch via the gate in start().
 func _on_display_debug_tool_toggled(enabled) -> void:
 	if debug_settings == null:
 		return
@@ -2010,6 +2120,45 @@ func _on_select_filter_bar_bar_button_toggled(enabled) -> void:
 		select_filter_bar.set_bar_button_enabled(enabled)
 
 
+func _load_library_right_panel() -> void:
+	if library_right_panel != null:
+		return
+	# Gate first, then load. Loading inside the gate made the outcome depend on
+	# whether the script happened to be cached from an earlier load, so a mod
+	# that had already been loaded once behaved differently from one that had
+	# never been loaded.
+	if not _debug_enabled("library_right_panel"):
+		return
+	if LibraryRightPanelScript == null:
+		LibraryRightPanelScript = ResourceLoader.load(Global.Root + "scripts/library_right_panel.gd", "GDScript", true)
+	if LibraryRightPanelScript == null:
+		return
+	library_right_panel = LibraryRightPanelScript.new()
+	library_right_panel._g = Global
+	library_right_panel.ui_util = ui_util
+	library_right_panel.initialize()
+	print("[UnofficialPatch] LibraryRightPanel loaded.")
+
+
+func _unload_library_right_panel() -> void:
+	if library_right_panel == null:
+		return
+	if library_right_panel.has_method("cleanup"):
+		library_right_panel.cleanup()
+	library_right_panel = null
+	print("[UnofficialPatch] LibraryRightPanel unloaded.")
+
+
+func _on_library_right_panel_toggled(enabled) -> void:
+	if enabled:
+		_load_library_right_panel()
+		# Hot toggle: ASO has long finished building, apply on the next frame.
+		if library_right_panel != null:
+			library_right_panel.boot_delay = 0.0
+	else:
+		_unload_library_right_panel()
+
+
 func _on_overlay_bar_button_toggled(enabled) -> void:
 	if overlay_tool != null and overlay_tool.has_method("set_bar_button_enabled"):
 		overlay_tool.set_bar_button_enabled(enabled)
@@ -2044,6 +2193,12 @@ func _on_tool_hints_toggled(enabled) -> void:
 		_unload_tool_hint()
 
 
+# Per-frame editor-state cache shared with all submods through Engine
+# metadata ("_uu_editor_state"). Kept as a member so the SAME Dictionary
+# instance is reused every frame; Engine.set_meta is only called once.
+var _uu_editor_state := {}
+
+
 func update(delta) -> void:
 	# ── Profiler (press F10 to start, F10 again to print results to console) ──
 	var _pk := Input.is_key_pressed(KEY_F10)
@@ -2051,6 +2206,33 @@ func update(delta) -> void:
 		_prof_toggle()
 	_prof_key_was = _pk
 	if _prof_on:
+		# Temps REEL depuis le debut de la frame precedente : capte TOUT
+		# (GC Mono, rendu, input), pas seulement notre dispatch update().
+		var _now := OS.get_ticks_usec()
+		if _prof_prev_tick > 0:
+			var gap := _now - _prof_prev_tick
+			if gap > _prof_gap_max:
+				_prof_gap_max = gap
+				_prof_gap_max_at = _prof_frames
+			if gap >= 33000:
+				_prof_gap_33 += 1
+			if gap >= 50000:
+				_prof_gap_50 += 1
+			if gap >= 100000:
+				_prof_gap_100 += 1
+		_prof_prev_tick = _now
+		# Finalise la frame precedente : _prof_cur = somme des submods _pu du
+		# dispatch precedent. On enregistre les pics et frames droppees avant
+		# d'entamer la frame suivante.
+		if _prof_frames > 0:
+			if _prof_cur > _prof_frame_peak:
+				_prof_frame_peak = _prof_cur
+				_prof_frame_peak_at = _prof_frames
+			if _prof_cur >= 16666:
+				_prof_over_16ms += 1
+			elif _prof_cur >= 8333:
+				_prof_over_8ms += 1
+		_prof_cur = 0
 		_prof_frames += 1
 	# Detect clicks on the overlay buttons via polling so they keep working
 	# even when an exclusive modal (e.g. Save Reminder) is grabbing GUI input.
@@ -2069,9 +2251,9 @@ func update(delta) -> void:
 	if _loading_popup != null:
 		if prefabs_thumbnails == null or prefabs_thumbnails._prefetch_done:
 			_close_loading_popup()
-			# Loading popup vient de fermer : c'est le moment d'afficher le
-			# welcome popup pour les nouveaux utilisateurs (no-op si l'user
-			# a deja coche "Do not show again").
+			# The loading popup just closed: this is the moment to show the
+			# welcome popup for new users (no-op if the user already checked
+			# "Do not show again").
 			if welcome_popup != null and welcome_popup.has_method("show_if_first_time"):
 				welcome_popup.show_if_first_time()
 		else:
@@ -2080,11 +2262,13 @@ func update(delta) -> void:
 				_loading_popup.raise()
 			return
 	else:
-		# Pas de loading popup (toggle desactive) : on tente d'afficher le
-		# welcome popup direct. show_if_first_time est idempotent — il
-		# no-op si deja affiche ou si l'user l'a marque comme vu.
+		# No loading popup (toggle disabled): we try to show the welcome
+		# popup directly. show_if_first_time is idempotent — it no-ops if
+		# already shown or if the user has marked it as seen.
 		if welcome_popup != null and welcome_popup.has_method("show_if_first_time"):
 			welcome_popup.show_if_first_time()
+	# ── Per-frame editor-state cache (see _refresh_editor_state_cache) ──
+	_refresh_editor_state_cache()
 	_pu("alt_deselect", alt_deselect, delta)
 	_pu("prefs_label_fix", prefs_label_fix, delta)
 	_pu("mod_settings", mod_settings, delta)
@@ -2095,12 +2279,14 @@ func update(delta) -> void:
 	_pu("preview_fix", preview_fix, delta)
 	_pu("select_fix", select_fix, delta)
 	_pu("scatter_multiselect_fix", scatter_multiselect_fix, delta)
+	_pu("scatter_transform", scatter_transform, delta)
 	_pu("select_cursor_fix", select_cursor_fix, delta)
 	_pu("select_highlight_fix", select_highlight_fix, delta)
 	_pu("drag_select_focus_fix", drag_select_focus_fix, delta)
 	_pu("select_layer_pick_fix", select_layer_pick_fix, delta)
-	_pu("select_layer_pick_fix", select_layer_pick_fix, delta)
 	_pu("compare_fix", compare_fix, delta)
+	_pu("export_light_fix", export_light_fix, delta)
+	_pu("export_brightness_fix", export_brightness_fix, delta)
 	_pu("level_settings_fix", level_settings_fix, delta)
 	_pu("level_settings_extra", level_settings_extra, delta)
 	_pu("light_fix", light_fix, delta)
@@ -2111,6 +2297,7 @@ func update(delta) -> void:
 	_pu("pattern_fix", pattern_fix, delta)
 	_pu("favorites", favorites, delta)
 	_pu("pack_cache_fix", pack_cache_fix, delta)
+	_pu("search_persist", search_persist, delta)
 	_pu("roof_select", roof_select, delta)
 	_pu("grid_fix", grid_fix, delta)
 	_pu("path_draw_fix", path_draw_fix, delta)
@@ -2134,7 +2321,7 @@ func update(delta) -> void:
 	_pu("split_path", split_path, delta)
 	_pu("merge_path", merge_path, delta)
 	if drag_select_walls != null:
-		# Assigner dsw au listener apres add_child
+		# Assign dsw to the listener after add_child
 		if drag_select_walls._pending_emitter != null and is_instance_valid(drag_select_walls._pending_emitter):
 			drag_select_walls._pending_emitter.dsw = drag_select_walls
 			drag_select_walls._pending_emitter = null
@@ -2157,22 +2344,23 @@ func update(delta) -> void:
 	_pu("ui_rescaler", ui_rescaler, delta)
 	_pu("arc_draw", arc_draw, delta)
 	_pu("tool_hint", tool_hint, delta)
+	_pu("library_right_panel", library_right_panel, delta)
 
 
 # ── Debug Settings : registration of all loadable mods ───────────────────────
-# Liste passee a debug_settings.register_mod(id, label, depends_on, settings_id).
-# - id : nom du fichier sans .gd (matche aussi le nom de var dans Main.gd)
-# - depends_on : autres mods requis ; cascade-off si le parent est disable
-# - settings_id : si renseigne, lit le toggle correspondant dans mod_settings ;
-#   quand ce toggle est OFF, le mod est force OFF dans le panel debug et grise
+# List passed to debug_settings.register_mod(id, label, depends_on, settings_id).
+# - id: file name without .gd (also matches the var name in Main.gd)
+# - depends_on: other required mods; cascades off if the parent is disabled
+# - settings_id: if set, reads the corresponding toggle in mod_settings;
+#   when that toggle is OFF, the mod is forced OFF in the debug panel and greyed out
 
 func _register_debug_mods() -> void:
 	if debug_settings == null:
 		return
-	# Ordre d'enregistrement sans importance — debug_settings trie alpha.
-	# Format : register_mod(id, label, depends_on, settings_id, tooltip)
+	# Registration order doesn't matter — debug_settings sorts alphabetically.
+	# Format: register_mod(id, label, depends_on, settings_id, tooltip)
 	debug_settings.register_mod("save_bypass", "Save Bypass (anti-busy)", [], "",
-		"Fait fonctionner Ctrl+S, le bouton SAVE et le menu\n'Save As' meme quand DD reste bloque sur 'busy' : ecrit\nla map (meme nom, dialogue OS natif pour Save As) sans le\npopup. N'intervient QUE lorsque le blocage est detecte.")
+		"Makes Ctrl+S, the SAVE button and the 'Save As' menu\nwork even when DD stays stuck on 'busy': writes the map\n(same name, native OS dialog for Save As) without the\npopup. Only kicks in when the lockup is detected.")
 	# Foundations
 	debug_settings.register_mod("ui_util", "", [], "",
 		"Shared UI helpers used by many other mods.\nDisabling this will break most of them.")
@@ -2193,6 +2381,8 @@ func _register_debug_mods() -> void:
 		"Various selection-related quirks fixes (offset bugs,\nstale highlights, edge cases).")
 	debug_settings.register_mod("scatter_multiselect_fix", "Scatter Multiselect Fix", [], "",
 		"Fixes the multi-second freeze when Shift-selecting a large\nrange of assets in the Scatter Tool's object library.")
+	debug_settings.register_mod("scatter_transform", "Scatter Manual Transform", [], "",
+		"Scatter Tool: wheel rotates the asset in hand (Z = 5\u00b0,\nShift+Z = 1\u00b0) and Alt+wheel resizes it, overriding the\nrandom rotation/scale for that object only.")
 	debug_settings.register_mod("select_cursor_fix", "", [], "",
 		"Fixes the cursor staying stuck on a resize/move/rotate\nshape when leaving SelectTool via a keyboard shortcut\nwhile hovering or manipulating a transform handle.")
 	debug_settings.register_mod("select_highlight_fix", "", [], "",
@@ -2203,6 +2393,10 @@ func _register_debug_mods() -> void:
 		"Fixes a vanilla bug where an object stacked under another\non the same layer stops being hover-detectable after the\ntop object's layer is changed and changed back.")
 	debug_settings.register_mod("compare_fix", "", [], "",
 		"Fixes the 'Compare' window behavior when toggling\nbetween before/after states.")
+	debug_settings.register_mod("export_light_fix", "", [], "",
+		"Fixes lights on the overlay level passing through\nfreestanding doors and windows when exporting two\nlevels at once (source + overlay).")
+	debug_settings.register_mod("export_brightness_fix", "", [], "",
+		"Fixes light sources being double-tinted by the ambient\nlight color in the Export window when Brightness or\nFocus is below 100%.")
 	debug_settings.register_mod("level_settings_fix", "", [], "",
 		"Lets the Levels list in the Level Settings panel grow\nto fill the panel height, instead of being a small fixed\nbox you have to scroll through once you add a few levels.")
 	debug_settings.register_mod("level_settings_extra", "", [], "",
@@ -2217,6 +2411,8 @@ func _register_debug_mods() -> void:
 		"Fixes camera pan glitches when middle-clicking or\nholding space during certain actions.")
 	debug_settings.register_mod("wall_allow_light", "", [], "",
 		"Adds a per-wall toggle to let light pass through\nspecific walls (useful for windows, archways).")
+	debug_settings.register_mod("wall_bevel", "", [], "",
+		"Adds a Bevel Corners toggle to the SelectTool for\nswitching selected walls between beveled and sharp corners.")
 	debug_settings.register_mod("drop_fix", "", [], "",
 		"Fixes file-drop behavior (image embedding, prefab\nfiles, etc.).")
 	debug_settings.register_mod("pattern_fix", "", [], "",
@@ -2263,11 +2459,13 @@ func _register_debug_mods() -> void:
 		"Adds an 'Export Trace Image' option to save the\ncurrent trace as a separate image file.")
 	debug_settings.register_mod("trace_tool_webp_fix", "", [], "",
 		"Fixes WEBP image loading in the Trace Tool.")
-	# Settings-tied : 1 mod = 1 settings
+	# Settings-tied: 1 mod = 1 settings entry
 	debug_settings.register_mod("save_reminder", "", [], "save_reminder",
 		"Pops up a reminder after a few minutes if you haven't\nsaved your map yet.")
 	debug_settings.register_mod("pack_cache_fix", "", [], "pack_cache_popup",
 		"Adds a popup at startup offering to clean stale entries\nfrom DD's pack cache.")
+	debug_settings.register_mod("search_persist", "Search Persist", [], "",
+		"Restores the Object/Scatter search results when you switch\nback to the tool (DD keeps the text but not the results).")
 	debug_settings.register_mod("map_explorer", "Map Explorer", [], "map_gallery",
 		"Adds the 'Map Gallery' menu entry: a thumbnail browser\nfor all your saved maps.")
 	debug_settings.register_mod("drop_embed", "", [], "drop_embed",
@@ -2280,6 +2478,8 @@ func _register_debug_mods() -> void:
 		"Photoshop-like ruler overlay around the map viewport\nwith a 'Guides' button (Ctrl+R).")
 	debug_settings.register_mod("select_filter_bar", "", [], "select_filter_bar",
 		"Repositionable horizontal bar of asset-type filter\ncheckboxes for the Select Tool ('Filters' floatbar button).")
+	debug_settings.register_mod("library_right_panel", "Library Right Panel", [], "library_right_panel",
+		"Moves the tool asset libraries (Floor, Wall, Portal, Cave,\nPattern, Roof, Material, Light + Select Tool ones) from the\nleft tool panel into a dedicated right-side panel.")
 	debug_settings.register_mod("overlay_tool", "", [], "walls_paths_overlay",
 		"Toggleable overlay that highlights all walls and paths\non the map for easier review.")
 	debug_settings.register_mod("grid_fix", "", [], "",
@@ -2294,6 +2494,8 @@ func _register_debug_mods() -> void:
 		"Lets you group selected assets together so they move,\nrotate, and scale as a unit.")
 	debug_settings.register_mod("select_collapse", "", [], "collapsable_controls",
 		"Adds collapse arrows to SelectTool panel sections so\nyou can hide controls you don't use.")
+	debug_settings.register_mod("slider_scroll_fix", "", [], "slider_scroll_fix",
+		"Mousewheel over a slider/spinbox changes its value\ninstead of scrolling the surrounding panel.")
 	debug_settings.register_mod("eyedropper", "", [], "picker_tool_enter",
 		"Pressing Enter in the Picker Tool selects the asset\nunder the cursor (instead of needing a click).")
 	debug_settings.register_mod("preserve_selection_undo", "", [], "undo_preserves_selection",
@@ -2308,7 +2510,7 @@ func _register_debug_mods() -> void:
 		"Generates thumbnail previews for every prefab with\nmultiple display modes.")
 	debug_settings.register_mod("popup_blur", "", [], "blurred_popup_background",
 		"Blurs the editor background behind dialog popups.")
-	# Settings-tied : 1 mod = plusieurs settings (Array)
+	# Settings-tied: 1 mod = multiple settings entries (Array)
 	debug_settings.register_mod("rotation_fix", "", [], ["consistent_rotation", "one_deg_rotation"],
 		"Unifies rotation step (15°/Z=5°) across all tools, plus\nadds Shift+Z+wheel for 1° rotation.")
 	debug_settings.register_mod("asset_cycle", "", [], ["select_tool_asset_cycle", "pattern_right_click_rotation"],
@@ -2326,7 +2528,12 @@ func _register_debug_mods() -> void:
 		"Adds 'Free Transform' to the right-click context menu\nin the SelectTool.")
 	debug_settings.register_mod("rotate_context", "Rotate Context", [], "",
 		"Adds 'Rotate 90°' to the right-click context menu and\ndisables RotateAndJiggle's right-click auto-rotation.")
-	debug_settings.register_mod("no_micro_drag", "", ["overlay_tool"], "better_selection",
+	# Pas de depends_on sur overlay_tool : no_micro_drag ne lui emprunte que
+	# _is_mouse_on_wall() (helper de geometrie pure), sur un seul site deja
+	# null-garde. Sans overlay_tool on perd uniquement le bypass sur les walls,
+	# le reste du mod fonctionne. wall_move, lui, garde la dependance : il lit
+	# _hover_wall / path_fix et devient inerte sans overlay_tool.
+	debug_settings.register_mod("no_micro_drag", "", [], "better_selection",
 		"Distinguishes click vs drag better : ignores tiny\nmouse movements that vanilla treats as drags.")
 	debug_settings.register_mod("wall_move", "", ["overlay_tool"], "wall_move_transform",
 		"Lets you move, rotate, scale, and copy walls using\nthe SelectTool transform box.")
@@ -2348,8 +2555,6 @@ func _register_debug_mods() -> void:
 		"Fixes portal placement bugs when using the Wall Tool\nin Edit Points mode.")
 	debug_settings.register_mod("select_rotation", "", ["rotation_snap"], "rotation_slider",
 		"Adds a rotation slider/spinbox in the SelectTool panel\nfor precise asset rotation.")
-	debug_settings.register_mod("pattern_scale_bake", "Pattern Scale Bake", [], "",
-		"Adds a 'Bake Pattern Scale' option to the right-click\nmenu for selected patterns whose scale isn't (1, 1).\nBakes node.scale into the polygon vertices so DD's snap\npipeline (which references node.position) aligns with\nthe rendered corner positions.\nUse after a vanilla resize if the pattern no longer\nsnaps the way you expect.")
 
 
 # Helper called by every conditional load site in start(). Returns true (= go
@@ -2360,6 +2565,41 @@ func _debug_enabled(id: String) -> bool:
 	return debug_settings.is_mod_enabled(id)
 
 # ── Profiler helpers ─────────────────────────────────────────────────────────
+func _refresh_editor_state_cache() -> void:
+	# Reads ActiveToolName ONCE per frame and publishes it through Engine
+	# metadata; submods read the shared copy via their _active_tool_name()
+	# helper instead of each marshaling a fresh String across the C++
+	# boundary (~1,800 allocations/second at idle before this cache).
+	# CRASH HAZARD (learned the hard way): rewriting the stored String
+	# every frame while readers hold COW references to the previous value
+	# causes a native access violation (c0000005) in DD's Godot fork on
+	# tool switches. Two rules keep this safe — do NOT relax either:
+	#   1. The Dictionary entry is only rewritten when the value CHANGES
+	#      (a handful of times per session instead of 60/s).
+	#   2. Readers must return a forced COPY, never the stored reference
+	#      (see the _active_tool_name() helpers in the submods).
+	var atn := ""
+	if Global.Editor != null:
+		atn = str(Global.Editor.ActiveToolName)
+	# ADOPT, don't republish: DD re-instantiates mods on every map load but
+	# Engine metadata survives. A fresh Main instance keeping its own member
+	# dict while the meta still points at the OLD instance's dict froze the
+	# published value for the rest of the session ('ObjectTool while
+	# scattering' bug -- every _uu_editor_state reader desynced at once).
+	# Adopting the already-published Dictionary keeps ONE shared dict alive
+	# across map loads; rewrite-on-change (rule 1 above) still applies to it.
+	if Engine.has_meta("_uu_editor_state"):
+		var shared = Engine.get_meta("_uu_editor_state")
+		if shared is Dictionary:
+			_uu_editor_state = shared
+		else:
+			Engine.set_meta("_uu_editor_state", _uu_editor_state)
+	else:
+		Engine.set_meta("_uu_editor_state", _uu_editor_state)
+	if _uu_editor_state.get("active_tool_name") != atn:
+		_uu_editor_state["active_tool_name"] = atn
+
+
 func _pu(n, ref, delta) -> void:
 	if ref == null:
 		return
@@ -2368,7 +2608,14 @@ func _pu(n, ref, delta) -> void:
 		return
 	var t0 := OS.get_ticks_usec()
 	ref.update(delta)
-	_prof_acc[n] = _prof_acc.get(n, 0) + (OS.get_ticks_usec() - t0)
+	var dt := OS.get_ticks_usec() - t0
+	_prof_acc[n] = _prof_acc.get(n, 0) + dt
+	if dt > _prof_max.get(n, 0):
+		_prof_max[n] = dt
+		_prof_peak_frame[n] = _prof_frames
+	if dt >= _PROF_SPIKE_US:
+		_prof_spikes[n] = _prof_spikes.get(n, 0) + 1
+	_prof_cur += dt
 
 
 func _prof_toggle() -> void:
@@ -2392,6 +2639,20 @@ func _prof_start() -> void:
 	_prof_state = "running"
 	_prof_acc = {}
 	_prof_frames = 0
+	_prof_max = {}
+	_prof_spikes = {}
+	_prof_peak_frame = {}
+	_prof_cur = 0
+	_prof_frame_peak = 0
+	_prof_frame_peak_at = 0
+	_prof_over_8ms = 0
+	_prof_over_16ms = 0
+	_prof_prev_tick = 0
+	_prof_gap_max = 0
+	_prof_gap_max_at = 0
+	_prof_gap_33 = 0
+	_prof_gap_50 = 0
+	_prof_gap_100 = 0
 	if Global.ModMapData is Dictionary:
 		Global.ModMapData["_prof_dsw_usec"] = 0
 		Global.ModMapData["_prof_umou_usec"] = 0
@@ -2667,25 +2928,47 @@ func _prof_dump() -> void:
 	for k in _prof_acc:
 		var avg := float(_prof_acc[k]) / float(frames)
 		total += avg
-		rows.append([k, avg])
+		# max = pire frame de ce submod. Les agregats replies (DragSelectWalls,
+		# is_mouse_over_ui, free_transform::*) n'ont pas d'echantillon par frame
+		# -> max = -1 -> affiche "-".
+		var mx = _prof_max.get(k, -1)
+		var sp = _prof_spikes.get(k, 0)
+		var pf = _prof_peak_frame.get(k, -1)
+		var sortv = mx if mx >= 0 else int(avg)
+		rows.append([k, avg, mx, sp, pf, sortv])
 	rows.sort_custom(self, "_prof_sort")
 	_prof_last_lines = []
-	var header := "===== avg us/frame over %d frames (worst first) =====" % frames
+	var header := "===== profiler over %d frames (sorted by worst single frame) =====" % frames
+	var col := "   max_us    avg_us  spikes   peak@  name"
 	print("[PROF] " + header)
+	print("[PROF] " + col)
 	_prof_last_lines.append(header)
+	_prof_last_lines.append(col)
 	for r in rows:
-		if r[1] < 1.0:
+		if r[5] < 1.0:
 			continue
-		var line := "%9.1f us   %s" % [r[1], r[0]]
+		var max_s = ("%9.1f" % float(r[2])) if r[2] >= 0 else "        -"
+		var sp_s = ("%6d" % r[3]) if r[2] >= 0 else "     -"
+		var pf_s = ("%6d" % r[4]) if r[4] >= 0 else "     -"
+		var line := "%s %9.1f %s %s   %s" % [max_s, r[1], sp_s, pf_s, r[0]]
 		print("[PROF] " + line)
 		_prof_last_lines.append(line)
-	var footer1 := "----- total measured: %.1f us/frame -----" % total
-	var footer2 := "(~%.1f%% of the 16666us 60fps budget)" % (total / 16666.0 * 100.0)
+	var footer1 := "----- avg total: %.1f us/frame  (~%.1f%% of 16666us 60fps budget) -----" % [total, total / 16666.0 * 100.0]
+	var footer2 := "----- worst single frame (all _pu submods): %.1f us @ frame %d -----" % [float(_prof_frame_peak), _prof_frame_peak_at]
+	var footer3 := "----- frames >=8ms: %d   frames >=16ms (dropped): %d   / %d -----" % [_prof_over_8ms, _prof_over_16ms, frames]
 	print("[PROF] " + footer1)
 	print("[PROF] " + footer2)
+	var footer4 := "----- REAL frame time (wall clock incl. GC/render/input): max %.1f ms @ frame %d -----" % [float(_prof_gap_max) / 1000.0, _prof_gap_max_at]
+	var footer5 := "----- real frames >=33ms: %d   >=50ms: %d   >=100ms: %d   / %d -----" % [_prof_gap_33, _prof_gap_50, _prof_gap_100, frames]
+	print("[PROF] " + footer3)
+	print("[PROF] " + footer4)
+	print("[PROF] " + footer5)
 	_prof_last_lines.append(footer1)
 	_prof_last_lines.append(footer2)
+	_prof_last_lines.append(footer3)
+	_prof_last_lines.append(footer4)
+	_prof_last_lines.append(footer5)
 
 
 func _prof_sort(a, b):
-	return a[1] > b[1]
+	return a[5] > b[5]
