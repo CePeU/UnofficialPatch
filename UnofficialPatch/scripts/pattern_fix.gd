@@ -135,8 +135,17 @@ func _find_all_of_class(node, cls: String, result: Array):
 
 
 func _install_input_listener():
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_patternfix_listener"):
+		var _old_n = Engine.get_meta("up_patternfix_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	_input_listener = Node.new()
 	_input_listener.name = "PatternFixListener"
+	Engine.set_meta("up_patternfix_listener", _input_listener)
 	var script = GDScript.new()
 	script.source_code = """extends Node
 var handler = null

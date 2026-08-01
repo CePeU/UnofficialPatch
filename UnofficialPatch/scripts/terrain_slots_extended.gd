@@ -368,6 +368,12 @@ func _sync_current_level() -> void:
 	if _cur_level_terrain != null and is_instance_valid(_cur_level_terrain):
 		_save_level_state(_cur_level_terrain)
 		_stash_current_buffers()
+	# Viewer a shader emprunte : il est lie au niveau qu'on quitte -> on coupe
+	# le surlignage et on rend son shader vanilla a l'ancien niveau.
+	if _hl_shader_temp:
+		_hl_slot = -1
+		_hide_hl_hint()
+		_hl_release_temp_shader(_cur_level_terrain)
 	_cur_level_terrain = cur
 	# Entering the new level: load its saved active flags (buffers load lazily).
 	_load_level_state(cur)
@@ -868,6 +874,12 @@ func activate(terrain, quiet := false) -> bool:
 func deactivate(terrain) -> void:
 	if terrain == null:
 		terrain = _get_terrain()
+	# Coupe le viewer : sans cela _hl_slot resterait arme apres la desactivation
+	# et le prochain clic droit serait consomme "a vide" (bascule fantome).
+	_hl_shader_temp = false   # le shader est rendu ci-dessous de toute facon
+	if _hl_slot >= 0:
+		_hl_slot = -1
+		_hide_hl_hint()
 	_active = false
 	_active24 = false
 	_extra_selected = false
@@ -960,6 +972,18 @@ func _tick(delta) -> void:
 		# undoes an immediate call.
 		if _extra_selected:
 			call_deferred("_enforce_vanilla_deselect")
+	elif _hl_shader_temp and _hl_slot >= 0:
+		# Shader emprunte par le viewer : DD peut rebrancher son shader vanilla
+		# (ex. bascule de Smooth Blending) -> on re-affirme le notre, comme le
+		# fait le bloc _active ci-dessus.
+		var terrain_hl = _get_terrain()
+		if terrain_hl != null:
+			var mat_hl = _get_material(terrain_hl)
+			if mat_hl != null:
+				var want_hl = _smooth16 if terrain_hl.get("SmoothBlending") == true else _height16
+				if mat_hl.shader != want_hl:
+					_push_extra_splats(mat_hl)
+					mat_hl.shader = want_hl
 
 
 func _on_input(e) -> bool:
@@ -1186,7 +1210,14 @@ func _collect_custom_pack_terrains() -> Array:
 # ── Temporary HUD (current slot + thumbnail) ──────────────────────────────────
 
 func _build_hud() -> void:
+	# Cross-session guard: free a HUD layer left over from a previous mod
+	# instance (the tree root persists across map reloads).
+	if Engine.has_meta("tse_hud"):
+		var _old_hud = Engine.get_meta("tse_hud")
+		if is_instance_valid(_old_hud):
+			_old_hud.queue_free()
 	_hud = CanvasLayer.new()
+	Engine.set_meta("tse_hud", _hud)
 	_hud.layer = 128
 
 	_hud_panel = PanelContainer.new()
@@ -1221,7 +1252,14 @@ func _hide_hud() -> void:
 # Etiquette "right click: exit area viewer" affichee a cote du curseur tant que
 # le surlignage des zones peintes est actif (clic droit sur la map).
 func _build_hl_hint() -> void:
+	# Cross-session guard (see _build_hud): free a stale hint layer from a
+	# previous mod instance still parented to the persistent tree root.
+	if Engine.has_meta("tse_hl_hint"):
+		var _old_hint = Engine.get_meta("tse_hl_hint")
+		if is_instance_valid(_old_hint):
+			_old_hint.queue_free()
 	_hl_hint = CanvasLayer.new()
+	Engine.set_meta("tse_hl_hint", _hl_hint)
 	_hl_hint.layer = 128
 	var panel = PanelContainer.new()
 	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -2762,6 +2800,7 @@ func _clear_highlight() -> void:
 		_hl_slot = -1
 		_apply_highlight_params()
 		_hide_hl_hint()
+	_hl_release_temp_shader()
 
 
 func _deselect_extra_lists() -> void:
@@ -3423,23 +3462,67 @@ func _current_paint_slot() -> int:
 	return _paint_slot
 
 
+# Vrai quand le viewer a emprunte notre shader SANS activer le mode etendu
+# (slots natifs surlignes depuis le mode vanilla). Rendu au moment de quitter.
+var _hl_shader_temp := false
+
 # Bascule le surlignage du slot courant depuis un clic droit sur la map.
 func _toggle_map_highlight() -> void:
 	if _hl_slot >= 0:
 		_hl_slot = -1
 		_hide_hl_hint()
-	else:
-		var slot = _current_paint_slot()
-		if slot < 0:
+		_apply_highlight_params()
+		_hl_release_temp_shader()
+		return
+	var slot = _current_paint_slot()
+	if slot < 0:
+		return
+	# Le surlignage exige notre shader ; les slots 17-24 exigent le mode 24
+	# (leur splat n'est lie qu'a ce moment-la). Pour un slot natif depuis le
+	# mode vanilla, on EMPRUNTE le shader sans activer les slots 9-16 : les
+	# splats etendus vides rendent l'affichage identique au vanilla, et on
+	# rend le shader natif a la sortie du viewer.
+	if slot >= 16 and not _active24:
+		_on_toggle24(true)
+	elif not _active:
+		if not _hl_borrow_shader():
 			return
-		_hl_slot = slot
-		# Le surlignage exige notre shader actif ; les slots 17-24 exigent le mode 24
-		# (leur splat n'est lie qu'a ce moment-la).
-		if slot >= 16 and not _active24:
-			_on_toggle24(true)
-		elif not _active:
-			_on_toggle(true)
+	# Fixe APRES l'activation eventuelle : un _clear_highlight declenche par un
+	# signal de selection pendant celle-ci ne peut plus effacer le nouvel etat.
+	_hl_slot = slot
 	_apply_highlight_params()
+
+
+# Applique notre shader 16 slots pour le seul rendu du surlignage, sans rien
+# activer d'autre (pas d'expand natif, pas d'UI 9-16, _active inchange).
+func _hl_borrow_shader() -> bool:
+	var terrain = _get_terrain()
+	if terrain == null:
+		return false
+	if not _ensure_buffers(terrain):
+		return false
+	var mat = _get_material(terrain)
+	if mat == null:
+		return false
+	_ensure_extra_array()
+	_push_extra_splats(mat)
+	mat.shader = _smooth16 if terrain.get("SmoothBlending") == true else _height16
+	_hl_shader_temp = true
+	return true
+
+
+# Rend le shader vanilla si le viewer l'avait emprunte. `terrain` permet de
+# viser l'ancien niveau lors d'un changement ; defaut = niveau courant.
+func _hl_release_temp_shader(terrain = null) -> void:
+	if not _hl_shader_temp:
+		return
+	_hl_shader_temp = false
+	if _active:
+		return   # le mode etendu a ete active entre-temps : il possede le shader
+	if terrain == null:
+		terrain = _get_terrain()
+	if terrain != null and is_instance_valid(terrain):
+		terrain.SetSmoothBlending(terrain.get("SmoothBlending") == true)
 
 
 # Grey out AND block DD's brush controls (tool buttons, Brush Size, Intensity)
@@ -4564,6 +4647,9 @@ func _persist_tick() -> void:
 
 
 func _on_world_changed() -> void:
+	_hl_slot = -1
+	_hl_shader_temp = false
+	_hide_hl_hint()
 	_active = false
 	_active24 = false
 	_native_expanded_before = false

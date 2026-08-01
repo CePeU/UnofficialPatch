@@ -154,8 +154,16 @@ func _setup() -> void:
 	var t = _g.World.get_tree().create_timer(0.5)
 	t.connect("timeout", self, "_load_initial_set")
 	# Noeud holder isole pour les Viewports de rendu -- hors de _g.World
+	# Cross-session guard: the tree root persists across map reloads, so a
+	# holder built by a previous mod instance is still parented there. Free it
+	# before creating ours, otherwise its render Viewports pile up every reload.
+	if Engine.has_meta("pft_vp_holder"):
+		var _old_vp = Engine.get_meta("pft_vp_holder")
+		if is_instance_valid(_old_vp):
+			_old_vp.queue_free()
 	_vp_holder = Node.new()
 	_vp_holder.name = "PrefabsThumbsVPHolder"
+	Engine.set_meta("pft_vp_holder", _vp_holder)
 	_panel.get_tree().root.add_child(_vp_holder)
 	print("[PrefabsThumbs] Ready -- %d sets indexed" % _prefab_index.size())
 	call_deferred("_discover_prefab_tool_methods")
@@ -696,10 +704,20 @@ func _hook_item_list_interception() -> void:
 	var script = GDScript.new()
 	script.source_code = "extends Node\nvar handler = null\nfunc _input(e):\n\tif handler != null: handler._on_prefab_list_input(e)\n"
 	script.reload()
+	# Cross-session guard: an interceptor from a previous mod instance is still
+	# parented to the persistent tree root, and its handler still points at the
+	# stale instance -- keeping it alive with a live _input(). Free it first and
+	# break the back-reference so the old instance can finally be released.
+	if Engine.has_meta("pft_click_interceptor"):
+		var _old_ci = Engine.get_meta("pft_click_interceptor")
+		if is_instance_valid(_old_ci):
+			_old_ci.set("handler", null)
+			_old_ci.queue_free()
 	_click_interceptor = Node.new()
 	_click_interceptor.name = "PrefabsThumbsClickInterceptor"
 	_click_interceptor.set_script(script)
 	_click_interceptor.handler = self
+	Engine.set_meta("pft_click_interceptor", _click_interceptor)
 	_g.World.get_tree().root.call_deferred("add_child", _click_interceptor)
 	_g.World.get_tree().root.call_deferred("move_child", _click_interceptor, 0)
 	print("[PrefabsThumbs] Click interceptor installed")

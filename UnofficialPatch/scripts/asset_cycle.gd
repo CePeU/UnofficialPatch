@@ -45,12 +45,38 @@ const MAP_CYCLE_TOOLS = [
 	"TextTool", "TerrainBrush", "PrefabTool"
 ]
 
+# Tool.Controls key of each tool's primary asset library, for the tools whose
+# library ToolPanel builds inside the left panel. library_right_panel can
+# relocate those lists to the right-side panel, where the tool-panel subtree
+# scan in _find_tool_list no longer reaches them; Controls points at the same
+# node in both layouts. Each key resolves to the list the scan used to return
+# (the last non-color ItemList of the panel).
+const TOOL_LIST_CONTROL = {
+	"FloorShapeTool":   "WallTexture",
+	"WallTool":         "Texture",
+	"PortalTool":       "Texture",
+	"CaveBrush":        "Texture",
+	"PatternShapeTool": "Texture",
+	"RoofTool":         "Texture",
+	"MaterialBrush":    "Texture",
+	"LightTool":        "Texture",
+}
+
 func initialize():
 	_install_input_listener()
 
 func _install_input_listener():
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_assetcycle_listener"):
+		var _old_n = Engine.get_meta("up_assetcycle_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	input_listener = Node.new()
 	input_listener.name = "AssetCycleListener"
+	Engine.set_meta("up_assetcycle_listener", input_listener)
 	var listener_script = GDScript.new()
 	listener_script.source_code = """extends Node
 var handler = null
@@ -80,7 +106,7 @@ func update(_delta):
 	# et on restaure dès que ça arrive.
 	if _terrain_escape_restore > 0:
 		_terrain_escape_restore -= 1
-		if _g.Editor.ActiveToolName != "TerrainBrush":
+		if _active_tool_name() != "TerrainBrush":
 			if _g.Editor.Toolset and _g.Editor.Toolset.has_method("Quickswitch"):
 				_g.Editor.Toolset.Quickswitch("TerrainBrush")
 				_terrain_escape_restore = 0
@@ -101,7 +127,7 @@ func _do_autoscroll():
 	if not _g.Editor:
 		return
 	
-	var tool_name = _g.Editor.ActiveToolName
+	var tool_name = _active_tool_name()
 	if not tool_name or tool_name == "" or tool_name == "Null" or tool_name == "ScatterTool":
 		_last_tool_name = tool_name
 		# All lists are gone — mark them so they get autoscrolled when they reappear
@@ -243,7 +269,7 @@ var _terrain_deep_diag_done = false
 func _do_terrain_sync():
 	if not _g.Editor:
 		return
-	var atn = _g.Editor.ActiveToolName
+	var atn = _active_tool_name()
 	if not atn or atn != "TerrainBrush":
 		# Close terrain popup when leaving terrain tool
 		_terrain_keep_open = false
@@ -802,7 +828,7 @@ func _on_input(event):
 	
 	# Detect left-click on map in SelectTool for autoscroll
 	if event is InputEventMouseButton and event.pressed and event.button_index == BUTTON_LEFT:
-		if _g.Editor and _g.Editor.ActiveToolName == "SelectTool":
+		if _g.Editor and _active_tool_name() == "SelectTool":
 			var _st_mpos = input_listener.get_viewport().get_mouse_position()
 			var _st_hovered = _get_hovered_item_list(_st_mpos)
 			if _st_hovered == null:
@@ -811,7 +837,7 @@ func _on_input(event):
 	# Handle right-click = +90° rotation in PatternShapeTool or PrefabTool
 	if event is InputEventMouseButton and event.pressed and event.button_index == BUTTON_RIGHT:
 		if _g.Editor:
-			var atn = _g.Editor.ActiveToolName
+			var atn = _active_tool_name()
 			# PatternShapeTool: rotate the Rotation slider by +90°
 			# Skip when mouse is over UI (lets favorites/context menus work on the panel)
 			if atn == "PatternShapeTool":
@@ -841,7 +867,7 @@ func _on_input(event):
 	# Handle PrefabTool rotation (plain scroll) and scale (alt+scroll) on map
 	if event is InputEventMouseButton and event.pressed:
 		if event.button_index == BUTTON_WHEEL_UP or event.button_index == BUTTON_WHEEL_DOWN:
-			if _g.Editor and _g.Editor.ActiveToolName == "PrefabTool":
+			if _g.Editor and _active_tool_name() == "PrefabTool":
 				var up = event.button_index == BUTTON_WHEEL_UP
 				var mouse_pos = input_listener.get_viewport().get_mouse_position()
 				
@@ -883,7 +909,7 @@ func _on_input(event):
 			return
 	
 	# Let ScatterTool handle shift+scroll natively (cycles selected objects)
-	if _g.Editor.ActiveToolName == "ScatterTool":
+	if _active_tool_name() == "ScatterTool":
 		return
 	
 	var up = event.button_index == BUTTON_WHEEL_UP
@@ -916,7 +942,7 @@ func _on_input(event):
 		return
 	
 	# 4) On the map: cycle the active tool's primary list
-	var tool_name = _g.Editor.ActiveToolName
+	var tool_name = _active_tool_name()
 	if tool_name in MAP_CYCLE_TOOLS:
 		var tool_list = _get_tool_item_list(tool_name)
 		if tool_list != null:
@@ -1942,7 +1968,7 @@ func _late_apply_prefab_transform():
 	if _prefab_rotation == 0.0 and _prefab_scale_factor == 1.0:
 		return
 	
-	if not _g.Editor or _g.Editor.ActiveToolName != "PrefabTool":
+	if not _g.Editor or _active_tool_name() != "PrefabTool":
 		return
 	
 	var current_idx = _prefab_get_selected_idx()
@@ -2068,7 +2094,12 @@ func _find_tool_list(tool_name: String):
 				return pt.list
 		return null
 	
-	# Other tools: search the tool panel
+	# Other tools: Tool.Controls first (layout-independent), then a scan of
+	# the tool panel as a fallback.
+	var mapped = _lib_control(tool_name)
+	if mapped != null:
+		return mapped
+	
 	var panel = _g.Editor.Toolset.GetToolPanel(tool_name)
 	if panel == null:
 		return null
@@ -2085,6 +2116,26 @@ func _find_tool_list(tool_name: String):
 		return null
 	
 	return asset_lists[asset_lists.size() - 1]
+
+
+# Resolve a tool's asset library through Tool.Controls. Returns null for tools
+# absent from TOOL_LIST_CONTROL, so the caller falls back to its own lookup.
+func _lib_control(tool_name: String):
+	if not TOOL_LIST_CONTROL.has(tool_name):
+		return null
+	var tools = _g.Editor.get("Tools")
+	if not tools or not tools is Dictionary:
+		return null
+	var t = tools.get(tool_name)
+	if t == null or not is_instance_valid(t):
+		return null
+	var controls = t.get("Controls")
+	if not controls or not controls is Dictionary:
+		return null
+	var c = controls.get(TOOL_LIST_CONTROL[tool_name])
+	if c and is_instance_valid(c) and c is ItemList:
+		return c
+	return null
 
 
 func _find_library_list(tool_name: String):
@@ -2162,3 +2213,43 @@ func _is_color_list(item_list: ItemList) -> bool:
 	if "color_preview" in path or "color_add" in path:
 		return true
 	return false
+
+
+# ── Per-frame cached editor state (published by Main.gd, Engine metadata) ──
+# Reading native/C# editor properties marshals a fresh GDScript object across
+# the interop boundary on EVERY access; with dozens of submods polling every
+# frame this is a steady allocation stream (background commit-charge growth).
+# Main.gd reads ActiveToolName once per frame and publishes it; we read the
+# shared copy here. THREE rules, each learned from a measured failure:
+#   1. PRECONDITION: never serve a cached name when this mod's _g.Editor is
+#      unreachable — callers would reach into editor objects that are unsafe
+#      to touch (native access violation c0000005 on tool switch / map churn).
+#   2. MEMOIZATION: the _g.Editor null-check itself marshals a wrapper per
+#      access; doing it per call cost as much as the problem this cache
+#      solves (+0.037 MB/s, +12% main CPU over 600 s). One read per mod per
+#      process tick keeps the safety signal at ~1/10th the volume.
+#   3. FORCED COPY: never hand out a COW reference to the String stored in
+#      the shared Dictionary — hence "%s" % v.
+var _uu_ed_frame := -1
+var _uu_ed_ok := false
+
+
+func _active_tool_name() -> String:
+	if not _uu_editor_reachable():
+		return ""
+	if Engine.has_meta("_uu_editor_state"):
+		var s = Engine.get_meta("_uu_editor_state")
+		if s is Dictionary:
+			var v = s.get("active_tool_name")
+			if v is String:
+				return "%s" % v
+	return str(_g.Editor.ActiveToolName)
+
+
+func _uu_editor_reachable() -> bool:
+	var f = Engine.get_idle_frames()
+	if f == _uu_ed_frame:
+		return _uu_ed_ok
+	_uu_ed_frame = f
+	_uu_ed_ok = _g != null and _g.Editor != null
+	return _uu_ed_ok

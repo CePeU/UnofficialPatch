@@ -1,9 +1,9 @@
 var _g  # Global reference
-const PREVIEW_CHECK_INTERVAL = 0.5  # seconds between preview-size checks
+const PREVIEW_SCAN_INTERVAL = 0.5  # seconds between preview-container discovery scans
 const DEFAULT_PREVIEW_PERCENT := 15
 const MIN_PREVIEW_PERCENT := 5
 const MAX_PREVIEW_PERCENT := 100
-var _patched_textures = {}
+const TEXTURE_CACHE_LIMIT = 128  # safety cap on the resized-preview cache
 
 
 var _last_tool_name = ""
@@ -11,7 +11,27 @@ var _preview_nodes = []
 var _was_focused = true
 var _mouse_watcher = null
 var _had_selection = false  # tracks whether SelectTool had objects selected
-var _preview_check_accum = 0.0
+var _scan_accum = 0.0
+
+# Event-driven resize state.
+# _entries: cached {container, tex_rect} pairs found by the throttled discovery
+#   scan. Enforcement then runs every frame on this short list only, which is
+#   what removes the flicker: DD re-assigns the original (big) texture on every
+#   mouse move over the asset grid, and we swap the resized one back in the
+#   same frame, before rendering.
+# _texture_cache: original-texture instance id -> {"original": Texture (kept
+#   alive so the id stays stable), "patched": ImageTexture or null (null means
+#   the texture already fits on screen)}.
+# _applied: tex_rect instance id -> original texture currently swapped out
+#   (used to restore everything when the percent setting changes).
+var _entries = []
+var _texture_cache = {}
+var _applied = {}
+var _last_max_h: int = -1
+# Set by the SceneTree "node_added" hook whenever a preview-looking node is
+# created, so discovery happens on the very next update() instead of waiting
+# for the throttled scan tick.
+var _needs_rescan: bool = false
 
 # Configurable max preview height as % of screen height (loaded from disk).
 var _max_preview_percent: int = DEFAULT_PREVIEW_PERCENT
@@ -132,12 +152,16 @@ func _apply_preview_percent(pct: int) -> void:
 
 
 func _invalidate_patched_textures() -> void:
-	for nid in _patched_textures.keys():
-		var entry = _patched_textures[nid]
+	# Restore the original texture on every TextureRect we patched, then drop
+	# both caches so previews get rebuilt at the new ratio on the next frame.
+	for nid in _applied.keys():
 		var obj = instance_from_id(nid)
 		if obj != null and is_instance_valid(obj) and obj is TextureRect:
-			obj.texture = entry["original"]
-	_patched_textures.clear()
+			var cur = obj.texture
+			if cur != null and cur.has_meta("preview_fix_patched"):
+				obj.texture = _applied[nid]
+	_applied.clear()
+	_texture_cache.clear()
 
 
 func initialize():
@@ -164,7 +188,19 @@ func _notification(what):
 	_mouse_watcher.preview_fix = self
 	_mouse_watcher.name = "PreviewFixWatcher"
 	_g.Editor.add_child(_mouse_watcher)
+	# React instantly when DD creates preview nodes on the fly: any node whose
+	# name mentions "preview" triggers a rescan on the next update() frame.
+	# The callback itself only does a cheap name check, so the per-node cost
+	# during map loads stays negligible.
+	_g.Editor.get_tree().connect("node_added", self, "_on_node_added")
 	print("[PreviewFix] Initialized with mouse watcher (max=", _max_preview_percent, "%)")
+
+
+func _on_node_added(node) -> void:
+	if _needs_rescan: return
+	if node == null: return
+	if "preview" in node.name.to_lower():
+		_needs_rescan = true
 
 func _find_all_preview_containers(node, result):
 	if node == null or not is_instance_valid(node): return
@@ -182,45 +218,105 @@ func _find_child_texture_rect(node):
 	return null
 
 
-func _limit_preview_sizes() -> void:
-	# Scan only the Editor UI subtree — previews never live under World,
-	# so this avoids walking thousands of map nodes on big maps.
+func _rescan_preview_entries() -> void:
+	# DD exposes its single PreviewContainer directly on the editor
+	# (PreviewContainer._EnterTree does Master.Editor.Preview = this), so no
+	# tree walk is needed in the normal case. The recursive scan of the Editor
+	# UI subtree is kept only as a fallback.
+	_entries.clear()
 	if _g.Editor == null or not is_instance_valid(_g.Editor): return
-	var screen_h = OS.get_real_window_size().y
-	var ratio = float(_max_preview_percent) / 100.0
-	var max_h = int(screen_h * ratio)
-	if max_h <= 0: return
+	var preview = _g.Editor.get("Preview")
+	if preview != null and is_instance_valid(preview):
+		_entries.append({"container": preview, "tex_rect": _find_child_texture_rect(preview)})
+		return
 	var found = []
 	_find_all_preview_containers(_g.Editor, found)
 	for node in found:
 		if not is_instance_valid(node): continue
-		var tex_rect = _find_child_texture_rect(node)
-		if tex_rect == null: continue
-		var nid = tex_rect.get_instance_id()
-		if not node.visible:
-			if _patched_textures.has(nid):
-				tex_rect.texture = _patched_textures[nid]["original"]
-				_patched_textures.erase(nid)
-			continue
+		# tex_rect may not exist yet (DD can build the container first and add
+		# the TextureRect later); it is resolved lazily in the enforce loop.
+		_entries.append({"container": node, "tex_rect": _find_child_texture_rect(node)})
+
+
+func _build_patched_texture(tex, max_h: int):
+	# Returns a resized ImageTexture, or null if the texture already fits.
+	# This (get_data + resize) is the only expensive step, and it now runs at
+	# most once per asset texture — every later re-assignment by DD is undone
+	# with a plain cached-texture swap.
+	var th = tex.get_height()
+	if th <= max_h: return null
+	var tw = tex.get_width()
+	var img = tex.get_data()
+	if img == null: return null
+	if img.is_compressed():
+		img.decompress()
+	var r = float(max_h) / float(th)
+	var new_w = max(int(tw * r), 1)
+	img.resize(new_w, max_h, Image.INTERPOLATE_BILINEAR)
+	var new_tex = ImageTexture.new()
+	new_tex.create_from_image(img)
+	new_tex.set_meta("preview_fix_patched", true)
+	return new_tex
+
+
+func _enforce_preview_sizes() -> void:
+	# Runs every frame on the cached entries (cheap: a few validity checks and
+	# one texture identity comparison per visible preview). DD re-sets the
+	# original texture on mouse motion; we swap the resized one back in the
+	# same frame, so no flicker is ever rendered.
+	var screen_h = OS.get_real_window_size().y
+	var max_h = int(screen_h * float(_max_preview_percent) / 100.0)
+	if max_h <= 0: return
+	if max_h != _last_max_h:
+		# Percent setting or window height changed: rebuild everything.
+		if _last_max_h != -1:
+			_invalidate_patched_textures()
+		_last_max_h = max_h
+	for e in _entries:
+		var node = e["container"]
+		if not is_instance_valid(node): continue
+		if not node.visible: continue
+		var tex_rect = e["tex_rect"]
+		if tex_rect == null or not is_instance_valid(tex_rect):
+			# Re-resolve inside the container only (tiny subtree walk), so a
+			# TextureRect recreated by DD is picked up the same frame.
+			tex_rect = _find_child_texture_rect(node)
+			if tex_rect == null: continue
+			e["tex_rect"] = tex_rect
 		var tex = tex_rect.texture
 		if tex == null: continue
-		if _patched_textures.has(nid) and _patched_textures[nid]["patched"] == tex: continue
-		var th = tex.get_height()
-		var tw = tex.get_width()
-		if th <= max_h: continue
-		var img = tex.get_data()
-		if img == null: continue
-		var r = float(max_h) / float(th)
-		var new_w = max(int(tw * r), 1)
-		img.resize(new_w, max_h, Image.INTERPOLATE_BILINEAR)
-		var new_tex = ImageTexture.new()
-		new_tex.create_from_image(img)
-		var orig = tex
-		if _patched_textures.has(nid):
-			orig = _patched_textures[nid]["original"]
-		_patched_textures[nid] = {"original": orig, "patched": new_tex}
-		tex_rect.texture = new_tex
-		node.rect_size = Vector2(new_w + 20, max_h + 50)
+		if tex.has_meta("thumbnail"):
+			# DD is still showing the small thumbnail: PreviewContainer._Process
+			# waits for Global.Preferences.FullPreviewDelay before swapping in
+			# the full texture (Library.Seek). Drive that same method with a
+			# huge delta to make the swap happen right now — this reuses DD's
+			# own logic (category, ImageTextureEx cache, load flags), and the
+			# resize below then applies in the same frame, before rendering.
+			node.call("_Process", 3600.0)
+			tex = tex_rect.texture
+			if tex == null or tex.has_meta("thumbnail"): continue
+		if tex.has_meta("preview_fix_patched"):
+			# Already ours — just keep the container size pinned, as DD may
+			# have re-applied the full-size rect on mouse move.
+			var want = Vector2(tex.get_width() + 20, tex.get_height() + 50)
+			if node.rect_size != want:
+				node.rect_size = want
+			continue
+		var tid = tex.get_instance_id()
+		var patched = null
+		if _texture_cache.has(tid):
+			patched = _texture_cache[tid]["patched"]
+		else:
+			patched = _build_patched_texture(tex, max_h)
+			if _texture_cache.size() >= TEXTURE_CACHE_LIMIT:
+				_texture_cache.clear()
+			# Keep a reference to the original so its instance id stays valid
+			# for the lifetime of the cache entry.
+			_texture_cache[tid] = {"original": tex, "patched": patched}
+		if patched == null: continue  # already fits on screen
+		_applied[tex_rect.get_instance_id()] = tex
+		tex_rect.texture = patched
+		node.rect_size = Vector2(patched.get_width() + 20, patched.get_height() + 50)
 
 
 func update(delta):
@@ -234,18 +330,25 @@ func update(delta):
 		if _save_pending_frames == 0:
 			_save_settings()
 
-	# Throttle the (still recursive) preview-size scan — every frame is overkill,
-	# a few times per second is more than enough for a visual resize.
-	_preview_check_accum += delta
-	if _preview_check_accum >= PREVIEW_CHECK_INTERVAL:
-		_preview_check_accum = 0.0
-		_limit_preview_sizes()
+	# Throttled recursive scan: only *discovers* preview containers. The
+	# actual size enforcement below is event-cheap and runs every frame.
+	_scan_accum += delta
+	if _needs_rescan or _scan_accum >= PREVIEW_SCAN_INTERVAL:
+		_needs_rescan = false
+		_scan_accum = 0.0
+		_rescan_preview_entries()
+
+	# Per-frame enforcement on the cached entries — swaps the resized texture
+	# back the moment DD re-assigns the original one, before rendering.
+	_enforce_preview_sizes()
 
 	# Detect tool change (including Escape which deselects tool)
 	var current_tool = _g.Editor.ActiveToolName
 	if current_tool != _last_tool_name:
 		_last_tool_name = current_tool
 		_hide_previews()
+		# New tool panels may bring new preview containers: rescan right away.
+		_rescan_preview_entries()
 	
 	# Detect window focus loss (handles click outside)
 	var is_focused = OS.is_window_focused()

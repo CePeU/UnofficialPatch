@@ -153,6 +153,9 @@ func _input(event) -> void:
 	var ui_util_script = ResourceLoader.load(_g.Root + "scripts/ui_util.gd", "GDScript", true)
 	if ui_util_script:
 		_ui_util = ui_util_script.new()
+		# _g requis pour les _extra_ui_rects (SelectFilterBar) et l'attribution
+		# correcte du temps de is_mouse_over_ui dans le profiler partagé.
+		_ui_util._g = _g
 
 	_setup_panel()
 	_restore_existing_texts()

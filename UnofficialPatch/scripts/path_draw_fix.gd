@@ -4,6 +4,7 @@
 
 var script_class = "tool"
 var _g
+var ui_util  # injecte par Main.gd (peut etre null si desactive en debug)
 var input_listener: Node
 
 var _watched_tools = ["PathTool", "WallTool", "PatternShapeTool", "RoofTool", "FloorShapeTool"]
@@ -71,23 +72,26 @@ func _get_active_drawing_tool():
 	return tool
 
 
-func _screen_to_world(screen_pos: Vector2) -> Vector2:
-	if _g == null:
-		return screen_pos
-	var world_ui = _g.get("WorldUI")
-	if world_ui == null or not is_instance_valid(world_ui):
-		return screen_pos
-	var canvas_xform = world_ui.get_viewport().get_canvas_transform()
-	return canvas_xform.affine_inverse().xform(screen_pos)
+# Position monde de la souris via get_global_mouse_position() : exactement
+# le meme espace de coordonnees que celui utilise par DD en interne
+# (viewport + canvas transform), donc aucune conversion manuelle susceptible
+# de diverger selon la resolution ou le scaling HiDPI de l'OS. L'ancienne
+# conversion basee sur event.position pouvait produire un decalage constant
+# sur certaines configurations (ex: 2560x1600 avec scaling Windows).
+func _mouse_world_position(world_ui) -> Vector2:
+	if world_ui is CanvasItem:
+		return world_ui.get_global_mouse_position()
+	var vp = world_ui.get_viewport()
+	return vp.get_canvas_transform().affine_inverse().xform(vp.get_mouse_position())
 
 
 func _on_input(event):
 	if not (event is InputEventMouseMotion):
 		return
-	_update_preview(event.position)
+	_update_preview()
 
 
-func _update_preview(screen_pos: Vector2):
+func _update_preview():
 	if _g == null:
 		return
 	var world_ui = _g.get("WorldUI")
@@ -96,7 +100,17 @@ func _update_preview(screen_pos: Vector2):
 	var tool = _get_active_drawing_tool()
 	if tool == null:
 		return
-	var world_pos = _screen_to_world(screen_pos)
+	# Ne rien faire quand la souris est dans la zone carte : DD y met a jour
+	# MousePosition nativement et notre ecriture ne ferait que rivaliser
+	# avec la sienne (ordre de propagation _input non garanti). Ecraser
+	# MousePosition avec une valeur decalee etait masque par le snap (la
+	# position etait quantifiee sur la grille), mais devenait visible des
+	# que le snap etait desactive en cours de trace. Le fix n'est utile que
+	# lorsque le curseur est au-dessus de l'UI / hors zone carte, la ou DD
+	# ne traite plus le motion.
+	if ui_util != null and not ui_util.is_mouse_over_ui(input_listener):
+		return
+	var world_pos = _mouse_world_position(world_ui)
 	world_ui.set("MousePosition", world_pos)
 	world_ui.set("IsMouseMoving", true)
 	# Tente la bonne methode Update* du tool. On essaie chaque candidat ;

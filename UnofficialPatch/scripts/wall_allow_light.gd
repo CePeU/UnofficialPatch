@@ -75,10 +75,18 @@ func initialize():
 		print("[WBL] WARNING: Could not get SelectTool panel")
 	
 	# Timer for polling
+	# Cross-session guard: _g.Editor persists across map reloads, so an autostart
+	# Timer added by a previous mod instance keeps ticking forever. Free the
+	# previous one before adding ours -- otherwise they accumulate per reload.
+	if Engine.has_meta("wal_timer"):
+		var _old_t = Engine.get_meta("wal_timer")
+		if is_instance_valid(_old_t):
+			_old_t.queue_free()
 	_timer = Timer.new()
 	_timer.wait_time = CHECK_INTERVAL
 	_timer.autostart = true
 	_timer.connect("timeout", self, "_tick")
+	Engine.set_meta("wal_timer", _timer)
 	_g.Editor.add_child(_timer)
 	
 	# Load saved data

@@ -92,8 +92,17 @@ func cleanup() -> void:
 # ── Bar construction ─────────────────────────────────────────────────────────
 
 func _create_bar() -> void:
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_sfb_layer"):
+		var _old_n = Engine.get_meta("up_sfb_layer")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	_canvas_layer = CanvasLayer.new()
 	_canvas_layer.name = "SelectFilterBarLayer"
+	Engine.set_meta("up_sfb_layer", _canvas_layer)
 	_canvas_layer.layer = 50
 
 	_panel = PanelContainer.new()

@@ -6,6 +6,15 @@
 #   check_right_click() -> bool       — return true to intercept the click
 #   get_context_items(raw) -> Array   — return [{label, icon, action_id}]
 #   on_context_action(action_id, raw) — handle a menu click
+#
+# Blocking windows: update() polls the RAW mouse state, so Godot's normal GUI
+# event consumption inside a mod dialog cannot stop us — a right-click on a
+# card of the Map Gallery would open the map context menu straight through the
+# window. Mod dialogs therefore register themselves in a shared registry
+# (Engine meta "_up_block_windows", an Array of WeakRef) and we skip the whole
+# right-click handling while the cursor is inside one of them. The registry
+# lives on Engine meta so a mod that only knows the key can feed it without
+# holding a reference to this script.
 
 var _g
 var ui_util
@@ -40,7 +49,67 @@ func update(_delta: float) -> void:
 	_right_was_pressed = right_now
 
 
+const BLOCK_WINDOWS_META := "_up_block_windows"
+# Node meta set on a registered window that behaves like a modal: while it is
+# visible, right-clicks are swallowed everywhere, not only over its rect. Used
+# by the Map Gallery, which is an exclusive popup — the map underneath receives
+# no input at all, so our context menus must not appear either.
+const BLOCK_ALL_META := "_up_block_all"
+
+
+# Register a Control (WindowDialog / Popup / panel) that must swallow
+# right-clicks while the cursor is over it.
+func register_blocking_window(node) -> void:
+	if node == null or not (node is Control):
+		return
+	var arr := []
+	if Engine.has_meta(BLOCK_WINDOWS_META):
+		var stored = Engine.get_meta(BLOCK_WINDOWS_META)
+		if stored is Array:
+			arr = stored
+	for wr in arr:
+		if wr is WeakRef and wr.get_ref() == node:
+			return
+	arr.append(weakref(node))
+	Engine.set_meta(BLOCK_WINDOWS_META, arr)
+
+
+# True when the cursor is inside a registered, visible blocking window.
+# Uses get_local_mouse_position() rather than get_global_rect(): the mod
+# dialogs live under the (scaled) UI canvas, so raw viewport coordinates do
+# not line up with their global rects, whereas local coordinates always do.
+func is_mouse_over_blocking_window() -> bool:
+	if not Engine.has_meta(BLOCK_WINDOWS_META):
+		return false
+	var arr = Engine.get_meta(BLOCK_WINDOWS_META)
+	if not (arr is Array) or arr.empty():
+		return false
+	var alive := []
+	var over := false
+	for wr in arr:
+		if not (wr is WeakRef):
+			continue
+		var w = wr.get_ref()
+		if w == null or not is_instance_valid(w) or not (w is Control):
+			continue
+		alive.append(wr)
+		if over or not w.is_visible_in_tree():
+			continue
+		if w.has_meta(BLOCK_ALL_META) and bool(w.get_meta(BLOCK_ALL_META)):
+			over = true
+		elif Rect2(Vector2.ZERO, w.rect_size).has_point(w.get_local_mouse_position()):
+			over = true
+	if alive.size() != arr.size():
+		Engine.set_meta(BLOCK_WINDOWS_META, alive)
+	return over
+
+
 func _on_right_click() -> void:
+	# A mod dialog (Map Gallery and friends) is under the cursor: it handles
+	# its own right-click menu, we must stay out of the way.
+	if is_mouse_over_blocking_window():
+		return
+
 	# Let providers intercept (e.g. favorites list click).
 	# Providers run regardless of active tool — their asset panels are
 	# visible everywhere (WallTool, PathTool, etc.).
@@ -73,18 +142,24 @@ func _on_right_click() -> void:
 	if select_tool == null:
 		return
 	var raw = select_tool.RawSelectables
-	if raw == null or raw.size() == 0:
-		return
 
-	# Defense in depth: even with SelectTool active, if the selection
-	# contains dead entries (edge case where cleanup hasn't run yet on
-	# this frame), bail out. GetSelectionRect() would crash on them.
-	if _raw_has_dead(raw):
-		return
-
-	# Check if cursor is near the selection box (256px screen space)
-	if not _is_mouse_near_selection(select_tool):
-		return
+	# Two flavours of context menu:
+	#   near_selection = true  -> right-click on/near the selection box:
+	#       providers contribute via get_context_items(raw) (Favorites, FT,
+	#       Copy/Cut/Delete, Paste...).
+	#   near_selection = false -> right-click in empty space (no selection,
+	#       or selection far away): providers contribute via
+	#       get_void_context_items() (Paste / Paste in Place only). This is
+	#       what lets the user paste into the void.
+	var near_selection := false
+	if raw != null and raw.size() > 0:
+		# Defense in depth: if the selection contains dead entries (edge
+		# case where cleanup hasn't run yet on this frame), bail out.
+		# GetSelectionRect() would crash on them.
+		if _raw_has_dead(raw):
+			return
+		# Near the selection box? (256px screen space)
+		near_selection = _is_mouse_near_selection(select_tool)
 
 	# Ask each provider for items
 	var all_items := []
@@ -93,9 +168,13 @@ func _on_right_click() -> void:
 
 	for pi in range(_providers.size()):
 		var p = _providers[pi]
-		if not p.has_method("get_context_items"):
-			continue
-		var items = p.get_context_items(raw)
+		var items = null
+		if near_selection:
+			if p.has_method("get_context_items"):
+				items = p.get_context_items(raw)
+		else:
+			if p.has_method("get_void_context_items"):
+				items = p.get_void_context_items()
 		if items == null or items.size() == 0:
 			continue
 		# Add separator between providers (except before the first group)
@@ -207,8 +286,15 @@ func _is_mouse_near_selection(select_tool) -> bool:
 func _get_popup_layer() -> CanvasLayer:
 	if _popup_layer and is_instance_valid(_popup_layer):
 		return _popup_layer
+	# Cross-session guard: free a popup layer left over from a previous mod
+	# instance still parented to the persistent tree root.
+	if Engine.has_meta("rcu_popup_layer"):
+		var _old_pl = Engine.get_meta("rcu_popup_layer")
+		if is_instance_valid(_old_pl):
+			_old_pl.queue_free()
 	_popup_layer = CanvasLayer.new()
 	_popup_layer.name = "RightClickPopupLayer"
 	_popup_layer.layer = 128
+	Engine.set_meta("rcu_popup_layer", _popup_layer)
 	_g.World.get_tree().root.add_child(_popup_layer)
 	return _popup_layer

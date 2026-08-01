@@ -1087,7 +1087,17 @@ func _register_default_hints() -> void:
 	add_hint("ObjectTool", "Object", "ctx_menu",
 		[{"tip": "list"}, {"icon": "rclick"}], "Context Menu")
 
-	# ScatterTool
+	# ScatterTool (order matters — appears left-to-right in the bar)
+	# Wheel bindings come from scatter_transform.gd: they override the
+	# random rotation/scale for the asset currently in hand.
+	add_hint("ScatterTool", "Scatter", "rotate",
+		[{"icon": "scroll"}], "Rotate")
+	add_hint("ScatterTool", "Scatter", "rotate_5deg",
+		["Z", "+", {"icon": "scroll"}], "5° Rotate")
+	add_hint("ScatterTool", "Scatter", "rotate_1deg",
+		["SHIFT", "+", "Z", "+", {"icon": "scroll"}], "1° Rotate")
+	add_hint("ScatterTool", "Scatter", "scale",
+		["ALT", "+", {"icon": "scroll"}], "Scale")
 	add_hint("ScatterTool", "Scatter", "fav_toggle",
 		["F"], "Favorites")
 	add_hint("ScatterTool", "Scatter", "ctx_menu",

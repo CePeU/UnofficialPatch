@@ -64,10 +64,24 @@ var _region_geo = null  # instance de library/region_geometry.gd
 # Barre de progression + Annuler (opérations longues)
 var _progress_script = null
 var _filling := false
+# Fill watchdog: if the fill coroutine dies from a runtime error, _filling
+# would stay true forever — every canvas click in Bucket mode would then be
+# silently swallowed by _on_input (the tool looks completely dead) until the
+# mods are reloaded. A Timer on the listener node (Timers keep running while
+# modal windows freeze the mod update loop) re-arms the bucket after a long
+# silence and force-closes any orphaned modal progress dialog.
+const FILL_WATCHDOG_MS = 6000
+var _fill_started := 0
+var _active_progress = null
 
 # Curseur du mode Bucket (bucket_cursor.png, comme l'outil Pattern).
 var _bucket_cursor_tex: ImageTexture = null
 var _bucket_cursor_active := false
+
+# Compat ASO : grille de recherche terrain (voir _ensure_aso_grid_height).
+var _aso_grid_done := false
+var _aso_grid_timer := 0
+const ASO_GRID_MIN_H := 700.0
 # Point chaud du curseur, en fraction de la taille de l'image (0,0 = haut-gauche,
 # 1,1 = bas-droite). Ajuste si la pointe du seau ne tombe pas sur le clic.
 const BUCKET_CURSOR_HOTSPOT_FRAC = Vector2(0.0, 1.0)
@@ -535,8 +549,35 @@ func _install_listener():
 	node.set_script(s)
 	node.handler = self
 	Engine.set_meta(_META_KEY, node)
+	# Watchdog timer (child of the listener so it lives in the SceneTree and
+	# keeps ticking even when DD freezes the mod update loop behind a modal).
+	var wt = Timer.new()
+	wt.wait_time = 2.0
+	wt.autostart = true
+	node.add_child(wt)
+	wt.connect("timeout", self, "_watchdog_tick")
 	_g.Editor.get_tree().get_root().call_deferred("add_child", node)
 	input_listener = node
+
+
+# Failsafe: a healthy fill reports activity continuously (the progress object
+# is pumped on every loop iteration, and synchronous stretches block this timer
+# anyway). A long silence while _filling is set means the coroutine is dead:
+# reset the flag and force the orphaned modal dialog closed.
+func _watchdog_tick():
+	if not _filling:
+		return
+	var alive = _fill_started
+	if _active_progress != null:
+		alive = max(alive, _active_progress.last_activity)
+	if OS.get_ticks_msec() - alive < FILL_WATCHDOG_MS:
+		return
+	print("[TerrainBucket] WARNING: fill watchdog fired — the fill coroutine died (check the errors above). Bucket re-armed.")
+	_filling = false
+	if _active_progress != null:
+		if _active_progress.has_method("force_close"):
+			_active_progress.force_close()
+		_active_progress = null
 
 
 # ── Utils ────────────────────────────────────────────────────────────────────
@@ -735,10 +776,12 @@ func _bucket_fill(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop
 	if _filling:
 		return
 	_filling = true
+	_fill_started = OS.get_ticks_msec()
 	var st = _bucket_fill_impl(mouse_world, stop_walls, stop_paths, stop_patterns)
 	if st is GDScriptFunctionState:
 		yield(st, "completed")
 	_filling = false
+	_active_progress = null
 
 
 func _bucket_fill_impl(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool):
@@ -752,6 +795,7 @@ func _bucket_fill_impl(mouse_world: Vector2, stop_walls: bool, stop_paths: bool,
 
 	var t0 = OS.get_ticks_msec()
 	var progress = _new_progress("Filling terrain…")
+	_active_progress = progress
 	if progress != null:
 		# Yield une frame pour que le 0 % soit réellement AFFICHÉ (sinon la
 		# première frame rendue arrive au premier pump(), déjà à quelques %).
@@ -1075,6 +1119,41 @@ func _on_input(event) -> bool:
 	return false
 
 
+# ── Compat AdditionalSearchOptions ─────────────────────────────────────────────
+# La grille de recherche terrain d'ASO (CreateTextureGridMenu, enregistree dans
+# Controls["TerrainTextureGridID"]) n'a AUCUNE hauteur minimale : elle ne vit
+# que de l'espace VBox RESTANT du panneau (size flag expand). Des que le
+# contenu du panneau depasse la hauteur visible (notre rangee de modes suffit
+# a faire basculer le total), l'espace restant tombe a 0 et la grille
+# "disparait" (rect 0 px, items pourtant charges). On lui impose une hauteur
+# minimale une fois trouvee : la grille scrolle en interne (ItemList) et le
+# panneau (ScrollContainer) scrolle deja. Retente ~2 min puis abandonne
+# silencieusement (ASO absent).
+func _ensure_aso_grid_height() -> void:
+	if _aso_grid_done:
+		return
+	_aso_grid_timer += 1
+	if _aso_grid_timer % 30 != 0 or _aso_grid_timer > 30 * 120:
+		return
+	if _g == null or _g.get("Editor") == null:
+		return
+	var tb = _g.Editor.Tools["TerrainBrush"]
+	if tb == null:
+		return
+	var ctrls = tb.get("Controls")
+	if ctrls == null or not (ctrls is Dictionary):
+		return
+	if not ctrls.has("TerrainTextureGridID"):
+		return
+	var grid = ctrls["TerrainTextureGridID"]
+	if grid == null or not is_instance_valid(grid) or not (grid is Control):
+		return
+	if grid.rect_min_size.y < ASO_GRID_MIN_H:
+		grid.rect_min_size = Vector2(grid.rect_min_size.x, ASO_GRID_MIN_H)
+	_aso_grid_done = true
+	print("[TerrainSquareBrush] ASO terrain search grid: min height applied")
+
+
 func _get_raw_mouse_world(world_ui, event):
 	var vp = world_ui.get_viewport()
 	if vp == null: return null
@@ -1085,6 +1164,7 @@ func _get_raw_mouse_world(world_ui, event):
 # ── Update ────────────────────────────────────────────────────────────────────
 
 func update(_delta):
+	_ensure_aso_grid_height()
 	if not _is_terrain_tool_active():
 		# Suspendre le mode une seule fois (le bouton reste coché)
 		if (_square_brush_active or _bucket_active) and not _suspended:

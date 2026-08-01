@@ -109,6 +109,7 @@ func initialize() -> void:
 
 var _idle_hooked := false
 var _last_update_frame := -1
+var _last_tint_check_frame := -1000
 var _last_idle_time_ms := 0
 var _last_world_id := -1
 
@@ -211,18 +212,26 @@ func _store_native_mat(mat: ShaderMaterial) -> void:
 
 
 func _check_native_mats() -> void:
-	# Relire la couleur des materials BlurScreen natifs stockés.
-	# DD peut les mettre à jour en temps réel (ressources partagées).
-	var alive = []
+	# Re-read the color of the stored native BlurScreen materials.
+	# DD may update them in real time (shared resources).
+	# Only rebuild the refs array when a dead ref is actually found —
+	# the common case (all alive) must not allocate anything.
+	var has_dead := false
 	for ref in _native_blur_refs:
 		var mat = ref.get_ref()
 		if mat == null or not (mat is ShaderMaterial):
+			has_dead = true
 			continue
-		alive.append(ref)
 		var color = mat.get_shader_param("color")
 		if color is Color:
 			_set_native_tint(color)
-	_native_blur_refs = alive
+	if has_dead:
+		var alive = []
+		for ref in _native_blur_refs:
+			var mat = ref.get_ref()
+			if mat != null and mat is ShaderMaterial:
+				alive.append(ref)
+		_native_blur_refs = alive
 
 
 # ── API publique ─────────────────────────────────────────────────────────────
@@ -538,6 +547,14 @@ func _inject_blur(popup: Node, passes: int, step: float, sigma: float, tint: Col
 	popup.add_child(last)
 
 	popup.set_meta("_blur_fallback", true)
+
+	# Mod-created WindowDialogs lose their title-bar background once the
+	# panel goes translucent: the blur rects only cover the popup body, not
+	# the title strip above y=0. Windows opting in through this meta get the
+	# same opaque title overlay as AcceptDialogs. Keep the key in sync with
+	# map_explorer.gd.
+	if popup.has_meta("_up_title_overlay"):
+		call_deferred("_create_title_overlay", popup)
 
 
 func _make_panel_translucent(popup: Node) -> void:
@@ -860,8 +877,10 @@ func update(delta: float) -> void:
 	if _title_overlays.size() > 0:
 		_update_title_overlays()
 
-	# Tracking teinte DD chaque frame (très léger)
-	if _native_blur_refs.size() > 0:
+	# DD tint tracking. Tint changes are rare and cosmetic — polling every
+	# 15 frames (~4 Hz) is plenty and removes a per-frame Array rebuild.
+	if _native_blur_refs.size() > 0 and current_frame - _last_tint_check_frame >= 15:
+		_last_tint_check_frame = current_frame
 		_check_native_mats()
 
 	if _startup_timer > 0.0:
@@ -873,9 +892,6 @@ func update(delta: float) -> void:
 	# Essayer de hooker si pas encore fait
 	if not _windows_hooked:
 		_hook_windows_node()
-
-	# Hook exploration Preferences (temporaire)
-	_hook_preferences_debug()
 
 	# Scan rapide des enfants de Windows chaque frame
 	# (très léger : juste une boucle sur ~10-20 nodes, skip si déjà patché)
@@ -934,7 +950,8 @@ func _fast_scan_windows() -> void:
 			print("[PopupBlur:DIAG] _fast_scan_windows: ", windows.get_child_count(),
 				" enfants total, nouveaux non-patchés : ", new_kids)
 
-	for child in windows.get_children():
+	for i in windows.get_child_count():
+		var child = windows.get_child(i)
 		if not is_instance_valid(child) or not (child is Control):
 			continue
 		if child.has_meta("_no_blur") or child is PopupMenu:
@@ -943,10 +960,16 @@ func _fast_scan_windows() -> void:
 		var state = _patched_ids.get(id)
 		if state == null:
 			_patch_window(child)
-		elif state == "replaced":
-			# DD peut restaurer le BlurScreen natif sur les popups après un
-			# rechargement de map. _replace_existing_blur est idempotent : il
-			# ne fait du travail que s'il retrouve un matériau BlurScreen.
+		elif state == "replaced" and child.visible:
+			# DD can restore the native BlurScreen on popups after a map
+			# reload. _replace_existing_blur is idempotent: it only does work
+			# if it actually finds a BlurScreen material. Restricting the
+			# re-check to VISIBLE popups matters: this used to run a
+			# recursive subtree walk per popup per frame, hidden ones
+			# included — O(popups × subtree × 60fps) for nothing. A hidden
+			# popup with a restored BlurScreen is harmless until shown, and
+			# this scan runs every frame, so it is re-patched the very frame
+			# it becomes visible.
 			_replace_existing_blur(child, 0)
 
 	# Retry hook Preferences (sur map 2+, _hook_windows_node peut avoir tourné
@@ -969,11 +992,11 @@ func _scan_for_replaceable(node: Node, depth: int) -> void:
 					_patched_ids[id] = "replaced"
 					_ensure_backbuffer(node)
 					_center_dialog_label(node)
-			elif state == "replaced":
-				# Idem _fast_scan_windows : re-patch si DD a restauré BlurScreen.
+			elif state == "replaced" and node.visible:
+				# Same as _fast_scan_windows: re-patch only visible popups.
 				_replace_existing_blur(node, 0)
-	for child in node.get_children():
-		_scan_for_replaceable(child, depth + 1)
+	for i in node.get_child_count():
+		_scan_for_replaceable(node.get_child(i), depth + 1)
 
 
 func _patch_window(popup: Node) -> void:
@@ -1052,8 +1075,8 @@ func _replace_existing_blur(node: Node, depth: int) -> bool:
 				print("[PopupBlur] Remplacé : " + node.get_parent().name)
 				return true
 
-	for child in node.get_children():
-		if _replace_existing_blur(child, depth + 1):
+	for i in node.get_child_count():
+		if _replace_existing_blur(node.get_child(i), depth + 1):
 			return true
 
 	return false

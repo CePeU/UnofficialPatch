@@ -65,6 +65,51 @@ var _mod_alt   := false
 
 # ── Sélection ─────────────────────────────────────────────────────────────
 var _selected_objects : Array = []
+# Walls actuellement sélectionnés (cache rafraîchi chaque frame dans
+# update() depuis DragSelectWalls). Utilisé par l'overlay (box verte
+# englobant les walls) et _selection_aabb sans re-scanner RawSelectables
+# à chaque appel.
+var _walls_in_selection : Array = []
+# Lights actuellement sélectionnées (cache rafraîchi chaque frame dans
+# update() depuis RawSelectables). Utilisé par l'overlay (box verte les
+# englobant), _selection_aabb et la visibilité du groupe de boutons FT.
+var _lights_in_selection : Array = []
+# Drag de groupe lights-only via la box verte FT (DD déplace sa sélection
+# via sa transform box, qu'on cache justement en lights-only — FT fournit
+# donc son propre move, comme IDX_MOVE pour les props). Undo unifié.
+var _light_drag_active := false
+var _light_drag_start := Vector2.ZERO
+var _light_drag_nodes := []
+var _light_drag_origins := []
+var _light_drag_before := {}
+# État du drag de walls via les handles FT (move / rotate / scale, comme
+# la custom box de DragSelectWalls). Snapshots pris au début du drag,
+# transformation affine appliquée chaque frame via l'API de DSW.
+var _wall_drag_active := false
+var _wall_drag_walls := []
+var _wall_drag_snaps := {}
+var _wall_drag_before := []
+# Coins source (AABB monde des Points au début du drag) par wall — quad de
+# référence pour le warp skew/distort/perspective.
+var _wall_drag_corners := {}
+# Largeur variable : profil pré-drag {wall: entry|null}, fractions d'arc
+# des points de chaque Line2D enfant {wall: {child: [fr]}} calculées une
+# fois au début du drag, et dernier quad destination appliqué {wall: nc}
+# (sert au commit pour figer le profil final).
+var _wall_drag_wprofile := {}
+# Points ORIGINAUX décimés par enfant {wall: {child: [pts]}} : après un
+# premier warp les lignes visuelles sont denses (≤384 pts) et les warper
+# par frame coûte des milliers d'inversions bilinéaires → on drague sur
+# une version décimée (~64 pts), la pleine qualité est reconstruite au
+# commit (RemakeLines + rebuild).
+var _wall_drag_childpts := {}
+var _wall_drag_childfr := {}
+var _wall_drag_lastnc := {}
+# Signatures de réapplication des largeurs par point {key: [n, w]}
+var _width_applied_sig := {}
+# Rotation accumulée à la molette pendant un drag IDX_MOVE de walls
+# (walls-only). Appliquée autour du centre courant de la sélection.
+var _wall_wheel_rot := 0.0
 
 # ── Cache textures portals (détection de changement de type) ──────────────
 var _portal_tex_cache : Dictionary = {}  # instance_id → {tex_w, base_radius}
@@ -185,6 +230,16 @@ var _edgecrop_default_loaded := false
 # Warp bilinéaire inverse : 4 coins totalement indépendants.
 # Deux variantes : avec et sans custom color (tint_r).
 
+# NOTE numérique (tous les shaders warp ci-dessous) : l'inversion
+# bilinéaire résout un polynôme quadratique. En float32 GPU, avec des
+# coins à l'échelle monde et un quad quasi-parallélogramme (cas typique
+# après skew puis scale : g = a-b+c-d minuscule mais non nul), la forme
+# naïve (-k1±sq)/(2 k2) subit une annulation catastrophique (k1² ~ 1e10,
+# 7 chiffres significatifs) → (u,v) bruités → texture en rayures denses
+# et bandes noires. Correctif : (1) normalisation des coordonnées
+# (centrées/réduites, invariant pour les coordonnées bilinéaires),
+# (2) forme quadratique stable q = -(k1 + signe(k1)·sq)/2, v = q/k2 ou
+# k0/q. Vérifié par simulation float32 : erreur 0.53 → 0.0.
 const DISTORT_SHADER_SRC = """shader_type canvas_item;
 uniform vec2 corner_tl;
 uniform vec2 corner_tr;
@@ -201,13 +256,18 @@ void vertex(){
 float cr(vec2 a,vec2 b){return a.x*b.y-a.y*b.x;}
 vec2 warp_uv(vec2 p){
 \tvec2 a=corner_tl,b=corner_tr,c=corner_br,d=corner_bl;
+\tvec2 nrm_ctr=(a+b+c+d)*0.25;
+\tfloat nrm_s=max(max(length(b-a),length(d-a)),1e-3);
+\ta=(a-nrm_ctr)/nrm_s;b=(b-nrm_ctr)/nrm_s;c=(c-nrm_ctr)/nrm_s;d=(d-nrm_ctr)/nrm_s;p=(p-nrm_ctr)/nrm_s;
 \tvec2 e=b-a,f=d-a,g=a-b+c-d,h=p-a;
 \tfloat k2=cr(g,f),k1=cr(e,f)+cr(h,g),k0=cr(h,e);
 \tfloat v;
 \tif(abs(k2)<1e-5){v=-k0/k1;}
 \telse{
 \t\tfloat sq=sqrt(max(k1*k1-4.0*k0*k2,0.0));
-\t\tfloat v1=(-k1-sq)/(2.0*k2),v2=(-k1+sq)/(2.0*k2);
+\t\tfloat qq=-0.5*(k1+(k1>=0.0?sq:-sq));
+\t\tfloat v1=qq/k2;
+\t\tfloat v2=abs(qq)>1e-12?k0/qq:v1;
 \t\tv=(v1>=-0.001&&v1<=1.001)?v1:v2;
 \t}
 \tvec2 den=e+g*v;
@@ -240,13 +300,18 @@ float cr(vec2 a,vec2 b){return a.x*b.y-a.y*b.x;}
 float luma(vec3 col){return dot(col,vec3(0.299,0.587,0.114));}
 vec2 warp_uv(vec2 p){
 \tvec2 a=corner_tl,b=corner_tr,c=corner_br,d=corner_bl;
+\tvec2 nrm_ctr=(a+b+c+d)*0.25;
+\tfloat nrm_s=max(max(length(b-a),length(d-a)),1e-3);
+\ta=(a-nrm_ctr)/nrm_s;b=(b-nrm_ctr)/nrm_s;c=(c-nrm_ctr)/nrm_s;d=(d-nrm_ctr)/nrm_s;p=(p-nrm_ctr)/nrm_s;
 \tvec2 e=b-a,f=d-a,g=a-b+c-d,h=p-a;
 \tfloat k2=cr(g,f),k1=cr(e,f)+cr(h,g),k0=cr(h,e);
 \tfloat v;
 \tif(abs(k2)<1e-5){v=-k0/k1;}
 \telse{
 \t\tfloat sq=sqrt(max(k1*k1-4.0*k0*k2,0.0));
-\t\tfloat v1=(-k1-sq)/(2.0*k2),v2=(-k1+sq)/(2.0*k2);
+\t\tfloat qq=-0.5*(k1+(k1>=0.0?sq:-sq));
+\t\tfloat v1=qq/k2;
+\t\tfloat v2=abs(qq)>1e-12?k0/qq:v1;
 \t\tv=(v1>=-0.001&&v1<=1.001)?v1:v2;
 \t}
 \tvec2 den=e+g*v;
@@ -298,13 +363,18 @@ void vertex(){
 float cr(vec2 a,vec2 b){return a.x*b.y-a.y*b.x;}
 vec2 inv_bilinear(vec2 p){
 \tvec2 a=ft_corner_tl,b=ft_corner_tr,c=ft_corner_br,d=ft_corner_bl;
+\tvec2 nrm_ctr=(a+b+c+d)*0.25;
+\tfloat nrm_s=max(max(length(b-a),length(d-a)),1e-3);
+\ta=(a-nrm_ctr)/nrm_s;b=(b-nrm_ctr)/nrm_s;c=(c-nrm_ctr)/nrm_s;d=(d-nrm_ctr)/nrm_s;p=(p-nrm_ctr)/nrm_s;
 \tvec2 e=b-a,f=d-a,g=a-b+c-d,h=p-a;
 \tfloat k2=cr(g,f),k1=cr(e,f)+cr(h,g),k0=cr(h,e);
 \tfloat v;
 \tif(abs(k2)<1e-5){v=-k0/k1;}
 \telse{
 \t\tfloat sq=sqrt(max(k1*k1-4.0*k0*k2,0.0));
-\t\tfloat v1=(-k1-sq)/(2.0*k2),v2=(-k1+sq)/(2.0*k2);
+\t\tfloat qq=-0.5*(k1+(k1>=0.0?sq:-sq));
+\t\tfloat v1=qq/k2;
+\t\tfloat v2=abs(qq)>1e-12?k0/qq:v1;
 \t\tv=(v1>=-0.001&&v1<=1.001)?v1:v2;
 \t}
 \tvec2 den=e+g*v;
@@ -357,13 +427,18 @@ void vertex(){
 float cr(vec2 a,vec2 b){return a.x*b.y-a.y*b.x;}
 vec2 inv_bilinear(vec2 p){
 \tvec2 a=ft_corner_tl,b=ft_corner_tr,c=ft_corner_br,d=ft_corner_bl;
+\tvec2 nrm_ctr=(a+b+c+d)*0.25;
+\tfloat nrm_s=max(max(length(b-a),length(d-a)),1e-3);
+\ta=(a-nrm_ctr)/nrm_s;b=(b-nrm_ctr)/nrm_s;c=(c-nrm_ctr)/nrm_s;d=(d-nrm_ctr)/nrm_s;p=(p-nrm_ctr)/nrm_s;
 \tvec2 e=b-a,f=d-a,g=a-b+c-d,h=p-a;
 \tfloat k2=cr(g,f),k1=cr(e,f)+cr(h,g),k0=cr(h,e);
 \tfloat v;
 \tif(abs(k2)<1e-5){v=-k0/k1;}
 \telse{
 \t\tfloat sq=sqrt(max(k1*k1-4.0*k0*k2,0.0));
-\t\tfloat v1=(-k1-sq)/(2.0*k2),v2=(-k1+sq)/(2.0*k2);
+\t\tfloat qq=-0.5*(k1+(k1>=0.0?sq:-sq));
+\t\tfloat v1=qq/k2;
+\t\tfloat v2=abs(qq)>1e-12?k0/qq:v1;
 \t\tv=(v1>=-0.001&&v1<=1.001)?v1:v2;
 \t}
 \tvec2 den=e+g*v;
@@ -469,8 +544,17 @@ func _do_setup() -> void:
 	_g.World.add_child(_input_listener)
 
 	# CanvasLayer pour le menu contextuel (au-dessus de l'UI de DD)
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_ft_popup_layer"):
+		var _old_n = Engine.get_meta("up_ft_popup_layer")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	var pl = CanvasLayer.new()
 	pl.name = "FreeTransformPopupLayer"
+	Engine.set_meta("up_ft_popup_layer", pl)
 	pl.layer = 128
 	_g.World.get_tree().root.add_child(pl)
 	_popup_layer = pl
@@ -536,7 +620,8 @@ func _map_save_id() -> String:
 const _FT_PERSIST_KEYS = [
 	"_ft_distort", "_ft_crop", "_ft_crop_soft", "_ft_crop_feather", "_ft_crop_opacity", "_ft_edgecrop", "_ft_transforms",
 	"_ft_pattern_orig", "_ft_pattern_orig_pos", "_ft_pattern_reset", "_ft_pattern_world",
-	"_portal_offsets", "_ft_orig_xform",
+	"_portal_offsets", "_ft_orig_xform", "_ft_width_warp", "_ft_wall_reset",
+	"_ft_path_reset",
 ]
 # Single ModMapData key under which we persist a snapshot of all the
 # stores listed above. DD persists ModMapData inside the .dungeondraft_map
@@ -1127,6 +1212,26 @@ func _on_reset_scale() -> void:
 			if wall != null:
 				wall.call("RemakeLines")
 		elif _is_path(nd):
+			# Warp distort/perspective : restaure les EditPoints d'origine
+			# et efface le profil de largeur (le warp vit dans les points,
+			# pas dans le transform).
+			var pkey = _ft_node_key(nd)
+			if pkey != "" and _g.ModMapData.has("_ft_path_reset") \
+					and _g.ModMapData["_ft_path_reset"].has(pkey):
+				var pflat = _g.ModMapData["_ft_path_reset"][pkey]
+				if pflat is Array and pflat.size() >= 4:
+					var ppts = []
+					for i in range(0, pflat.size(), 2):
+						ppts.append(Vector2(pflat[i], pflat[i + 1]))
+					nd.call("SetEditPoints", ppts)
+					if nd.has_method("Smooth"):
+						nd.call("Smooth")
+				_g.ModMapData["_ft_path_reset"].erase(pkey)
+			if pkey != "" and _g.ModMapData.has("_ft_width_warp") \
+					and _g.ModMapData["_ft_width_warp"].has(pkey):
+				_g.ModMapData["_ft_width_warp"].erase(pkey)
+				_width_applied_sig.erase(pkey)
+				_apply_path_point_widths(nd, null)
 			nd.scale    = Vector2(1, 1)
 			nd.rotation = 0.0
 			nd.transform = Transform2D(Vector2(1, 0), Vector2(0, 1), nd.position)
@@ -1229,6 +1334,12 @@ func _auto_disable_ft(reason: String) -> void:
 # ── Suppression hover/overlay DD (repris du mécanisme de pan_fix) ──────────
 
 func _update_hover_suppression(select_active: bool) -> void:
+	# Pendant une drag box DD, la sélection oscille (assets qui entrent/
+	# sortent du rectangle) → snapshot/clear puis restore des filtres à
+	# répétition, visible dans l'UI. On gèle l'état courant jusqu'au
+	# relâchement ; la frame suivante re-converge sur la sélection finale.
+	if _select_tool != null and _select_tool.isDrawing:
+		return
 	var want = _enabled and select_active and _selected_objects.size() > 0
 	if want and not _hover_suppressed:
 		_clear_current_highlight()
@@ -1308,6 +1419,13 @@ func _ft_snapshot_and_clear_filters() -> void:
 	if menu != null:
 		for i in range(1, menu.get_item_count()):
 			if menu.get_item_text(i) == "Texts":
+				continue
+			# "Walls" reste coché : DragSelectWalls lit ce filtre pour
+			# l'ajout différé (+2 frames) des walls après une drag box ;
+			# le décocher ici créait une course qui excluait les walls de
+			# toute multi-sélection quand FT était actif. Les clics près
+			# de la box FT restent consommés par le verrou de toute façon.
+			if menu.get_item_text(i) == "Walls":
 				continue
 			if menu.is_item_checked(i):
 				menu.emit_signal("id_pressed", menu.get_item_id(i))
@@ -1434,6 +1552,7 @@ func update(_delta: float) -> void:
 	_ftp("reapply_shear", _ft4)
 	_ft4 = OS.get_ticks_usec()
 	_restore_distort_from_store(not pattern_tool_active)
+	_reapply_width_warp()
 	_ftp("restore_distort", _ft4)
 	_ft4 = OS.get_ticks_usec()
 	_restore_crop_from_store(not pattern_tool_active)
@@ -1452,6 +1571,8 @@ func update(_delta: float) -> void:
 
 	if not select_active:
 		_selected_objects.clear()
+		_walls_in_selection = []
+		_lights_in_selection = []
 		_reset_cursor()
 		return
 
@@ -1485,6 +1606,8 @@ func update(_delta: float) -> void:
 			if _selected_objects.size() > 0:
 				_selected_objects.clear()
 				_crop_node = null
+			_walls_in_selection = []
+			_lights_in_selection = []
 			if _toggle_btn != null and is_instance_valid(_toggle_btn):
 				var _grp = _toggle_btn.get_parent()
 				if _grp != null and _grp.visible:
@@ -1535,9 +1658,15 @@ func update(_delta: float) -> void:
 				_ft_lock = fresh_props.duplicate()
 				_ft_lock_reassert = 0
 		elif not _same_selection(fresh_props, _ft_lock):
+			# Sélection walls-only : switch DÉLIBÉRÉ vers un wall (compatible
+			# symétrie) → on lâche le verrou au lieu de le rétablir, sinon le
+			# wall serait immédiatement désélectionné au profit des props.
+			if fresh_props.size() == 0 and _selected_walls().size() > 0:
+				_ft_lock = []
+				_ft_lock_reassert = 0
 			# DD a basculé sur un autre asset → on rétablit le verrou (appels
 			# directs, comme DragSelectWalls / alt_deselect).
-			if _ft_lock_reassert < 8 and _select_tool != null:
+			elif _ft_lock_reassert < 8 and _select_tool != null:
 				_ft_lock_reassert += 1
 				_select_tool.transformMode = 0
 				_select_tool.DeselectAll()
@@ -1581,10 +1710,24 @@ func update(_delta: float) -> void:
 	var has_selection = fresh_props.size() > 0
 	var is_portal_sel = has_selection and _all_portals()
 
+	# Walls sélectionnés : compatibles avec FT depuis l'ajout de la symétrie
+	# des walls (menu réduit). Sert à ne pas auto-désactiver, à garder le
+	# widget visible, à ne pas rétablir le verrou sur une sélection
+	# walls-only, et à dessiner la box verte autour des walls (cache
+	# _walls_in_selection consommé par l'overlay et _selection_aabb).
+	var sel_walls_now := _selected_walls()
+	_walls_in_selection = sel_walls_now
+	_lights_in_selection = _selected_lights()
+
 	# Auto-disable FT si la sélection devient exclusivement incompatible
-	# (sélection non vide, mais aucun asset compatible — ex : walls seuls, roofs, lights)
+	# (sélection non vide, mais aucun asset compatible — ex : roofs).
+	# Les walls seuls ne sont PLUS incompatibles : la symétrie s'y applique.
+	# Les lights non plus (symétrie du menu contextuel) — testées en
+	# dernier : _selected_lights() ne scanne RawSelectables que si tout
+	# le reste conclurait à la désactivation (court-circuit).
 	# Cas "rien sélectionné" → on ne désactive pas (l'utilisateur peut re-sélectionner).
-	if _enabled and not _lock_mode and fresh.size() > 0 and fresh_props.size() == 0:
+	if _enabled and not _lock_mode and fresh.size() > 0 and fresh_props.size() == 0 \
+			and sel_walls_now.size() == 0 and _selected_lights().size() == 0:
 		_auto_disable_ft("incompatible selection")
 
 	# Crop / Soft Crop ne supportent qu'UN seul prop simple. Si on sélectionne un
@@ -1609,19 +1752,31 @@ func update(_delta: float) -> void:
 	# Note: si des paths sont en distort/perspective, le warning popup gère la situation
 
 	# Gestion de la box DD :
-	# - FT actif → cache la box DD chaque frame (notre overlay remplace)
+	# - FT actif → cache la box DD chaque frame (notre overlay remplace,
+	#   y compris pour les walls : la box verte les englobe désormais et
+	#   la custom box de DragSelectWalls est coupée quand FT est actif)
 	# - FT inactif → on ne touche pas à la box DD, on la laisse gérer par DD
-	if _enabled and _select_tool != null and fresh.size() > 0:
+	if _enabled and _select_tool != null \
+			and (fresh_props.size() > 0 or sel_walls_now.size() > 0):
+		_select_tool.call("EnableTransformBox", false)
+	elif _enabled and _select_tool != null and fresh.size() > 0 \
+			and _selected_lights().size() > 0:
+		# Lights-only : pas de handles FT, mais la box DD (et ses curseurs
+		# de resize) n'a rien à faire là non plus — seul le widget flamme
+		# reste. Testé en dernier (court-circuit) : le scan RawSelectables
+		# ne tourne que sur les sélections sans props ni walls.
 		_select_tool.call("EnableTransformBox", false)
 
-	# Bouton : visibilité basée sur fresh_props (déselection immédiate).
+	# Bouton : visibilité basée sur fresh_props (déselection immédiate) OU
+	# une sélection de walls (symétrie disponible via le menu réduit).
 	# _widget_force_hidden override quand l'utilisateur a desactive le
 	# toggle "Free Transform" dans le Settings panel — sinon le group se
 	# reaffiche des qu'un asset compatible est selectionne.
 	if _toggle_btn != null and is_instance_valid(_toggle_btn):
 		var group = _toggle_btn.get_parent()
 		if group != null:
-			group.visible = has_selection and not _widget_force_hidden
+			group.visible = (has_selection or sel_walls_now.size() > 0 \
+					or _lights_in_selection.size() > 0) and not _widget_force_hidden
 
 
 	# Détecte les changements de type de portal et rafraîchit le mur
@@ -1658,7 +1813,7 @@ func update(_delta: float) -> void:
 				return
 			var wp = _mouse_world(vp)
 			var resolved = false
-			if _selected_objects.size() > 0:
+			if _selected_objects.size() > 0 or _walls_in_selection.size() > 0:
 				# Portals : la zone intérieure est toujours grab, handles seulement à l'extérieur
 				if _all_portals() and _selection_aabb().has_point(wp):
 					if _mod_alt:
@@ -1839,7 +1994,60 @@ func _on_input(event: InputEvent) -> void:
 	_mod_shift = event.shift; _mod_alt = event.alt
 
 	if not _enabled: return
-	if _selected_objects.size() == 0 and _active_handle < 0: return
+	if _selected_objects.size() == 0 and _active_handle < 0:
+		# Sélection walls-only (un ou plusieurs murs, aucun prop FT) : on
+		# laisse passer les événements souris — la box verte FT porte les
+		# handles move/rotate/scale des walls et le menu des symétries.
+		if _walls_in_selection.size() == 0:
+			# Lights-only : clic droit (menu des symétries) + drag gauche
+			# dans la box verte (move groupé — DD déplace via sa transform
+			# box, cachée en lights-only). Tout le reste passe à DD.
+			if _lights_in_selection.size() == 0 and not _light_drag_active:
+				return
+			if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
+				var vp_l = tree.root.get_node_or_null(_viewport_path)
+				if vp_l == null:
+					return
+				if event.pressed:
+					if _ui_util != null and _ui_util.is_mouse_over_ui(_input_listener):
+						return
+					var wp_l = _mouse_world(vp_l)
+					var box_l = _selection_aabb()
+					if box_l.size != Vector2.ZERO and box_l.has_point(wp_l):
+						_light_drag_active = true
+						_light_drag_start = wp_l
+						_light_drag_nodes = []
+						_light_drag_origins = []
+						for l in _lights_in_selection:
+							if is_instance_valid(l):
+								_light_drag_nodes.append(l)
+								_light_drag_origins.append(l.global_position)
+						_light_drag_before = _capture_ft_unified(_light_drag_nodes)
+						tree.set_input_as_handled()
+					# Clic hors box : DD gère (désélection / marquee).
+				elif _light_drag_active:
+					_light_drag_active = false
+					_record_ft_unified_change(_light_drag_before,
+							_capture_ft_unified(_light_drag_nodes))
+					_light_drag_nodes = []
+					_light_drag_origins = []
+					_light_drag_before = {}
+					tree.set_input_as_handled()
+				return
+			elif event is InputEventMouseMotion:
+				if _light_drag_active:
+					var vp_m = tree.root.get_node_or_null(_viewport_path)
+					if vp_m != null:
+						var delta_l = _mouse_world(vp_m) - _light_drag_start
+						for i in range(_light_drag_nodes.size()):
+							var ln = _light_drag_nodes[i]
+							if is_instance_valid(ln):
+								ln.global_position = _light_drag_origins[i] + delta_l
+						tree.set_input_as_handled()
+				return
+			if not (event is InputEventMouseButton \
+					and event.button_index == BUTTON_RIGHT and event.pressed):
+				return
 	var vp = tree.root.get_node_or_null(_viewport_path)
 	if vp == null: return
 
@@ -1922,6 +2130,22 @@ func _on_input(event: InputEvent) -> void:
 				tree.set_input_as_handled()
 				return
 
+	# Molette pendant un drag IDX_MOVE de walls (walls-only) : rotation
+	# par pas de 15° (5° avec Shift), composée dans la translation.
+	# Hors drag, la molette appartient à rotation_fix (qui route les
+	# walls via DragSelectWalls et skippe pendant nos drags de handle).
+	if event is InputEventMouseButton and event.pressed \
+			and (event.button_index == BUTTON_WHEEL_UP or event.button_index == BUTTON_WHEEL_DOWN) \
+			and _active_handle == IDX_MOVE and _wall_drag_active and _drag_states.empty():
+		var wheel_step = deg2rad(5.0) if _mod_shift else deg2rad(15.0)
+		if event.button_index == BUTTON_WHEEL_UP:
+			wheel_step = -wheel_step
+		_wall_wheel_rot += wheel_step
+		print("[FreeTransform] Wheel (drag) : %.0f°" % rad2deg(_wall_wheel_rot))
+		_update_handle_drag(wp, vp)
+		tree.set_input_as_handled()
+		return
+
 	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT and event.pressed:
 		var _ft_consumed := false
 		# Portals : comportement selon le mode
@@ -1950,7 +2174,8 @@ func _on_input(event: InputEvent) -> void:
 			if hit >= 0:
 				_start_handle_drag(hit, wp)
 				_ft_consumed = true
-			elif _selected_objects.size() > 0 and _selection_aabb().has_point(wp):
+			elif (_selected_objects.size() > 0 or _walls_in_selection.size() > 0) \
+					and _selection_aabb().has_point(wp):
 				# Clic dans la bbox → déplacement libre via IDX_MOVE
 				_start_handle_drag(IDX_MOVE, wp)
 				_ft_consumed = true
@@ -1985,8 +2210,9 @@ func _on_input(event: InputEvent) -> void:
 			tree.set_input_as_handled()
 
 	elif event is InputEventMouseButton and event.button_index == BUTTON_RIGHT and event.pressed:
-		# Menu contextuel du mode de transformation
-		if _enabled and _selected_objects.size() > 0 and _active_handle < 0:
+		# Menu contextuel du mode de transformation. Ouvert aussi pour une
+		# sélection ne contenant QUE des walls (menu réduit : symétries).
+		if _enabled and (_selected_objects.size() > 0 or _walls_in_selection.size() > 0 or _selected_lights().size() > 0) and _active_handle < 0:
 			if _ui_util == null or not _ui_util.is_mouse_over_ui(_input_listener):
 				_show_transform_menu()
 				tree.set_input_as_handled()
@@ -2089,6 +2315,16 @@ func _capture_ft_unified(nodes: Array) -> Dictionary:
 			"rotation": nd.global_rotation,
 			"scale": nd.global_scale,
 		}
+		# Paths : EditPoints (coordonnées monde) — mutés par le warp
+		# distort/perspective (baké dans les points, invisible pour le
+		# record DD RecordTransforms).
+		if _is_path(nd):
+			var ppts = _get_path_edit_points_world(nd)
+			if ppts.size() > 0:
+				entry["path_points"] = ppts
+			var wprof = _ft_width_profile_copy(nd)
+			if wprof != null:
+				entry["path_width_warp"] = wprof
 		if transforms_store.has(key):
 			entry["transform"] = transforms_store[key].duplicate()
 		if distort_store.has(key):
@@ -2297,6 +2533,43 @@ func _restore_ft_unified(state: Dictionary) -> void:
 		var entry = state[key]
 		var nd = _ft_node_from_key(key)
 		if nd != null and is_instance_valid(nd):
+			# Paths : les path_points capturés sont MONDE (GlobalEditPoints)
+			# et SetEditPoints (C#) suppose une base IDENTITÉ — il pose
+			# Position = points[0] et stocke des deltas parent-space, sans
+			# tenir compte de rotation/scale. On neutralise donc la base
+			# AVANT SetEditPoints (Position est posé par SetEditPoints
+			# lui-même, Smooth() y est inclus). Sans points capturés,
+			# fallback transform standard.
+			if _is_path(nd):
+				if entry.has("path_points") and entry["path_points"].size() > 1:
+					nd.rotation = 0.0
+					nd.scale = Vector2.ONE
+					nd.call("SetEditPoints", entry["path_points"])
+					_refresh_path_widget(nd)
+				elif entry.has("transform"):
+					var dt = entry["transform"]
+					nd.transform = Transform2D(
+						Vector2(dt.xx, dt.xy),
+						Vector2(dt.yx, dt.yy),
+						Vector2(dt.ox, dt.oy)
+					)
+				else:
+					nd.global_position = entry["position"]
+					nd.global_rotation = entry["rotation"]
+					nd.global_scale = entry["scale"]
+			if _is_path(nd):
+				# Profil de largeur : restaure ou efface (état capturé sans
+				# profil) — application par point (moteur DD).
+				if not _g.ModMapData.has("_ft_width_warp"):
+					_g.ModMapData["_ft_width_warp"] = {}
+				if entry.has("path_width_warp"):
+					var wprof = entry["path_width_warp"]
+					_g.ModMapData["_ft_width_warp"][key] = wprof.duplicate(true)
+					_apply_path_point_widths(nd, wprof)
+				else:
+					_g.ModMapData["_ft_width_warp"].erase(key)
+					_apply_path_point_widths(nd, null)
+				_width_applied_sig.erase(key)
 			# For patterns, the visual rendering depends on a ShaderMaterial
 			# (_ft_materials cache) that warps the polygon's interior. If
 			# we just restored the polygon vertices the OUTLINE / SHAPE
@@ -2357,7 +2630,12 @@ func _restore_ft_unified(state: Dictionary) -> void:
 			else:
 				# Non-pattern node: standard transform restore (or full
 				# transform when shear is captured for paths/etc).
-				if entry.has("pattern_transform"):
+				# Paths : déjà restaurés EXACTEMENT plus haut (avant
+				# SetEditPoints) — ne pas ré-écraser via pos/rot/scale
+				# (perdrait le det<0 d'une symétrie).
+				if _is_path(nd):
+					pass
+				elif entry.has("pattern_transform"):
 					nd.transform = entry["pattern_transform"]
 				else:
 					nd.global_position = entry["position"]
@@ -2531,7 +2809,18 @@ func _other_mod_owns_box() -> bool:
 	return false
 
 
+func _selection_has_pattern() -> bool:
+	for nd in _selected_objects:
+		if is_instance_valid(nd) and _is_pattern(nd):
+			return true
+	return false
+
+
 func _all_portals() -> bool:
+	# Sélection vide (ex: walls-only) → false, sinon les branches
+	# portals (hit test, handles, pivots) s'appliqueraient à tort.
+	if _selected_objects.empty():
+		return false
 	for nd in _selected_objects:
 		if is_instance_valid(nd) and not _is_portal(nd):
 			return false
@@ -2684,6 +2973,23 @@ func _get_path_edit_points_local(node: Node2D) -> Array:
 	return result
 
 
+# EditPoints en coordonnées MONDE. DD expose EditPoints (locaux au node)
+# et GlobalEditPoints (monde) ; SetEditPoints attend du MONDE — convention
+# validée par SplitPath (lit GlobalEditPoints, repasse tel quel à
+# SetEditPoints). Fallback : transforme les locaux par node.transform.
+func _get_path_edit_points_world(node: Node2D) -> Array:
+	var pts = node.get("GlobalEditPoints")
+	if pts != null:
+		var out = []
+		for p in pts:
+			out.append(p)
+		return out
+	var out2 = []
+	for p in _get_path_edit_points_local(node):
+		out2.append(node.transform.xform(p))
+	return out2
+
+
 func _get_path_local_aabb(node: Node2D) -> Rect2:
 	var pts = _get_path_edit_points_local(node)
 	if pts.empty(): return Rect2(Vector2.ZERO, Vector2(128, 128))
@@ -2758,6 +3064,72 @@ func _bake_path_transform(node: Node2D) -> void:
 	var key = _ft_node_key(node)
 	if key != "" and _g.ModMapData.has("_ft_transforms"):
 		_g.ModMapData["_ft_transforms"].erase(key)
+
+
+# Inversion bilinéaire CPU (float64) : coordonnées (u,v) de p dans le quad
+# [tl, tr, br, bl]. Forme quadratique numériquement stable (même correctif
+# que les shaders warp). Pas de clamp : l'extrapolation reste continue pour
+# les points en bordure du padding de la box des paths fins.
+func _inv_bilinear_cpu(p: Vector2, quad: Array) -> Vector2:
+	var a: Vector2 = quad[0]; var b: Vector2 = quad[1]
+	var c: Vector2 = quad[2]; var d: Vector2 = quad[3]
+	var e = b - a; var f = d - a; var g = a - b + c - d; var h = p - a
+	var k2 = g.cross(f)
+	var k1 = e.cross(f) + h.cross(g)
+	var k0 = h.cross(e)
+	var v: float
+	if abs(k2) < 1e-9 * (abs(k1) + 1.0):
+		v = -k0 / k1 if abs(k1) > 0.000000000001 else 0.0
+	else:
+		var sq = sqrt(max(k1 * k1 - 4.0 * k0 * k2, 0.0))
+		var qq = -0.5 * (k1 + (sq if k1 >= 0.0 else -sq))
+		var v1 = qq / k2
+		var v2 = k0 / qq if abs(qq) > 0.000000000001 else v1
+		v = v1 if (v1 >= -0.001 and v1 <= 1.001) else v2
+	var den = e + g * v
+	var u: float
+	if abs(den.x) > abs(den.y):
+		u = (h.x - f.x * v) / den.x if abs(den.x) > 0.000000000001 else 0.0
+	else:
+		u = (h.y - f.y * v) / den.y if abs(den.y) > 0.000000000001 else 0.0
+	return Vector2(u, v)
+
+
+# Distort/Perspective d'un path : remappe chaque EditPoint (monde, capturé
+# au début du drag) du quad source vers le quad destination, puis Smooth.
+func _apply_distort_path(st: Dictionary, nc: Array) -> void:
+	var node = st.node
+	if not is_instance_valid(node): return
+	var pts0 = st.get("path_pts_world")
+	if pts0 == null or pts0.size() == 0: return
+	var src = st.corners
+	if not (src is Array) or src.size() != 4: return
+	var new_pts = []
+	for p in pts0:
+		new_pts.append(_warp_point(p, src, nc))
+	node.call("SetEditPoints", new_pts)
+	if node.has_method("Smooth"):
+		node.call("Smooth")
+
+	# Largeur variable : facteur perpendiculaire du warp à chaque point,
+	# composé avec le profil d'avant le drag (recalcul absolu depuis les
+	# snapshots chaque frame — pas de dérive). Store écrit au fil de l'eau
+	# (persisté par _save_ft_data au commit).
+	var ploop = bool(node.get("loop")) if node.get("loop") != null else false
+	var fr0 = _polyline_arc_fractions(pts0, ploop)
+	var pre = st.get("path_width_profile")
+	var new_fr = _polyline_arc_fractions(new_pts, ploop)
+	var new_fa = []
+	for i in range(pts0.size()):
+		new_fa.append(_sample_width_profile(pre, fr0[i]) * _area_warp_factor(pts0[i], src, nc))
+	var key = _ft_node_key(node)
+	if key != "":
+		if not _g.ModMapData.has("_ft_width_warp"):
+			_g.ModMapData["_ft_width_warp"] = {}
+		_g.ModMapData["_ft_width_warp"][key] = {"fr": new_fr, "fa": new_fa, "cl": ploop}
+	if node is Line2D:
+		_apply_path_point_widths(node, {"fr": new_fr, "fa": new_fa, "cl": ploop})
+
 
 
 func _bake_pattern_state(node: Node2D) -> void:
@@ -2873,17 +3245,16 @@ func _soft_bake_pattern(node: Node2D) -> void:
 				new_corners.append(wc.y - t.origin.y)
 			_g.ModMapData["_ft_distort"][key] = new_corners
 
-	# 2. Transforme le polygon original par le scale
-	if _g.ModMapData.has("_ft_pattern_orig") and _g.ModMapData["_ft_pattern_orig"].has(key):
-		var flat = _g.ModMapData["_ft_pattern_orig"][key]
-		if flat is Array and flat.size() >= 6:
-			var new_flat = []
-			for i in range(0, flat.size(), 2):
-				var p = Vector2(flat[i], flat[i + 1])
-				var wp = t.xform(p)
-				new_flat.append(wp.x - t.origin.x)
-				new_flat.append(wp.y - t.origin.y)
-			_g.ModMapData["_ft_pattern_orig"][key] = new_flat
+	# 2. NE PAS toucher au polygon original (_ft_pattern_orig).
+	# C'est la référence FIXE de l'espace texture : le shader échantillonne
+	# via ft_orig_min/ft_orig_size (fenêtre de texture) et le warp calcule
+	# ses (u,v) par rapport à l'AABB de l'original. Le transformer changeait
+	# la taille de la fenêtre (fréquence de texture fausse → rayures denses)
+	# et désalignait les 4 points de leur AABB (paramétrisation (u,v)
+	# repliée → triangulation qui se chevauche, bandes noires) — visible en
+	# enchaînant skew puis scale. L'interpolation bilinéaire étant
+	# équivariante aux transformations affines, absorber le transform dans
+	# les coins (étape 1) et le polygon (étape 3) suffit et reste exact.
 
 	# 3. Transforme le polygon actuel du node
 	var new_poly = PoolVector2Array()
@@ -3115,6 +3486,25 @@ func _selection_aabb() -> Rect2:
 		var bb = _prop_aabb(nd)
 		mn.x = min(mn.x, bb.position.x); mn.y = min(mn.y, bb.position.y)
 		mx.x = max(mx.x, bb.end.x);      mx.y = max(mx.y, bb.end.y)
+	# Étend aux walls sélectionnés : la box verte FT les englobe (visuel
+	# seul — les handles ne transforment que les props, les walls passent
+	# par la symétrie du menu contextuel).
+	for w in _walls_in_selection:
+		if not is_instance_valid(w): continue
+		var pts = w.get("Points")
+		if pts == null: continue
+		for p in pts:
+			mn.x = min(mn.x, p.x); mn.y = min(mn.y, p.y)
+			mx.x = max(mx.x, p.x); mx.y = max(mx.y, p.y)
+	# Étend aux lights sélectionnées : position ± pad (le widget flamme
+	# fait ~128 px locaux ; 64 unités monde donnent une box lisible sans
+	# englober tout le rayon lumineux).
+	var light_pad := 64.0
+	for l in _lights_in_selection:
+		if not is_instance_valid(l): continue
+		var lp = l.global_position
+		mn.x = min(mn.x, lp.x - light_pad); mn.y = min(mn.y, lp.y - light_pad)
+		mx.x = max(mx.x, lp.x + light_pad); mx.y = max(mx.y, lp.y + light_pad)
 	if mn.x == INF: return Rect2()
 	return Rect2(mn, mx - mn)
 
@@ -3159,12 +3549,18 @@ func _bbox_handle_positions(bb: Rect2) -> Array:
 
 
 func _current_handle_positions(vp: Node) -> Array:
-	if _selected_objects.size() == 0: return []
+	if _selected_objects.size() == 0:
+		# Walls-only : handles sur la bbox fusionnée (move/rotate/scale
+		# en free ; coins/bords warpés en skew/distort/perspective).
+		if _walls_in_selection.size() > 0 \
+				and _transform_mode in ["free", "skew", "distort", "perspective"]:
+			return _bbox_handle_positions(_selection_aabb())
+		return []
 	# Pendant un drag non-free, utilise _group_warp_corners comme source de vérité
 	# (évite les décalages si node.transform est modifié entre frames)
 	if _transform_mode != "free" and _group_warp_corners.size() == 4 and _active_handle >= 0:
 		return _group_corners_to_handles(_group_warp_corners)
-	if _selected_objects.size() == 1:
+	if _selected_objects.size() == 1 and _walls_in_selection.size() == 0:
 		var nd = _selected_objects[0]
 		if not is_instance_valid(nd): return []
 		if _transform_mode in ["distort", "perspective", "skew"] and _has_distort_corners(nd):
@@ -3293,6 +3689,26 @@ func _hit_handle(wp: Vector2, vp: Node) -> int:
 			if not k in allowed: continue
 			if wp.distance_to(hs[k]) < thr_in: return k
 
+	# Bande de rotation autour de la box (même geste que la custom box de
+	# DragSelectWalls) — en mode free, hors des handles de scale.
+	# Exclusions :
+	# - sélections 100% portals (leurs modes slide/offset/scale priment,
+	#   et une rotation libre les décollerait du mur) ;
+	# - sélections contenant un pattern : DD reset les transforms des
+	#   patterns (node.rotation est inopérant) et stocker une base
+	#   tournée dans _ft_transforms épinglait le pattern (box qui bouge
+	#   sans le pattern). La molette de rotation_fix, qui passe par
+	#   rotate_ft_node, reste le chemin supporté pour eux.
+	if _transform_mode == "free" and not _all_portals() \
+			and not _selection_has_pattern() \
+			and (_selected_objects.size() > 0 or _walls_in_selection.size() > 0):
+		var bb = _selection_aabb()
+		if bb.size != Vector2.ZERO and not bb.has_point(wp):
+			var nearest = Vector2(clamp(wp.x, bb.position.x, bb.end.x),
+					clamp(wp.y, bb.position.y, bb.end.y))
+			if wp.distance_to(nearest) < 65.0 / zoom:
+				return IDX_ROT
+
 	return -1
 
 
@@ -3370,12 +3786,73 @@ func _start_handle_drag(handle_idx: int, wp: Vector2) -> void:
 					_bake_pattern_state(nd)
 			_normalize_pattern_position(nd)
 
+	# Walls : snapshot pour move / rotate / scale (mode free) — identique
+	# à la custom box de DragSelectWalls, via son API. Les modes
+	# skew / distort / perspective / crop ne s'appliquent PAS aux walls
+	# (seuls la symétrie et les transformations affines sont supportées).
+	_wall_drag_active = false
+	_wall_drag_walls = []
+	_wall_drag_snaps = {}
+	_wall_drag_before = []
+	_wall_drag_corners = {}
+	_wall_drag_wprofile = {}
+	_wall_drag_childpts = {}
+	_wall_drag_childfr = {}
+	_wall_drag_lastnc = {}
+	var _dsw = _g.ModMapData.get("_drag_select_walls")
+	if _walls_in_selection.size() > 0 and _dsw != null \
+			and _dsw.has_method("_apply_transform_to_wall") \
+			and (handle_idx == IDX_MOVE or handle_idx == IDX_ROT \
+			or (_transform_mode in ["free", "skew", "distort", "perspective"] \
+			and handle_idx in (CORNER_IDX + EDGE_IDX))):
+		for _w in _walls_in_selection:
+			if not is_instance_valid(_w):
+				continue
+			_store_wall_reset(_w)
+			var _wsnap = _dsw._snapshot_wall(_w)
+			_wall_drag_walls.append(_w)
+			_wall_drag_snaps[_w] = _wsnap
+			_wall_drag_corners[_w] = _wall_aabb_corners(_wsnap.get("pts", []))
+			_wall_drag_wprofile[_w] = _ft_width_profile_copy(_w)
+			var _cfr = {}
+			var _cdec = {}
+			var _wloop2 = bool(_w.get("Loop")) if _w.get("Loop") != null else false
+			for _child in _wsnap.get("children", {}):
+				var _cdata = _wsnap["children"][_child]
+				if _cdata.has("points"):
+					var _cpts = _decimate_polyline(_cdata["points"], 64)
+					_cdec[_child] = _cpts
+					_cfr[_child] = _arc_fractions_on_polyline(_wsnap.get("pts", []), _cpts, _wloop2)
+			_wall_drag_childpts[_w] = _cdec
+			_wall_drag_childfr[_w] = _cfr
+			_wall_drag_before.append({
+				"wall": _w,
+				"snap": _wsnap,
+				"portal_scales": _capture_portal_scales(_w),
+				"width_warp": _ft_width_profile_copy(_w),
+			})
+		_wall_drag_active = _wall_drag_walls.size() > 0
+	_wall_wheel_rot = 0.0
+
+	# Distort / Perspective sur paths : absorbe d'abord tout transform du
+	# node dans les EditPoints (bake éprouvé du flux skew→free), pour que
+	# le warp travaille en coordonnées monde pures et que la capture
+	# d'undo reflète l'état post-bake (visuellement identique).
+	if _transform_mode in ["distort", "perspective"]:
+		for _pnd in _selected_objects:
+			if is_instance_valid(_pnd) and _is_path(_pnd):
+				_bake_path_transform(_pnd)
+				_store_path_reset(_pnd)
+
 	# Choose the undo path based on whether the selection is fully
 	# manageable by us. If yes, we skip DD's SavePreTransforms entirely
 	# and capture a unified before-snapshot ourselves; we'll push a
 	# single record on commit. If not (any wall/portal/pattern/path),
 	# we fall back to DD's flow + an extras-only callback.
-	_undo_skip_dd_record = _ft_selection_is_simple(_selected_objects)
+	# Sélection walls-only : rien à enregistrer côté DD (les walls sont
+	# couverts par notre record combiné) → chemin unifié.
+	_undo_skip_dd_record = _ft_selection_is_simple(_selected_objects) \
+			or _selected_objects.empty()
 	if _undo_skip_dd_record:
 		_undo_unified_before = _capture_ft_unified(_selected_objects)
 	else:
@@ -3403,10 +3880,13 @@ func _start_handle_drag(handle_idx: int, wp: Vector2) -> void:
 			"orig_polygon": Array(nd.polygon) if _is_pattern(nd) else null,
 			"is_pattern": _is_pattern(nd),
 			"is_path": _is_path(nd),
+			"path_pts_world": _get_path_edit_points_world(nd) if _is_path(nd) else null,
+			"path_width_profile": _ft_width_profile_copy(nd) if _is_path(nd) else null,
 			"wall_arc": wall_arc,
 			"arc_rot_start": arc_rot_start,
 		})
-	_group_bbox = _prop_aabb(_drag_states[0].node) if _drag_states.size() == 1 else _selection_aabb()
+	_group_bbox = _prop_aabb(_drag_states[0].node) \
+			if (_drag_states.size() == 1 and not _wall_drag_active) else _selection_aabb()
 	_walk_prev_wp = wp
 
 	# Initialise les coins du groupe pour le cadre FT pendant le drag
@@ -3437,8 +3917,8 @@ func _start_handle_drag(handle_idx: int, wp: Vector2) -> void:
 
 
 func _update_handle_drag(wp: Vector2, vp: Node) -> void:
-	if _drag_states.empty(): return
-	var is_single = (_selected_objects.size() == 1)
+	if _drag_states.empty() and not _wall_drag_active: return
+	var is_single = (_selected_objects.size() == 1) and not _wall_drag_active
 	var delta = wp - _drag_start_pos
 
 
@@ -3455,6 +3935,8 @@ func _update_handle_drag(wp: Vector2, vp: Node) -> void:
 		var rad = deg2rad(da)
 		for st in _drag_states:
 			if not is_instance_valid(st.node): continue
+			# Défensif : jamais de node.rotation sur un pattern (cf. bande).
+			if st.get("is_pattern", false): continue
 			st.node.position = st.pos
 			st.node.rotation = st.rot
 			var aabb_before = _prop_aabb(st.node)
@@ -3464,6 +3946,12 @@ func _update_handle_drag(wp: Vector2, vp: Node) -> void:
 			var aabb_natural = _prop_aabb(st.node)
 			var vc_natural = aabb_natural.position + aabb_natural.size * 0.5
 			st.node.position = st.pos + (vc_target - vc_natural)
+			_sync_store_basis(st.node)
+		# Walls : rotation monde autour du même pivot, via DragSelectWalls.
+		if _wall_drag_active:
+			var Wr = Transform2D(rad, Vector2.ZERO)
+			Wr.origin = pivot - Wr.basis_xform(pivot)
+			_apply_walls_drag_transform(Wr)
 		return
 
 	# ── Glissement perpendiculaire au mur (portals, Alt) ─────────────────────
@@ -3548,6 +4036,16 @@ func _update_handle_drag(wp: Vector2, vp: Node) -> void:
 						new_wc.append(wraw[i] + delta.x)
 						new_wc.append(wraw[i + 1] + delta.y)
 					_g.ModMapData["_ft_pattern_world"][move_id] = new_wc
+		# Walls : translation identique via DragSelectWalls, composée avec
+		# la rotation molette (autour du centre courant de la sélection).
+		if _wall_drag_active:
+			var Wm = Transform2D(0.0, delta)
+			if abs(_wall_wheel_rot) > 0.0001:
+				var c = _group_bbox.position + _group_bbox.size * 0.5 + delta
+				var Rw = Transform2D(_wall_wheel_rot, Vector2.ZERO)
+				Rw.origin = c - Rw.basis_xform(c)
+				Wm = Rw * Wm
+			_apply_walls_drag_transform(Wm)
 		return
 
 	# ── Modes spéciaux : skew / distort / perspective ────────────────────
@@ -3785,12 +4283,20 @@ func _update_handle_drag(wp: Vector2, vp: Node) -> void:
 			var nsw  = new_sw if abs(pls.x) > 0 else 0
 			var nsh  = new_sh if abs(pls.y) > 0 else 0
 			st.node.position = pivot + sign(dir2.x) * nsw * lx + sign(dir2.y) * nsh * ly
+		_sync_store_basis(st.node)
 	else:
 		var pivot = _pivot_world_group(_active_handle)
 		# Portals : ancrage vertical centré (coins et handles haut/bas)
 		var is_vert_handle = (_active_handle == 1 or _active_handle == 5)
 		if (_active_handle in CORNER_IDX or is_vert_handle) and _all_portals():
 			pivot.y = _group_bbox.position.y + _group_bbox.size.y * 0.5
+		# Walls : scale monde autour du pivot groupe, via DragSelectWalls
+		# (positions seules — l'épaisseur du wall ne change pas, comme la
+		# custom box).
+		if _wall_drag_active:
+			var Ws = Transform2D(Vector2(rx, 0.0), Vector2(0.0, ry), Vector2.ZERO)
+			Ws.origin = pivot - Ws.basis_xform(pivot)
+			_apply_walls_drag_transform(Ws)
 		for st in _drag_states:
 			if not is_instance_valid(st.node): continue
 			if st.get("is_pattern", false):
@@ -3820,6 +4326,7 @@ func _update_handle_drag(wp: Vector2, vp: Node) -> void:
 				else:
 					st.node.position = new_pos
 					st.node.scale    = new_sc
+					_sync_store_basis(st.node)
 
 
 func _sync_portal_radii(final: bool = false) -> void:
@@ -3862,6 +4369,60 @@ func _commit_handle_drag() -> void:
 					is_identity = false
 			if not is_identity:
 				_store_shear_transform(st.node, t)
+	# Walls dragués via les handles FT : RemakeLines final (différé
+	# pendant le drag pour la performance, cf. _apply_walls_drag_transform)
+	# puis snapshots d'après pour le record combiné.
+	var wall_entries_after := []
+	if _wall_drag_active:
+		var _dsw = _g.ModMapData.get("_drag_select_walls")
+		for _w in _wall_drag_walls:
+			if not is_instance_valid(_w):
+				continue
+			# Largeur variable : fige le profil final dans le store (facteurs
+			# aux points du wall, composés avec le profil pré-drag) AVANT le
+			# RemakeLines — qui recrée les Line2D — puis reconstruit leurs
+			# width_curve depuis le store APRÈS.
+			var _wkey = _ft_node_key(_w)
+			if _wkey != "" and _wall_drag_lastnc.has(_w) \
+					and _wall_drag_corners.has(_w) and _wall_drag_snaps.has(_w):
+				var _osrc = _wall_drag_corners[_w]
+				var _onc = _wall_drag_lastnc[_w]
+				var _opts = _wall_drag_snaps[_w].get("pts", [])
+				var _wloop = bool(_w.get("Loop")) if _w.get("Loop") != null else false
+				if _opts.size() >= 2:
+					var _ofr = _polyline_arc_fractions(_opts, _wloop)
+					var _pre = _wall_drag_wprofile.get(_w)
+					var _newpts = []
+					for _p in _opts:
+						_newpts.append(_warp_point(_p, _osrc, _onc))
+					var _nfa = []
+					var _changed = _pre != null
+					for _i in range(_opts.size()):
+						var _f = _sample_width_profile(_pre, _ofr[_i]) \
+								* _area_warp_factor(_opts[_i], _osrc, _onc)
+						_nfa.append(_f)
+						if abs(_f - 1.0) > 0.01:
+							_changed = true
+					if _changed:
+						if not _g.ModMapData.has("_ft_width_warp"):
+							_g.ModMapData["_ft_width_warp"] = {}
+						var _sfr = _polyline_arc_fractions(_newpts, _wloop)
+						_g.ModMapData["_ft_width_warp"][_wkey] = {
+							"fr": _sfr,
+							"fa": _nfa,
+							"cl": _wloop,
+						}
+			if _w.has_method("RemakeLines"):
+				_w.RemakeLines()
+			_rebuild_wall_width_curves(_w)
+			if _dsw != null and _dsw.has_method("_snapshot_wall"):
+				wall_entries_after.append({
+					"wall": _w,
+					"snap": _dsw._snapshot_wall(_w),
+					"portal_scales": _capture_portal_scales(_w),
+					"width_warp": _ft_width_profile_copy(_w),
+				})
+
 	# Build the post-state list for the unified snapshot.
 	var nodes_for_after: Array = []
 	for st in _drag_states:
@@ -3872,20 +4433,34 @@ func _commit_handle_drag() -> void:
 	if _undo_skip_dd_record:
 		# All-regular-objects path: push our single unified record.
 		# DD's record was deliberately skipped at start_handle_drag.
-		_record_ft_unified_change(_undo_unified_before, unified_after)
+		# Avec des walls : record combiné (état FT + walls) → UN Ctrl+Z.
+		_record_ft_with_walls(_undo_unified_before, unified_after,
+				_wall_drag_before, wall_entries_after)
 	else:
 		# Mixed-selection path: DD captures the standard transforms via
 		# RecordTransforms, we push an extras-only record alongside.
 		# That still produces two history records — the user needs two
 		# Ctrl+Z — but at least both halves are restored cleanly. Future
 		# work: extend the unified path to cover patterns/paths/portals.
+		# Les walls dragués sont inclus dans notre moitié du record.
 		if _select_tool != null:
 			_select_tool.call("RecordTransforms")
-		_record_ft_unified_change(_undo_unified_before, unified_after)
+		_record_ft_with_walls(_undo_unified_before, unified_after,
+				_wall_drag_before, wall_entries_after)
 	_undo_unified_before = {}
 	_undo_skip_dd_record = false
 	_drag_states.clear()
 	_group_warp_corners = []
+	_wall_drag_active = false
+	_wall_drag_walls = []
+	_wall_drag_snaps = {}
+	_wall_drag_before = []
+	_wall_drag_corners = {}
+	_wall_drag_wprofile = {}
+	_wall_drag_childpts = {}
+	_wall_drag_childfr = {}
+	_wall_drag_lastnc = {}
+	_width_applied_sig = {}
 	_save_ft_data()
 	print("[FreeTransform] Transform validé")
 
@@ -4029,14 +4604,27 @@ func _restore_portals_in_node(node: Node, store: Dictionary, depth: int) -> void
 # ══ Overlay ════════════════════════════════════════════════════════════════
 
 func _needs_overlay() -> bool:
-	return _enabled and _selected_objects.size() > 0
+	# Inclut les lights : sans elles, l'overlay cesse de se redessiner dès
+	# que la sélection est lights-only — le DERNIER dessin (box verte)
+	# reste alors gelé à l'écran après désélection ou FT off. Avec elles,
+	# need retombe à false à la désélection et le _was_drawing du script
+	# overlay déclenche l'update() de nettoyage.
+	return _enabled and (_selected_objects.size() > 0 \
+			or _walls_in_selection.size() > 0 or _lights_in_selection.size() > 0)
 
 func _draw_overlay(overlay: Node2D) -> void:
 	if not _enabled: return
 	if _viewport_path.is_empty(): return
 	var tree = _g.World.get_tree()
 	if not _is_select_tool_active(tree): return
-	if _selected_objects.size() == 0: return
+	# Pendant une drag box DD (marquee), la sélection live entre/sort des
+	# assets à chaque frame → la box verte clignoterait. On la masque
+	# jusqu'au relâchement. (isDrawing : champ C# privé mais exposé par
+	# Mono — même accès que DragSelectWalls.)
+	if _select_tool != null and _select_tool.isDrawing: return
+	var walls_selected = _walls_in_selection.size() > 0
+	var lights_selected = _lights_in_selection.size() > 0
+	if _selected_objects.size() == 0 and not walls_selected and not lights_selected: return
 	var vp = tree.root.get_node_or_null(_viewport_path)
 	if vp == null: return
 
@@ -4102,7 +4690,10 @@ func _draw_overlay(overlay: Node2D) -> void:
 		return
 
 	# ── Cadre ────────────────────────────────────────────────────────────
-	if _selected_objects.size() == 1:
+	# Sélection walls-only : _selected_objects est vide, on tombe dans la
+	# branche multi ci-dessous qui trace le rect de _selection_aabb()
+	# (walls inclus) ; les handles bbox portent move/rotate/scale.
+	if _selected_objects.size() == 1 and not walls_selected:
 		var nd = _selected_objects[0]
 		if not is_instance_valid(nd): return
 		# Pendant un drag non-free, utilise _group_warp_corners (source de vérité)
@@ -4233,13 +4824,13 @@ func _allowed_handle_indices() -> Array:
 # Applique la transformation affine pour les modes skew / distort / perspective.
 # Travaille en coordonnées monde à partir des coins initiaux stockés dans drag state.
 func _update_transform_mode(wp: Vector2) -> void:
-	if _drag_states.empty(): return
+	if _drag_states.empty() and not _wall_drag_active: return
 
 	# ── Coins du groupe de référence au début du drag ──────────────────────
 	# Pour single : coins réels du node.
 	# Pour multi  : coins de la group_bbox (axe-aligned rectangle).
 	var gc: Array  # [TL, TR, BR, BL] groupe monde au début du drag
-	if _drag_states.size() == 1:
+	if _drag_states.size() == 1 and not _wall_drag_active:
 		var st0 = _drag_states[0]
 		if not is_instance_valid(st0.node): return
 		gc = st0.corners.duplicate()
@@ -4366,22 +4957,11 @@ func _update_transform_mode(wp: Vector2) -> void:
 			if st.get("is_pattern", false):
 				_apply_distort_pattern(st.node, nc, st.get("orig_polygon"))
 			elif st.get("is_path", false):
-				# Paths en distort/perspective : applique le transform AABB (affine best-effort)
-				var ts = st.tex_size
-				var hw = ts.x * 0.5; var hh = ts.y * 0.5
-				if hw > 0.1 and hh > 0.1:
-					var p_mn = nc[0]; var p_mx = nc[0]
-					for ci in range(1, 4):
-						p_mn.x = min(p_mn.x, nc[ci].x); p_mn.y = min(p_mn.y, nc[ci].y)
-						p_mx.x = max(p_mx.x, nc[ci].x); p_mx.y = max(p_mx.y, nc[ci].y)
-					var aabb_sz = p_mx - p_mn
-					var aabb_ct = p_mn + aabb_sz * 0.5
-					var sx = aabb_sz.x / (2.0 * hw)
-					var sy = aabb_sz.y / (2.0 * hh)
-					var soff = st.get("visual_offset", Vector2.ZERO)
-					var origin = aabb_ct - Vector2(sx * soff.x, sy * soff.y)
-					st.node.transform = Transform2D(Vector2(sx, 0), Vector2(0, sy), origin)
-					_store_shear_transform(st.node, st.node.transform)
+				# Path : vrai warp bilinéaire des EditPoints (monde), du quad
+				# source (coins au début du drag) vers le quad warpé. Pas de
+				# shader — la texture suit la courbe. Tout est baké dans les
+				# points, les drags successifs composent naturellement.
+				_apply_distort_path(st, nc)
 			else:
 				# Prop (Sprite) : met à jour node.transform AABB + shader
 				var ts = st.tex_size
@@ -4424,6 +5004,23 @@ func _update_transform_mode(wp: Vector2) -> void:
 				var t = Transform2D(col_x, col_y, origin)
 				st.node.transform = t
 				_store_shear_transform(st.node, t)
+
+	# ── Walls : warp bilinéaire des Points + portals ─────────────────────
+	# Le skew (affine) est un cas particulier du warp — un seul chemin
+	# couvre skew, distort et perspective. RemakeLines différé au commit ;
+	# les Line2D enfants sont warpées point à point pour le retour visuel.
+	if _wall_drag_active:
+		for w in _wall_drag_walls:
+			if not is_instance_valid(w) or not _wall_drag_snaps.has(w):
+				continue
+			var w_src = _wall_drag_corners.get(w)
+			if w_src == null or w_src.size() != 4:
+				continue
+			# Coins du wall mappés dans le groupe warpé (identité si le
+			# wall est seul : ses coins == gc).
+			var w_nc = _map_node_corners_to_group(w_src, gc, new_gc)
+			_wall_drag_lastnc[w] = w_nc
+			_apply_warp_to_wall(w, _wall_drag_snaps[w], w_src, w_nc)
 
 
 func _map_node_corners_to_group(node_corners: Array, group_src: Array, group_dst: Array) -> Array:
@@ -4512,6 +5109,22 @@ func _reapply_shear_transforms(select_active: bool = true) -> void:
 					is_dragged = true; break
 			if is_dragged: continue
 		var d = store[key]
+		# Lights : self-heal des entrées ROTATION-PURE (det > 0, colonnes
+		# orthonormées) — produites par la composition de deux symétries
+		# (H puis V = R(180°)) dans d'anciennes sessions. Une rotation
+		# pure est entièrement représentable par position + rotation DD :
+		# l'entrée est inutile, et NUISIBLE — l'heuristique ident du
+		# repli FT-OFF snap le node en arrière dès que la rotation
+		# native fait traverser 0° à la base (blocage à 360°). Purge.
+		if _is_light(nd):
+			var slx = Vector2(d.xx, d.xy)
+			var sly = Vector2(d.yx, d.yy)
+			if (slx.x * sly.y - slx.y * sly.x) > 0.0 \
+					and abs(slx.length() - 1.0) < 0.001 \
+					and abs(sly.length() - 1.0) < 0.001 \
+					and abs(slx.dot(sly)) < 0.001:
+				dead_keys.append(key)
+				continue
 		# FT OFF : autoriser l'édition NATIVE (rotation/scale via la box ou le
 		# slider DD). Au lieu de reverter la base du node vers le store, on
 		# REPLIE tout changement de base dans le store (les coins distort, en
@@ -4528,6 +5141,30 @@ func _reapply_shear_transforms(select_active: bool = true) -> void:
 				d.ox = cur.origin.x
 				d.oy = cur.origin.y
 				continue
+			# Lights : au chargement de map, DD recrée la light avec la
+			# rotation DÉCOMPOSÉE de la base miroir (SaveLight ne persiste
+			# pas le scale) — base courante = rotation pure R(θdec) avec
+			# θdec = atan2 de la colonne x stockée. Dans ce cas précis,
+			# restaure la base miroir stockée. Toute autre base (rotation
+			# native vers un autre angle, resize) suit le repli standard.
+			if _is_light(nd):
+				var lcx = Vector2(cur.x.x, cur.x.y)
+				var lcy = Vector2(cur.y.x, cur.y.y)
+				var cur_rot_pure = abs(lcx.length() - 1.0) < 0.001 \
+						and abs(lcy.length() - 1.0) < 0.001 \
+						and abs(lcx.dot(lcy)) < 0.001 \
+						and (lcx.x * lcy.y - lcx.y * lcy.x) > 0.0
+				var drot = atan2(d.xy, d.xx)
+				var crot = atan2(cur.x.y, cur.x.x)
+				if cur_rot_pure and abs(wrapf(crot - drot, -PI, PI)) < 0.01:
+					nd.transform = Transform2D(
+						Vector2(d.xx, d.xy),
+						Vector2(d.yx, d.yy),
+						nd.position
+					)
+					d.ox = nd.position.x
+					d.oy = nd.position.y
+					continue
 			if ident:
 				nd.transform = Transform2D(Vector2(d.xx, d.xy), Vector2(d.yx, d.yy), nd.position)
 				d.ox = nd.position.x
@@ -4538,11 +5175,73 @@ func _reapply_shear_transforms(select_active: bool = true) -> void:
 			d.yx = cur.y.x; d.yy = cur.y.y
 			d.ox = cur.origin.x; d.oy = cur.origin.y
 			continue
-		# Pour les patterns, DD peut reset la position — on utilise la position stockée
+		# Auto-réparation : une base stockée qui est une ROTATION PURE
+		# (colonnes orthonormées, det ≈ +1, non identité) sur un pattern
+		# n'est jamais un état FT légitime (les entrées légitimes portent
+		# du shear, du scale ou un flip det<0). C'est un artefact de
+		# l'ancien bug "bande de rotation sur pattern" : on purge
+		# l'entrée et on remet la base à l'identité pour libérer le
+		# pattern (il redevient déplaçable/éditable normalement).
+		if _is_pattern(nd):
+			var cx = Vector2(d.xx, d.xy)
+			var cy = Vector2(d.yx, d.yy)
+			var det = cx.x * cy.y - cx.y * cy.x
+			var is_ident = abs(d.xx - 1.0) < 0.001 and abs(d.xy) < 0.001 \
+					and abs(d.yx) < 0.001 and abs(d.yy - 1.0) < 0.001
+			# EXCEPTION : diag(-1,-1) (rotation 180° exacte) est un état FT
+			# LÉGITIME — c'est la composition de deux symétries d'axes
+			# différents (H puis V). La purger téléportait le pattern loin
+			# (base identité + origin (2cx, 2cy) hérité des réflexions).
+			var is_180 = abs(d.xx + 1.0) < 0.001 and abs(d.xy) < 0.001 \
+					and abs(d.yx) < 0.001 and abs(d.yy + 1.0) < 0.001
+			if not is_ident and not is_180 and abs(cx.length() - 1.0) < 0.001 \
+					and abs(cy.length() - 1.0) < 0.001 \
+					and abs(cx.dot(cy)) < 0.001 and det > 0.0:
+				print("[FreeTransform] Pattern : base rotation-pure purgée (artefact), node libéré")
+				nd.transform = Transform2D(Vector2(1, 0), Vector2(0, 1), nd.position)
+				dead_keys.append(key)
+				continue
+		# Pour les patterns, DD peut reset la position — on utilise la
+		# position stockée quand FT est ACTIF (FT gère alors les moves via
+		# IDX_MOVE qui synchronise le store).
+		# FT OFF : même logique de REPLI que les autres assets. Écraser la
+		# base à chaque frame ferait la guerre à DD pendant un
+		# rotate/resize natif : DD calcule la position pour SA base, nous
+		# remettons la nôtre, et la position dérive à chaque frame (le
+		# pattern s'éloigne de la box). On ne touche donc PAS au node
+		# pendant une édition native — on replie sa base dans le store —
+		# et on ne restaure que sur la signature d'un reset DD (base
+		# identité ; position seulement si remise à zéro).
 		var origin = nd.position
 		if _is_pattern(nd):
-			origin = Vector2(d.ox, d.oy)
-			nd.position = origin
+			if _enabled:
+				origin = Vector2(d.ox, d.oy)
+				nd.position = origin
+			else:
+				var curp = nd.transform
+				var identp = abs(curp.x.x - 1.0) < 0.001 and abs(curp.x.y) < 0.001 \
+						and abs(curp.y.x) < 0.001 and abs(curp.y.y - 1.0) < 0.001
+				var samep = abs(curp.x.x - d.xx) < 0.0001 and abs(curp.x.y - d.xy) < 0.0001 \
+						and abs(curp.y.x - d.yx) < 0.0001 and abs(curp.y.y - d.yy) < 0.0001
+				if samep:
+					# Base inchangée : seul un move natif a pu avoir lieu →
+					# replie la position et ne touche à rien.
+					d.ox = curp.origin.x
+					d.oy = curp.origin.y
+					continue
+				if not identp:
+					# Rotate/resize natif en cours → replie la base
+					# complète dans le store, node laissé à DD.
+					d.xx = curp.x.x; d.xy = curp.x.y
+					d.yx = curp.y.x; d.yy = curp.y.y
+					d.ox = curp.origin.x; d.oy = curp.origin.y
+					continue
+				# Base identité = reset DD → restaure la base stockée ;
+				# position restaurée seulement si elle a été remise à zéro.
+				if nd.position == Vector2.ZERO \
+						and Vector2(d.ox, d.oy) != Vector2.ZERO:
+					origin = Vector2(d.ox, d.oy)
+					nd.position = origin
 		nd.transform = Transform2D(
 			Vector2(d.xx, d.xy),
 			Vector2(d.yx, d.yy),
@@ -4728,6 +5427,31 @@ func _apply_distort_pattern(node: Node2D, world_corners: Array, orig_polygon = n
 
 	# Toujours utiliser le vrai polygon original (stocké au premier drag).
 	var orig = _get_orig_polygon(node)
+
+	# Auto-réparation : l'ancien soft bake transformait le working original
+	# (_ft_pattern_orig), corrompant la fenêtre d'échantillonnage texture et
+	# la paramétrisation (u,v) — et cette corruption PERSISTE en JSON via
+	# _save_ft_data. _ft_pattern_reset (jamais touché par le soft bake) est
+	# la référence sûre : si le working diverge du reset, on le restaure.
+	# Effet de bord assumé : un pattern hard-baké puis re-skewé retrouve la
+	# fenêtre texture d'origine (densité restaurée) — jamais de garbling.
+	if _dbg_key != "" and _g.ModMapData.has("_ft_pattern_reset") \
+			and _g.ModMapData["_ft_pattern_reset"].has(_dbg_key):
+		var rflat = _g.ModMapData["_ft_pattern_reset"][_dbg_key]
+		if rflat is Array and rflat.size() >= 6:
+			var diverged = orig.size() * 2 != rflat.size()
+			if not diverged:
+				for i in range(orig.size()):
+					if abs(orig[i].x - rflat[i * 2]) > 1.0 \
+							or abs(orig[i].y - rflat[i * 2 + 1]) > 1.0:
+						diverged = true
+						break
+			if diverged:
+				_g.ModMapData["_ft_pattern_orig"][_dbg_key] = rflat.duplicate()
+				orig = []
+				for i in range(0, rflat.size(), 2):
+					orig.append(Vector2(rflat[i], rflat[i + 1]))
+
 	if orig.size() < 3:
 		orig = orig_polygon if orig_polygon != null and orig_polygon.size() >= 3 else Array(node.polygon)
 	if orig.size() < 3: return
@@ -6876,7 +7600,27 @@ func _show_transform_menu_at(pos: Vector2) -> void:
 
 	var is_portal_sel = _all_portals()
 
-	if is_portal_sel:
+	if _selected_objects.size() == 0 and _walls_in_selection.size() == 0:
+		# Sélection lights-only : seules les symétries s'appliquent
+		# (position + angle miroir — pas de handles FT sur les lights).
+		menu.add_item("Horizontal Symmetry", 20)
+		menu.add_item("Vertical Symmetry", 21)
+	elif _selected_objects.size() == 0:
+		# Sélection walls-only : modes de transformation (Scale via les
+		# handles free ; Skew/Distort/Perspective warpent les Points et
+		# les portals des walls) + symétries.
+		var mode_to_id_w = {"free": 0, "skew": 1, "distort": 2, "perspective": 3}
+		var labels_w = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective"}
+		var cur_id_w = mode_to_id_w.get(_transform_mode, 0)
+		for mid in [0, 1, 2, 3]:
+			var prefix_w = "» " if mid == cur_id_w else "  "
+			menu.add_item(prefix_w + labels_w[mid], mid)
+		menu.add_separator()
+		menu.add_item("Horizontal Symmetry", 20)
+		menu.add_item("Vertical Symmetry", 21)
+		menu.add_separator()
+		menu.add_item("Reset Transform", 22)
+	elif is_portal_sel:
 		# Menu pour les portals : Scale, Slide, Offset
 		var scale_prefix = "» " if _portal_mode == "scale" else "  "
 		var slide_prefix = "» " if _portal_mode == "slide" else "  "
@@ -6903,7 +7647,8 @@ func _show_transform_menu_at(pos: Vector2) -> void:
 		var labels = {0: "Scale", 1: "Skew", 2: "Distort", 3: "Perspective", 4: "Crop", 5: "Soft Crop", 6: "Edge Crop"}
 		var has_path = _has_any_path()
 		var all_paths = has_path and _all_paths()
-		var modes = [0, 1] if all_paths else [0, 1, 2, 3]
+		# Distort/Perspective supportés pour les paths (warp des EditPoints)
+		var modes = [0, 1, 2, 3]
 		# Crop : props simples uniquement (un seul objet sélectionné)
 		if not all_paths and _selected_objects.size() == 1 and _is_plain_prop(_selected_objects[0]):
 			modes = [0, 1, 2, 3, 4, 5, 6]
@@ -6932,6 +7677,7 @@ func _show_transform_menu_at(pos: Vector2) -> void:
 	if layer == null or not is_instance_valid(layer):
 		layer = CanvasLayer.new()
 		layer.name = "FreeTransformPopupLayer"
+		Engine.set_meta("up_ft_popup_layer", layer)
 		layer.layer = 128
 		_g.World.get_tree().root.add_child(layer)
 		_popup_layer = layer
@@ -6979,23 +7725,98 @@ func _same_selection(a: Array, b: Array) -> bool:
 	return true
 
 
+# Le PathwayWidget (Line2D pointillée) copie Pathway.Points uniquement dans
+# OnChange() (select/highlight) — après un SetEditPoints il affiche les
+# anciens points. On force la resynchronisation.
+func _refresh_path_widget(nd: Node2D) -> void:
+	var pw = nd.get("Widget")
+	if pw != null and is_instance_valid(pw) and pw.has_method("OnChange"):
+		pw.call("OnChange")
+
+
+# Lights sélectionnées dans DD (exclues de _selected_objects — FT ne leur
+# met pas de handles — mais les symétries du menu doivent les suivre).
+# Source : RawSelectables (Type 6 = Light, node dans Thing). Les lights ne
+# sont PAS dans SelectTool.Selected, et isSelected est porté par leur
+# LightWidget enfant, pas par le Light2D lui-même.
+func _selected_lights() -> Array:
+	var out := []
+	if _select_tool == null:
+		return out
+	# Accès DIRECT aux membres C# (pattern éprouvé de DragSelectWalls :
+	# select_tool.RawSelectables / s.Thing / s.Type — .get() ne résout
+	# pas ces membres).
+	var raw = _select_tool.RawSelectables
+	if raw == null:
+		return out
+	for sl in raw:
+		if sl == null or sl.Thing == null or not is_instance_valid(sl.Thing):
+			continue
+		# Test structurel (parent = node Lights du level) plutôt que la
+		# valeur numérique de l'enum SelectableType, invisible dans le
+		# décompilé et donc incertaine.
+		if _is_light(sl.Thing):
+			out.append(sl.Thing)
+	return out
+
+
 func _flip_selection(horizontal: bool) -> void:
 	# Flip immédiat (miroir) de TOUTE la sélection d'un bloc, autour du centre
 	# de la transform box. Réversible : ré-appliquer le même flip annule.
 	# - Props / patterns / paths : réflexion du global_transform autour du centre
 	#   de la box (miroir monde), persistée dans _ft_transforms.
-	# - Portals : flip dans le repère LOCAL (le node est aligné au mur) en
-	#   négativant scale.x (H = le long du mur) ou scale.y (V = perpendiculaire),
-	#   pour rester collé au mur. abs(scale.x) sert au Radius → taille inchangée.
-	# Tout est persisté via _reapply_shear_transforms et annulable (undo unifié).
+	# - Portals sélectionnés individuellement : flip dans le repère LOCAL (le
+	#   node est aligné au mur) en négativant scale.x (H = le long du mur) ou
+	#   scale.y (V = perpendiculaire), pour rester collé au mur. abs(scale.x)
+	#   sert au Radius → taille inchangée.
+	# - Walls sélectionnés : points, enfants visuels et portals attachés sont
+	#   miroirés via l'API de DragSelectWalls (_apply_transform_to_wall accepte
+	#   un Transform2D quelconque, réflexion incluse). Les portals attachés à
+	#   un wall sélectionné sont retirés de flippable : ils sont transformés
+	#   PAR le wall (sinon double transformation).
+	# Tout est persisté (props via _reapply_shear_transforms, walls via leurs
+	# Points C#) et annulable en UNE étape (record combiné).
 	var flippable := []
 	for nd in _selected_objects:
 		if is_instance_valid(nd):
 			flippable.append(nd)
-	if flippable.empty():
+
+	var dsw = _g.ModMapData.get("_drag_select_walls")
+	var sel_walls := _selected_walls()
+	if sel_walls.size() > 0:
+		var wall_ids := {}
+		for w in sel_walls:
+			if w.has_meta("node_id"):
+				wall_ids[int(w.get_meta("node_id"))] = true
+		var kept := []
+		for nd in flippable:
+			if _is_portal(nd) and "WallID" in nd and wall_ids.has(int(nd.WallID)):
+				continue
+			kept.append(nd)
+		flippable = kept
+
+	var sel_lights := _selected_lights()
+	if flippable.empty() and sel_walls.empty() and sel_lights.empty():
 		return
 	var box = _selection_aabb()
-	if box.size == Vector2.ZERO:
+	# Étend la box aux walls sélectionnés : le centre du miroir est celui
+	# du GROUPE complet, walls inclus.
+	if sel_walls.size() > 0 and dsw != null and dsw.has_method("_compute_walls_aabb"):
+		var wbox = dsw._compute_walls_aabb(sel_walls)
+		if wbox.size != Vector2.ZERO:
+			box = wbox if box.size == Vector2.ZERO else box.merge(wbox)
+	# Étend la box aux lights sélectionnées (positions ponctuelles).
+	var box_empty = box.size == Vector2.ZERO and flippable.empty() and sel_walls.empty()
+	for l in sel_lights:
+		if not is_instance_valid(l):
+			continue
+		var lrect = Rect2(l.global_position, Vector2.ZERO)
+		if box_empty:
+			box = lrect
+			box_empty = false
+		else:
+			box = box.merge(lrect)
+	if box.size == Vector2.ZERO and sel_lights.empty():
 		return
 	var center = box.position + box.size * 0.5
 
@@ -7006,7 +7827,9 @@ func _flip_selection(horizontal: bool) -> void:
 	for nd in flippable:
 		_snapshot_orig_xform(nd)
 		_store_shear_transform(nd, nd.transform)
-	var before = _capture_ft_unified(flippable)
+	# Lights incluses dans la capture (restaurées via pos/rot/scale — le
+	# modèle DD ne persiste que position + rotation, voir Lights.SaveLight).
+	var before = _capture_ft_unified(flippable + sel_lights)
 
 	# Réflexion monde autour de l'axe vertical (H) ou horizontal (V) passant
 	# par le centre du groupe.
@@ -7028,6 +7851,51 @@ func _flip_selection(horizontal: bool) -> void:
 			else:
 				sc.y = -sc.y
 			nd.scale = sc
+		elif _is_path(nd):
+			# Paths : bake la réflexion dans les EditPoints au lieu de
+			# laisser une base reflétée sur le node. SetEditPoints (C#)
+			# suppose une base IDENTITÉ : il pose Position = points[0] et
+			# stocke des deltas parent-space — toute rotation/scale/miroir
+			# sur le node fausse le rendu ET le undo (points re-projetés
+			# avec la mauvaise base). Rotation/scale remis à neutre ;
+			# Smooth() est appelé par SetEditPoints, et le watchdog de
+			# largeurs réappliquera le profil (signature changée).
+			var wpts = _get_path_edit_points_world(nd)
+			if wpts.size() > 0:
+				var new_pts = []
+				for p in wpts:
+					new_pts.append(R.xform(p))
+				# Une réflexion (det < 0) inverse l'orientation de parcours :
+				# le côté intérieur/extérieur de la texture (défini par
+				# rapport au sens de parcours : perp(M·t) = −M·perp(t))
+				# passerait du mauvais côté. On inverse l'ordre des points
+				# pour rétablir le côté monde exact du miroir. NB : les
+				# extrémités échangent leur rôle — un fade/grow asymétrique
+				# (in ≠ out) change donc d'extrémité (propriétés C# non
+				# réassignables sans recharger le path).
+				new_pts.invert()
+				# Profil de largeur (warp) : les fractions d'arc se
+				# mesurent depuis le nouveau départ → f devient 1−f,
+				# tableaux réinversés pour rester croissants.
+				var wkey = _ft_node_key(nd)
+				if wkey != "" and _g.ModMapData.has("_ft_width_warp") \
+						and _g.ModMapData["_ft_width_warp"].has(wkey):
+					var prof = _g.ModMapData["_ft_width_warp"][wkey]
+					if prof != null and prof.has("fr") and prof.has("fa"):
+						var nfr = []
+						var nfa = []
+						for i in range(prof["fr"].size() - 1, -1, -1):
+							nfr.append(1.0 - prof["fr"][i])
+							nfa.append(prof["fa"][i])
+						prof["fr"] = nfr
+						prof["fa"] = nfa
+						_width_applied_sig.erase(wkey)
+				nd.rotation = 0.0
+				nd.scale = Vector2.ONE
+				nd.call("SetEditPoints", new_pts)
+				_refresh_path_widget(nd)
+			_clear_shear_transform(nd)
+			continue
 		else:
 			# Miroir monde : la base reflétée (déterminant négatif) produit le
 			# miroir.
@@ -7036,15 +7904,828 @@ func _flip_selection(horizontal: bool) -> void:
 		# frame même si DD reset le scale.
 		_store_shear_transform(nd, nd.transform)
 
+	# Walls : miroir des Points, des enfants visuels et des portals via
+	# DragSelectWalls. _apply_transform_to_wall détecte une base symétrique
+	# (réflexion pure → w_rot = 0) et laisse alors la rotation des portals
+	# inchangée ; or le miroir exact d'un angle θ est π−θ (H) ou −θ (V),
+	# combiné à un flip local scale.y (une réflexion inverse la chiralité :
+	# M·R(θ) = R(π−θ)·diag(1,−1) pour H, R(−θ)·diag(1,−1) pour V). On
+	# corrige donc rotation + scale des portals après l'application.
+	# Lights : vraie réflexion du transform (comme les props) — Light2D
+	# rend sa texture via le transform complet du node, donc position ET
+	# orientation/chiralité sont miroirées exactement, quelle que soit
+	# l'orientation de base de la texture. L'undo pos/rot/scale reste
+	# exact : les bases restent orthogonales (Godot les décompose en
+	# rotation + scale.y négatif sans perte). Limite : DD ne sauvegarde
+	# que position + rotation pour les lights (Lights.SaveLight), donc
+	# la composante miroir de la texture ne survit pas à un save/reload
+	# de la map — l'axe du faisceau, lui, est préservé au mieux.
+	# Le LightWidget est un enfant : il suit automatiquement.
+	for l in sel_lights:
+		if not is_instance_valid(l):
+			continue
+		l.global_transform = R * l.global_transform
+		# Persiste la base miroir : DD ne sauvegarde que position +
+		# rotation pour les lights (Lights.SaveLight) — au reload la
+		# composante miroir serait perdue. Le side-store _ft_transforms
+		# (persisté dans la map) la réapplique (cas dédié lights dans
+		# _reapply_shear_transforms). EXCEPTION : deux symétries composées
+		# donnent une base ROTATION PURE (det > 0) — représentable
+		# nativement par DD, donc rien à persister ; une entrée store
+		# ferait au contraire boguer la rotation native (snap à 0° via
+		# l'heuristique ident du repli). Purge dans ce cas.
+		var lt = l.transform
+		if (lt.x.x * lt.y.y - lt.x.y * lt.y.x) > 0.0 \
+				and abs(lt.x.length() - 1.0) < 0.001 \
+				and abs(lt.y.length() - 1.0) < 0.001 \
+				and abs(lt.x.dot(lt.y)) < 0.001:
+			_clear_shear_transform(l)
+		else:
+			_store_shear_transform(l, l.transform)
+
+	var wall_entries_before := []
+	var wall_entries_after := []
+	if sel_walls.size() > 0 and dsw != null and dsw.has_method("_apply_transform_to_wall"):
+		for w in sel_walls:
+			if not is_instance_valid(w):
+				continue
+			_store_wall_reset(w)
+			var pre = dsw._snapshot_wall(w)
+			wall_entries_before.append({
+				"wall": w,
+				"snap": pre,
+				"portal_scales": _capture_portal_scales(w),
+				"width_warp": _ft_width_profile_copy(w),
+			})
+			dsw._apply_transform_to_wall(w, pre, R)
+			var rot_map = pre.get("portal_rots", {})
+			for portal in rot_map:
+				if not is_instance_valid(portal):
+					continue
+				var theta = rot_map[portal]
+				portal.rotation = (PI - theta) if horizontal else (-theta)
+				var psc = portal.scale
+				psc.y = -psc.y
+				portal.scale = psc
+			if w.has_method("RemakeLines"):
+				w.RemakeLines()
+			wall_entries_after.append({
+				"wall": w,
+				"snap": dsw._snapshot_wall(w),
+				"portal_scales": _capture_portal_scales(w),
+				"width_warp": _ft_width_profile_copy(w),
+			})
+
 	_save_ft_data()
-	_record_ft_unified_change(before, _capture_ft_unified(flippable))
+	# Record combiné (props + walls) → UNE seule étape de Ctrl+Z.
+	_record_ft_with_walls(before, _capture_ft_unified(flippable + sel_lights),
+			wall_entries_before, wall_entries_after)
 	_save_ft_data()
-	print("[FreeTransform] Symmetry %s appliquée" % ("Horizontal" if horizontal else "Vertical"))
+	print("[FreeTransform] Symmetry %s appliquée (%d prop(s), %d wall(s), %d light(s))" % [("Horizontal" if horizontal else "Vertical"), flippable.size(), sel_walls.size(), sel_lights.size()])
+
+
+# Walls actuellement sélectionnés dans DD, via DragSelectWalls (qui expose
+# son instance dans ModMapData et connaît le type SELECTABLE_WALL).
+func _selected_walls() -> Array:
+	var dsw = _g.ModMapData.get("_drag_select_walls")
+	if dsw == null or not dsw.has_method("_get_selected_walls_and_ref"):
+		return []
+	var result = dsw._get_selected_walls_and_ref()
+	if result is Array and result.size() > 0 and result[0] is Array:
+		return result[0]
+	return []
+
+
+# Snapshot des scale des portals d'un wall. Le snapshot de DragSelectWalls
+# ne couvre pas scale (il n'en a pas besoin pour move/rotate/scale) mais la
+# symétrie négativise scale.y, donc l'undo doit pouvoir le restaurer.
+func _capture_portal_scales(wall) -> Dictionary:
+	var scales := {}
+	var portals = wall.get("Portals")
+	if portals != null:
+		for p in portals:
+			if is_instance_valid(p):
+				scales[p] = p.scale
+	return scales
+
+
+# Resynchronise l'entrée _ft_transforms d'un node avec sa base courante,
+# si une entrée existe (ex : objet ayant subi une symétrie). Sans ça,
+# _reapply_shear_transforms écrase la base chaque frame avec l'ancienne
+# matrice → rotation/scale "reset" juste après un drag en multi-sélection.
+func _sync_store_basis(nd) -> void:
+	if nd == null or not is_instance_valid(nd):
+		return
+	if not _g.ModMapData.has("_ft_transforms"):
+		return
+	var key = _ft_node_key(nd)
+	if key == "" or not _g.ModMapData["_ft_transforms"].has(key):
+		return
+	var t = nd.transform
+	var d = _g.ModMapData["_ft_transforms"][key]
+	d.xx = t.x.x; d.xy = t.x.y
+	d.yx = t.y.x; d.yy = t.y.y
+	d.ox = t.origin.x; d.oy = t.origin.y
+
+
+# Store "_ft_wall_reset" : état d'origine d'un wall (Points + portals),
+# capturé au PREMIER transform FT et jamais écrasé — aplati en floats
+# pour la persistance en map. Sert au "Reset Transform" du menu walls.
+func _store_wall_reset(wall) -> void:
+	var key = _ft_node_key(wall)
+	if key == "":
+		return
+	if not _g.ModMapData.has("_ft_wall_reset"):
+		_g.ModMapData["_ft_wall_reset"] = {}
+	if _g.ModMapData["_ft_wall_reset"].has(key):
+		return
+	var raw = wall.get("Points")
+	if raw == null or raw.size() < 2:
+		return
+	var flat = []
+	for p in raw:
+		flat.append(p.x)
+		flat.append(p.y)
+	var portals = {}
+	var plist = wall.get("Portals")
+	if plist != null:
+		for portal in plist:
+			if portal == null or not is_instance_valid(portal):
+				continue
+			if not portal.has_meta("node_id"):
+				continue
+			portals[str(int(portal.get_meta("node_id")))] = [
+				portal.position.x, portal.position.y, portal.rotation,
+				portal.Direction.x, portal.Direction.y]
+	_g.ModMapData["_ft_wall_reset"][key] = {"pts": flat, "portals": portals}
+
+
+# Store "_ft_path_reset" : EditPoints d'origine (monde, aplatis) d'un
+# path, capturés au PREMIER warp distort/perspective (post-bake — cible
+# visuellement identique au pré-warp) et jamais écrasés. Sert au Reset.
+func _store_path_reset(node) -> void:
+	var key = _ft_node_key(node)
+	if key == "":
+		return
+	if not _g.ModMapData.has("_ft_path_reset"):
+		_g.ModMapData["_ft_path_reset"] = {}
+	if _g.ModMapData["_ft_path_reset"].has(key):
+		return
+	var pts = _get_path_edit_points_world(node)
+	if pts.size() < 2:
+		return
+	var flat = []
+	for p in pts:
+		flat.append(p.x)
+		flat.append(p.y)
+	_g.ModMapData["_ft_path_reset"][key] = flat
+
+
+# Reset Transform des walls sélectionnés : restaure Points + portals de
+# l'état d'origine, efface le profil de largeur, RemakeLines, et pousse
+# un record combiné (un seul Ctrl+Z).
+func _reset_walls_transform() -> void:
+	var dsw = _g.ModMapData.get("_drag_select_walls")
+	if dsw == null or not dsw.has_method("_snapshot_wall"):
+		return
+	var reset_store = _g.ModMapData.get("_ft_wall_reset", {})
+	var entries_before = []
+	var entries_after = []
+	var count = 0
+	for w in _walls_in_selection:
+		if not is_instance_valid(w):
+			continue
+		var key = _ft_node_key(w)
+		if key == "" or not reset_store.has(key):
+			continue
+		var data = reset_store[key]
+		var flat = data.get("pts", [])
+		if flat.size() < 4:
+			continue
+		entries_before.append({
+			"wall": w,
+			"snap": dsw._snapshot_wall(w),
+			"portal_scales": _capture_portal_scales(w),
+			"width_warp": _ft_width_profile_copy(w),
+		})
+		var pts = PoolVector2Array()
+		for i in range(0, flat.size(), 2):
+			pts.append(Vector2(flat[i], flat[i + 1]))
+		w.set("Points", pts)
+		var pmap = data.get("portals", {})
+		var plist = w.get("Portals")
+		if plist != null:
+			for portal in plist:
+				if portal == null or not is_instance_valid(portal):
+					continue
+				var pid = str(int(portal.get_meta("node_id"))) if portal.has_meta("node_id") else ""
+				if pid != "" and pmap.has(pid):
+					var pv = pmap[pid]
+					portal.position = Vector2(pv[0], pv[1])
+					portal.rotation = pv[2]
+					if "Direction" in portal:
+						portal.Direction = Vector2(pv[3], pv[4])
+		if _g.ModMapData.has("_ft_width_warp"):
+			_g.ModMapData["_ft_width_warp"].erase(key)
+		_width_applied_sig.erase(key)
+		if w.has_method("RemakeLines"):
+			w.RemakeLines()
+		_rebuild_wall_width_curves(w)
+		entries_after.append({
+			"wall": w,
+			"snap": dsw._snapshot_wall(w),
+			"portal_scales": _capture_portal_scales(w),
+			"width_warp": null,
+		})
+		count += 1
+	if count > 0:
+		_record_ft_with_walls({}, {}, entries_before, entries_after)
+		_save_ft_data()
+		print("[FreeTransform] Reset Transform : %d wall(s)" % count)
+
+
+# Décime une polyline à ~max_pts points (stride uniforme, premier et
+# dernier points toujours conservés).
+func _decimate_polyline(pts, max_pts: int) -> Array:
+	var out = []
+	var np = pts.size()
+	if np <= max_pts:
+		for p in pts:
+			out.append(p)
+		return out
+	var stride = float(np - 1) / float(max_pts - 1)
+	for i in range(max_pts):
+		out.append(pts[int(round(i * stride))])
+	return out
+
+
+# Coins [TL, TR, BR, BL] de l'AABB d'un jeu de points, avec padding minimal
+# pour les walls plats (AABB dégénérée → inversion bilinéaire instable).
+func _wall_aabb_corners(pts: Array) -> Array:
+	if pts.empty():
+		return []
+	var mn = pts[0]; var mx = pts[0]
+	for p in pts:
+		mn.x = min(mn.x, p.x); mn.y = min(mn.y, p.y)
+		mx.x = max(mx.x, p.x); mx.y = max(mx.y, p.y)
+	if mx.x - mn.x < 1.0:
+		mn.x -= 24.0; mx.x += 24.0
+	if mx.y - mn.y < 1.0:
+		mn.y -= 24.0; mx.y += 24.0
+	return [mn, Vector2(mx.x, mn.y), mx, Vector2(mn.x, mx.y)]
+
+
+# ══ Largeur variable (Niveau 1) ═════════════════════════════════════════
+# Un warp non-uniforme devrait aussi amincir/épaissir le trait. Le moteur
+# DD rend les lignes avec des largeurs PAR POINT : on y bake le facteur
+# d'échelle GLOBAL (isotrope) du warp — cf. _area_warp_factor. Store persisté "_ft_width_warp" : { key: {"fr": [...],
+# "fa": [...]} } — profil (fraction d'arc → facteur cumulé) le long de la
+# polyline. Le node.width de DD reste intact (dégradation propre sans le
+# mod : trait constant) ; les facteurs vivent dans curve.max_value.
+
+# Copie du profil de largeur d'un node (null si absent).
+func _ft_width_profile_copy(node):
+	var key = _ft_node_key(node)
+	if key == "":
+		return null
+	var store = _g.ModMapData.get("_ft_width_warp", null)
+	if store == null or not store.has(key):
+		return null
+	return store[key].duplicate(true)
+
+
+# Facteur d'échelle GLOBAL (isotrope) du warp au point p : racine du
+# déterminant du jacobien local (zoom de surface), par différences
+# centrées. Indépendant de l'orientation du trait — le côté pincé du quad
+# donne un trait fin quel que soit le sens du path/wall, avec une
+# variation régulière le long du quad. Un shear pur (aire conservée) ne
+# change pas l'épaisseur ; un étirement uniforme k donne k.
+func _area_warp_factor(p: Vector2, src: Array, nc: Array) -> float:
+	var eps = 8.0
+	var jx = (_warp_point(p + Vector2(eps, 0), src, nc) \
+			- _warp_point(p - Vector2(eps, 0), src, nc)) / (2.0 * eps)
+	var jy = (_warp_point(p + Vector2(0, eps), src, nc) \
+			- _warp_point(p - Vector2(0, eps), src, nc)) / (2.0 * eps)
+	return sqrt(abs(jx.cross(jy)))
+
+
+# Fractions d'arc cumulées (0→1) d'une polyline. Dégénérée → ratios
+# d'index. closed : le périmètre inclut le segment de fermeture
+# (dernier→premier), le dernier point garde donc une fraction < 1.
+func _polyline_arc_fractions(pts: Array, closed := false) -> Array:
+	var out = []
+	if pts.size() < 2:
+		for _i in range(pts.size()):
+			out.append(0.0)
+		return out
+	var cum = [0.0]
+	for i in range(pts.size() - 1):
+		cum.append(cum[i] + pts[i].distance_to(pts[i + 1]))
+	var total = cum[cum.size() - 1]
+	if closed:
+		total += pts[pts.size() - 1].distance_to(pts[0])
+	for i in range(pts.size()):
+		out.append(cum[i] / total if total > 0.001 else float(i) / float(pts.size() - 1))
+	return out
+
+
+# Échantillonne un profil {"fr","fa"} à la fraction t (interp. linéaire).
+func _sample_width_profile(entry, t: float) -> float:
+	if entry == null or not (entry is Dictionary):
+		return 1.0
+	var fr = entry.get("fr", []); var fa = entry.get("fa", [])
+	if fr.size() == 0 or fr.size() != fa.size():
+		return 1.0
+	if t <= fr[0]: return fa[0]
+	for i in range(1, fr.size()):
+		if t <= fr[i]:
+			var span = fr[i] - fr[i - 1]
+			var k = (t - fr[i - 1]) / span if span > 0.000001 else 0.0
+			return lerp(fa[i - 1], fa[i], k)
+	# Au-delà du dernier point : profil fermé → interpole vers le premier
+	# point (segment de fermeture) ; ouvert → constant.
+	if entry.get("cl", false):
+		var last = fr.size() - 1
+		var span2 = 1.0 - fr[last]
+		var k2 = (t - fr[last]) / span2 if span2 > 0.000001 else 0.0
+		return lerp(fa[last], fa[0], clamp(k2, 0.0, 1.0))
+	return fa[fa.size() - 1]
+
+
+# Construit une Curve Godot depuis (positions x, valeurs). Les facteurs
+# peuvent dépasser 1 → portés par max_value (width DD intact).
+func _build_width_curve(xs: Array, vals: Array) -> Curve:
+	var c = Curve.new()
+	c.min_value = 0.0
+	var mx = 1.0
+	for v in vals:
+		mx = max(mx, v)
+	c.max_value = mx * 1.05
+	for i in range(xs.size()):
+		c.add_point(Vector2(clamp(xs[i], 0.0, 1.0), vals[i]))
+	return c
+
+
+# Fraction d'arc de chaque point de query le long de polyline (les points
+# sont supposés SUR la polyline — projection sur le segment le plus proche).
+func _arc_fractions_on_polyline(polyline: Array, query: Array, closed := false) -> Array:
+	var out = []
+	if polyline.size() < 2:
+		for _q in query:
+			out.append(0.0)
+		return out
+	var cum = [0.0]
+	for i in range(polyline.size() - 1):
+		cum.append(cum[i] + polyline[i].distance_to(polyline[i + 1]))
+	var total = cum[cum.size() - 1]
+	if closed:
+		total += polyline[polyline.size() - 1].distance_to(polyline[0])
+	if total < 0.001:
+		for _q in query:
+			out.append(0.0)
+		return out
+	var nseg = polyline.size() - 1 + (1 if closed else 0)
+	for q in query:
+		var best_d = INF
+		var best_arc = 0.0
+		for i in range(nseg):
+			var a = polyline[i]
+			var b = polyline[(i + 1) % polyline.size()]
+			var ab = b - a
+			var l2 = ab.length_squared()
+			var k = clamp((q - a).dot(ab) / l2, 0.0, 1.0) if l2 > 0.000001 else 0.0
+			var proj = a + ab * k
+			var dd = q.distance_squared_to(proj)
+			if dd < best_d:
+				best_d = dd
+				best_arc = cum[i] + sqrt(l2) * k if i < cum.size() else cum[cum.size() - 1] + sqrt(l2) * k
+		out.append(best_arc / total)
+	return out
+
+
+# Sous-divise une polyline (points colinéaires insérés, espacement max
+# max_seg, plafond max_pts au total).
+func _subdivide_polyline(pts: Array, max_seg: float, max_pts: int, closed := false) -> Array:
+	# Le budget max_pts limite la DENSITÉ de sous-division, jamais les
+	# points originaux : l'ancien break tronquait la queue des longues
+	# polylines (> ~9 000 px), et les loops se refermaient alors en
+	# diagonale à travers la forme. Si le budget est trop petit pour
+	# l'espacement demandé, on élargit l'espacement uniformément.
+	var total = 0.0
+	for i in range(pts.size() - 1):
+		total += pts[i].distance_to(pts[i + 1])
+	if closed:
+		total += pts[pts.size() - 1].distance_to(pts[0])
+	var seg = max_seg
+	var budget = max_pts - pts.size()
+	if budget < 1:
+		budget = 1
+	if total / seg > float(budget):
+		seg = total / float(budget)
+	var out = [pts[0]]
+	for i in range(pts.size() - 1):
+		var a = pts[i]
+		var b = pts[i + 1]
+		var steps = int(max(1, ceil(a.distance_to(b) / seg)))
+		for k in range(1, steps + 1):
+			out.append(a.linear_interpolate(b, float(k) / float(steps)))
+	# Segment de fermeture (points intermédiaires seulement, le renderer
+	# referme lui-même sur le premier point)
+	if closed:
+		var a2 = pts[pts.size() - 1]
+		var b2 = pts[0]
+		var steps2 = int(max(1, ceil(a2.distance_to(b2) / seg)))
+		for k in range(1, steps2):
+			out.append(a2.linear_interpolate(b2, float(k) / float(steps2)))
+	return out
+
+
+# Résout le nom réel de la propriété "Super" du fork moteur sur une
+# Line2D native (le binding C# PascalCase ne vaut que côté mono). Sonde
+# une liste de candidats puis mémorise le premier qui existe.
+var _super_prop_cache := ""
+func _line_super_property(line) -> String:
+	if _super_prop_cache != "" and line.get(_super_prop_cache) != null:
+		return _super_prop_cache
+	for cand in ["Super", "super", "super_mode", "use_super", "super_line"]:
+		if line.get(cand) != null:
+			_super_prop_cache = cand
+			return cand
+	return ""
+
+
+# Applique un profil de largeur à une Line2D. Le moteur Godot modifié de
+# DD rend les Pathways (et lignes "Super") avec des largeurs PAR POINT
+# (set_point_width — cf. Pathway.GrowShrinkEnds) et ignore width_curve ;
+# on pose donc la largeur point par point, avec repli width_curve si la
+# méthode n'existe pas. base_w = largeur nominale ; entry = profil
+# {"fr","fa"} échantillonné à la fraction d'arc de chaque point (null →
+# facteur 1, sert à remettre à plat). taper = multiplicateurs par point
+# additionnels (réplique du Grow/Shrink de DD), même taille que points.
+func _apply_line_point_widths(line, entry, base_w: float, taper = null, allow_subdiv := false) -> void:
+	if line == null or not is_instance_valid(line):
+		return
+	var pts = []
+	for p in line.points:
+		pts.append(p)
+	if pts.size() < 2:
+		return
+	var lloop = bool(line.get("loop")) if line.get("loop") != null else false
+	var frs = _polyline_arc_fractions(pts, lloop)
+	var use_ppw = line.has_method("set_point_width")
+	# Le renderer par point du moteur DD n'est actif qu'en mode "Super"
+	# (Pathway l'active dans son constructeur, Wall.AddLine NON : sans ça,
+	# set_point_width est stocké mais ignoré au rendu). On l'active dès
+	# qu'un profil réel est posé — jamais désactivé ensuite (des largeurs
+	# uniformes rendent identique au mode standard).
+	if use_ppw and entry != null:
+		# Le renderer par point n'est actif qu'en mode "Super" (Pathway
+		# l'active dans son constructeur, Wall.AddLine non).
+		var sup_name = _line_super_property(line)
+		if sup_name != "" and not bool(line.get(sup_name)):
+			line.set(sup_name, true)
+		# Le builder du fork rend chaque segment à largeur CONSTANTE
+		# (celle de son point de départ) — le dégradé apparent des paths
+		# vient de la densité de leurs points lissés. On densifie donc
+		# les polylines éparses (walls : 1 point par sommet) pour
+		# retrouver un dégradé visuel. Points colinéaires insérés → aucun
+		# impact sur la géométrie ni le tuilage de texture.
+		if allow_subdiv:
+			var need = false
+			for i in range(pts.size() - 1):
+				if pts[i].distance_to(pts[i + 1]) > 32.0:
+					need = true
+					break
+			# Boucle : le segment de fermeture doit être vérifié et
+			# sous-divisé aussi, sinon il reste un unique palier (voire
+			# des artefacts de largeur sur la couture).
+			if not need and lloop and pts[pts.size() - 1].distance_to(pts[0]) > 32.0:
+				need = true
+			if need:
+				pts = _subdivide_polyline(pts, 24.0, 384, lloop)
+				line.points = PoolVector2Array(pts)
+				frs = _polyline_arc_fractions(pts, lloop)
+	var xs = []
+	var vals = []
+	for i in range(pts.size()):
+		var f = _sample_width_profile(entry, frs[i])
+		var t = taper[i] if taper != null and i < taper.size() else 1.0
+		if use_ppw:
+			line.set_point_width(i, base_w * f * t)
+		else:
+			xs.append(frs[i])
+			vals.append(f * t)
+	if not use_ppw:
+		line.width_curve = _build_width_curve(xs, vals) if entry != null else null
+
+
+# Réplique le taper Grow/Shrink de DD (Pathway.GrowShrinkEnds) : facteurs
+# par point [0..1] sur les points lissés. null si ni Grow ni Shrink.
+func _path_growshrink_taper(node, count: int):
+	var grow = bool(node.get("Grow")) if node.get("Grow") != null else false
+	var shrink = bool(node.get("Shrink")) if node.get("Shrink") != null else false
+	if not grow and not shrink:
+		return null
+	var distance = int(count / 3) if count < 100 else 50
+	var taper = []
+	for _i in range(count):
+		taper.append(1.0)
+	if distance <= 0:
+		return taper
+	for i in range(1, distance + 1):
+		var t = ease(float(i) / float(distance), -2.0)
+		var w = lerp(1.0, 0.0, t)
+		if grow and distance - i >= 0 and distance - i < count:
+			taper[distance - i] = w
+		if shrink:
+			var idx = count - distance + i - 1
+			if idx >= 0 and idx < count:
+				taper[idx] = w
+	return taper
+
+
+# Applique le profil de largeur d'un path (points lissés du Pathway).
+# Le profil est rééchantillonné par PROJECTION des points lissés sur la
+# polyline des EditPoints (référence du profil) : le Chaikin fermé n'a
+# pas d'extrémités fixes et introduit un déphasage entre les fractions
+# d'arc des deux polylines — la projection y est immune (même méthode
+# que les walls, éprouvée sur leurs loops).
+func _apply_path_point_widths(node, entry) -> void:
+	if node == null or not is_instance_valid(node) or not (node is Line2D):
+		return
+	var taper = _path_growshrink_taper(node, node.points.size())
+	if entry == null:
+		_apply_line_point_widths(node, null, node.width, taper)
+		return
+	var ploop = bool(node.get("loop")) if node.get("loop") != null else false
+	# EditPoints en espace LOCAL du node (les points lissés le sont)
+	var eplocal = []
+	for p in _get_path_edit_points_world(node):
+		eplocal.append(node.to_local(p))
+	var spts = []
+	for p in node.points:
+		spts.append(p)
+	if eplocal.size() < 2 or spts.size() < 2:
+		_apply_line_point_widths(node, entry, node.width, taper)
+		return
+	var frs = _arc_fractions_on_polyline(eplocal, spts, ploop)
+	var lfr = _polyline_arc_fractions(spts, ploop)
+	var lfa = []
+	for i in range(spts.size()):
+		lfa.append(_sample_width_profile(entry, frs[i]))
+	_apply_line_point_widths(node, {"fr": lfr, "fa": lfa, "cl": ploop}, node.width, taper)
+
+
+# Reconstruit les width_curve des Line2D enfants d'un wall depuis le store
+# (post-RemakeLines, undo, reload). Courbe par enfant, points de courbe aux
+# ratios d'index — exactement l'échantillonnage interne de Line2D.
+func _rebuild_wall_width_curves(wall) -> void:
+	if wall == null or not is_instance_valid(wall):
+		return
+	var key = _ft_node_key(wall)
+	var store = _g.ModMapData.get("_ft_width_warp", {})
+	var entry = store.get(key) if key != "" else null
+	var wall_pts = []
+	var raw = wall.get("Points")
+	if raw != null:
+		for p in raw:
+			wall_pts.append(p)
+	for child in wall.get_children():
+		if child.has_meta("_ft_probe"):
+			continue
+		var lines = []
+		if child is Line2D:
+			lines.append(child)
+		elif child is Node2D:
+			for sub in child.get_children():
+				if sub is Line2D:
+					lines.append(sub)
+		for line in lines:
+			var cpts = []
+			for p in line.points:
+				cpts.append(p)
+			if cpts.size() < 2:
+				continue
+			# Profil du wall rééchantillonné en profil LOCAL à la ligne
+			# (fractions d'arc de la ligne → facteur au point correspondant
+			# du wall), puis application par point.
+			var wloop = bool(wall.get("Loop")) if wall.get("Loop") != null else false
+			var lloop = bool(line.get("loop")) if line.get("loop") != null else false
+			var frs = _arc_fractions_on_polyline(wall_pts, cpts, wloop)
+			var lfr = _polyline_arc_fractions(cpts, lloop)
+			var lfa = []
+			for i in range(cpts.size()):
+				lfa.append(_sample_width_profile(entry, frs[i]) if entry != null else 1.0)
+			_apply_line_point_widths(line, {"fr": lfr, "fa": lfa, "cl": lloop} if entry != null else null, line.width, null, true)
+
+
+# Maintenance : réapplique les largeurs par point (reload, Smooth de DD,
+# RemakeLines). Les largeurs par point n'ont pas de getter → détection par
+# signature (nb de points + width) : tout Smooth/RemakeLines qui régénère
+# la géométrie change la signature ou repasse les largeurs à l'uniforme,
+# et on réapplique alors depuis le store.
+func _reapply_width_warp() -> void:
+	# Purge du store de l'ex-feature "cisaillement de texture" (retirée) :
+	# les maps de test peuvent en garder une copie persistée.
+	if _g.ModMapData.has("_ft_tex_shear"):
+		_g.ModMapData.erase("_ft_tex_shear")
+	var store = _g.ModMapData.get("_ft_width_warp", null)
+	if store == null or not (store is Dictionary) or store.empty():
+		return
+	var dead = []
+	for key in store.keys():
+		var nd = _ft_node_from_key(key)
+		if nd == null or not is_instance_valid(nd):
+			dead.append(key)
+			_width_applied_sig.erase(key)
+			continue
+		var sig
+		if _is_path(nd):
+			if not (nd is Line2D):
+				continue
+			sig = [nd.points.size(), nd.width]
+			if _width_applied_sig.get(key) != sig:
+				_apply_path_point_widths(nd, store[key])
+				_width_applied_sig[key] = sig
+		else:
+			var total = 0
+			for child in nd.get_children():
+				if child is Line2D:
+					total += child.points.size()
+				elif child is Node2D:
+					for sub in child.get_children():
+						if sub is Line2D:
+							total += sub.points.size()
+			var wpts = nd.get("Points")
+			sig = [total, wpts.size() if wpts != null else 0]
+			if _width_applied_sig.get(key) != sig:
+				_rebuild_wall_width_curves(nd)
+				_width_applied_sig[key] = sig
+	for key in dead:
+		store.erase(key)
+
+
+# Warp bilinéaire d'un point : (u,v) dans le quad source → quad destination.
+func _warp_point(p: Vector2, src: Array, nc: Array) -> Vector2:
+	var t = _inv_bilinear_cpu(p, src)
+	var top = nc[0].linear_interpolate(nc[1], t.x)
+	var bot = nc[3].linear_interpolate(nc[2], t.x)
+	return top.linear_interpolate(bot, t.y)
+
+
+# Direction locale du warp au point p, le long de la direction d (par
+# différence centrée). Sert à réorienter portals et end-caps.
+func _warp_direction(p: Vector2, d: Vector2, src: Array, nc: Array) -> Vector2:
+	var eps = 8.0
+	var d1 = _warp_point(p + d * eps, src, nc) - _warp_point(p - d * eps, src, nc)
+	return d1.normalized() if d1.length() > 0.0001 else d
+
+
+# Warp skew/distort/perspective d'un wall depuis son snapshot DSW :
+# Points, Line2D enfants (retour visuel, RemakeLines différé au commit),
+# end-caps, et portals (position + Direction + rotation, l'écart
+# rotation↔direction — flip — est préservé). Les WallDistance ne sont pas
+# réécrits : les trous sont recalculés depuis position/Direction/Radius
+# par RemakeLines (même approche que le scale affine de DragSelectWalls).
+func _apply_warp_to_wall(wall, snap: Dictionary, src: Array, nc: Array) -> void:
+	var pts0 = snap.get("pts", [])
+	if pts0.empty():
+		return
+	var new_pts = PoolVector2Array()
+	for p in pts0:
+		new_pts.append(_warp_point(p, src, nc))
+	wall.set("Points", new_pts)
+
+	var children = snap.get("children", {})
+	var pre_profile = _wall_drag_wprofile.get(wall)
+	var child_frs = _wall_drag_childfr.get(wall, {})
+	var child_dec = _wall_drag_childpts.get(wall, {})
+	for child in children:
+		if child == null or not is_instance_valid(child):
+			continue
+		var data = children[child]
+		if data.has("points"):
+			var opts = child_dec.get(child, data["points"])
+			var lp = PoolVector2Array()
+			for p in opts:
+				lp.append(_warp_point(p, src, nc))
+			child.points = lp
+			# Largeur variable : facteur perpendiculaire composé avec le
+			# profil pré-drag, échantillonné à la fraction d'arc pré-calculée.
+			if child is Line2D and opts.size() >= 2:
+				var cfr = child_frs.get(child, [])
+				# Largeur par point (moteur DD) : facteur perpendiculaire
+				# composé avec le profil pré-drag, aux fractions d'arc de
+				# la polyline WARPÉE de l'enfant.
+				var lp_arr = []
+				for p in lp:
+					lp_arr.append(p)
+				var cloop = bool(child.get("loop")) if child.get("loop") != null else false
+				var xs = _polyline_arc_fractions(lp_arr, cloop)
+				var vals = []
+				for i in range(opts.size()):
+					var fprev = _sample_width_profile(pre_profile, cfr[i]) if i < cfr.size() else 1.0
+					vals.append(fprev * _area_warp_factor(opts[i], src, nc))
+				# Pas de re-sous-division pendant le drag (points déjà
+				# bornés par la décimation ; pleine densité au commit).
+				_apply_line_point_widths(child, {"fr": xs, "fa": vals, "cl": cloop}, child.width, null, false)
+		elif data.has("position"):
+			var cp = data["position"]
+			child.position = _warp_point(cp, src, nc)
+			var crot = data.get("rotation", 0.0)
+			var cd = Vector2(cos(crot), sin(crot))
+			child.rotation = _warp_direction(cp, cd, src, nc).angle()
+
+	var portal_pos = snap.get("portals", {})
+	var portal_rot = snap.get("portal_rots", {})
+	var portal_dir = snap.get("portal_dirs", {})
+	for portal in portal_pos:
+		if portal == null or not is_instance_valid(portal):
+			continue
+		var p0 = portal_pos[portal]
+		portal.position = _warp_point(p0, src, nc)
+		var d0 = portal_dir.get(portal, Vector2.RIGHT)
+		var d1 = _warp_direction(p0, d0, src, nc)
+		if "Direction" in portal:
+			portal.Direction = d1
+		var r0 = portal_rot.get(portal, 0.0)
+		portal.rotation = d1.angle() + (r0 - d0.angle())
+
+
+# Applique une transformation affine monde aux walls dragués (une fois
+# par frame de drag). RemakeLines est différé au commit : les enfants
+# Line2D sont déjà transformés point à point par DSW, et RemakeLines est
+# coûteux sur les walls à portals (même raison que le _ci_mode de DSW).
+func _apply_walls_drag_transform(W: Transform2D) -> void:
+	var dsw = _g.ModMapData.get("_drag_select_walls")
+	if dsw == null or not dsw.has_method("_apply_transform_to_wall"):
+		return
+	for w in _wall_drag_walls:
+		if is_instance_valid(w) and _wall_drag_snaps.has(w):
+			dsw._apply_transform_to_wall(w, _wall_drag_snaps[w], W, false)
+
+
+# Enregistre un changement FT en y joignant les walls si présents :
+# record combiné en UNE étape de Ctrl+Z via _restore_flip_combined.
+# Sans walls, délègue au record unifié standard.
+func _record_ft_with_walls(before: Dictionary, after: Dictionary,
+		walls_before: Array, walls_after: Array) -> void:
+	if walls_before.empty():
+		_record_ft_unified_change(before, after)
+		return
+	var undo_lib = _g.ModMapData.get("_undo_lib")
+	if undo_lib == null:
+		return
+	undo_lib.record_callback(
+		self, "_restore_flip_combined", [before, walls_before],
+		self, "_restore_flip_combined", [after, walls_after])
+
+
+# Undo/redo d'une transformation mixte (props + walls) en UNE étape —
+# symétrie ou drag des handles FT : restaure d'abord l'état unifié FT
+# (props/paths/patterns/portals autonomes), puis chaque wall via
+# DragSelectWalls (Points + portals + enfants visuels), et enfin les
+# scale de portals (non couverts par _restore_wall_state).
+func _restore_flip_combined(unified: Dictionary, wall_entries: Array) -> void:
+	if unified.size() > 0:
+		_restore_ft_unified(unified)
+	var dsw = _g.ModMapData.get("_drag_select_walls")
+	if dsw == null or not dsw.has_method("_restore_wall_state"):
+		return
+	for e in wall_entries:
+		var w = e.get("wall")
+		if w == null or not is_instance_valid(w):
+			continue
+		dsw._restore_wall_state(w, e["snap"])
+		var scales = e.get("portal_scales", {})
+		for portal in scales:
+			if is_instance_valid(portal):
+				portal.scale = scales[portal]
+		# Profil de largeur : restaure ou efface, puis reconstruit les
+		# width_curve des enfants (restaurés par _restore_wall_state).
+		if e.has("width_warp"):
+			var wkey = _ft_node_key(w)
+			if wkey != "":
+				if not _g.ModMapData.has("_ft_width_warp"):
+					_g.ModMapData["_ft_width_warp"] = {}
+				if e["width_warp"] == null:
+					_g.ModMapData["_ft_width_warp"].erase(wkey)
+				else:
+					_g.ModMapData["_ft_width_warp"][wkey] = e["width_warp"].duplicate(true)
+			_rebuild_wall_width_curves(w)
 
 
 func _on_transform_menu_id(id: int) -> void:
 	if id == 20 or id == 21:
 		_flip_selection(id == 20)
+		if _context_menu != null and is_instance_valid(_context_menu):
+			_context_menu.queue_free()
+		_context_menu = null
+		return
+
+	if id == 22:
+		# Reset Transform des walls : état d'origine (Points + portals)
+		_reset_walls_transform()
 		if _context_menu != null and is_instance_valid(_context_menu):
 			_context_menu.queue_free()
 		_context_menu = null
@@ -7100,18 +8781,8 @@ func _on_transform_menu_id(id: int) -> void:
 	var id_to_mode = {0: "free", 1: "skew", 2: "distort", 3: "perspective", 4: "crop", 5: "softcrop", 6: "edgecrop"}
 	var new_mode = id_to_mode.get(id, "free")
 
-	# Warning si distort/perspective avec des paths dans la sélection
-	if new_mode in ["distort", "perspective"] and _has_any_path():
-		_pending_mode = new_mode
-		# Déconnecte popup_hide de l'ancien menu AVANT de montrer le warning,
-		# sinon la fermeture de l'ancien menu tue le nouveau popup.
-		if _context_menu != null and is_instance_valid(_context_menu):
-			if _context_menu.is_connected("popup_hide", self, "_on_transform_menu_closed"):
-				_context_menu.disconnect("popup_hide", self, "_on_transform_menu_closed")
-			_context_menu.queue_free()
-			_context_menu = null
-		_show_path_warning_popup()
-		return
+	# (Les paths sont désormais réellement warpés en distort/perspective —
+	# l'ancien avertissement "affine best-effort" n'a plus lieu d'être.)
 
 	# Crop et Skew/Distort/Perspective sont mutuellement exclusifs : passer de
 	# l'un à l'autre EFFACE la modif existante. On prévient l'utilisateur si une

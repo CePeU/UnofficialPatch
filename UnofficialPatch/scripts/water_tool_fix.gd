@@ -1,6 +1,9 @@
 # water_tool_fix.gd
 # Toggle water animation on/off with persistence
 # Fixes black lines at map edges by disabling distortion near map bounds
+# Fixes nested island bug: drawing water inside a hole detaches sibling holes
+# from their outer polygon (DFS grouping bug in WaterMesh.UpdateMesh_TriangleNet),
+# flooding unrelated interiors. Fixed by flattening the PolyTree via Save()/Load().
 
 var _g
 
@@ -12,6 +15,9 @@ var _shader = null
 var _mat = null
 var _settings_path = "user://UnofficialPatch/bugfixes_water_anim.cfg"
 var _bounds_set = false
+# Watchdog "îlots imbriqués" : signature du mesh par instance, et compteur de stabilité
+var _tree_sig = {}
+var _tree_stable = {}
 var _last_map_w = 0
 var _last_map_h = 0
 var TILE_SIZE = 256.0
@@ -126,6 +132,99 @@ func update(delta):
 					_last_map_h = h
 		if not _bounds_set:
 			_update_bounds()
+	_watch_nested_islands()
+
+
+# --- Fix "îlots imbriqués" -------------------------------------------------
+# Bug vanilla : UpdateMesh_TriangleNet regroupe les trous avec le DERNIER
+# polygone visité en DFS. Un îlot dessiné dans un trou devient enfant de ce
+# trou dans le PolyTree ; le DFS le visite avant les trous frères suivants,
+# qui se retrouvent alors rattachés à l'îlot -> l'extérieur perd ces trous
+# et la triangulation les remplit d'eau (les bordures Line2D restent justes).
+# Correctif : aplatir l'arbre (les îlots remontent à la racine, chaque
+# extérieur ne garde que ses trous directs) via Save()/Load(). La géométrie
+# est inchangée, seul l'ordre de visite DFS est corrigé.
+
+func _watch_nested_islands():
+	if water_brush == null:
+		return
+	var mesh_node = water_brush.Mesh
+	if mesh_node == null or not is_instance_valid(mesh_node):
+		return
+	var array_mesh = mesh_node.get("mesh")
+	if array_mesh == null:
+		return
+	var key = mesh_node.get_instance_id()
+	var sig = _mesh_signature(array_mesh)
+	if not _tree_sig.has(key) or _tree_sig[key] != sig:
+		# Mesh modifié (dessin, undo/redo, chargement) : armer le compteur
+		_tree_sig[key] = sig
+		_tree_stable[key] = 0
+		return
+	if not _tree_stable.has(key):
+		return
+	# Attendre la fin du trait et quelques frames de stabilité
+	if Input.is_mouse_button_pressed(BUTTON_LEFT):
+		_tree_stable[key] = 0
+		return
+	_tree_stable[key] += 1
+	if _tree_stable[key] < 10:
+		return
+	_tree_stable.erase(key)
+	_fix_nested_islands(mesh_node)
+	_tree_sig[key] = _mesh_signature(array_mesh)
+
+
+func _mesh_signature(array_mesh):
+	# Signature bon marché : nombre de surfaces + tailles des tableaux de sommets
+	var sig = [array_mesh.get_surface_count()]
+	for i in range(array_mesh.get_surface_count()):
+		sig.append(array_mesh.surface_get_array_len(i))
+	return sig
+
+
+func _fix_nested_islands(mesh_node):
+	var data = mesh_node.call("Save")
+	if data == null or not (data is Dictionary) or not data.has("tree"):
+		return
+	var tree = data["tree"]
+	if not (tree is Dictionary):
+		return
+	var roots = tree.get("children")
+	if not (roots is Array):
+		return
+	var new_roots = []
+	var changed = [false]
+	for outer in roots:
+		_flatten_poly_node(outer, new_roots, changed)
+	if not changed[0]:
+		return
+	tree["children"] = new_roots
+	mesh_node.call("Load", data)
+	print("[WaterFix] Nested island detected: PolyTree flattened (%d root polygons)" % new_roots.size())
+
+
+func _flatten_poly_node(outer, roots, changed):
+	# Ajoute 'outer' à la racine, garde ses trous directs, remonte
+	# récursivement les îlots (enfants de trous) au niveau racine
+	if not (outer is Dictionary):
+		return
+	roots.append(outer)
+	var children = outer.get("children")
+	if not (children is Array):
+		return
+	var holes = []
+	for hole in children:
+		holes.append(hole)
+		if not (hole is Dictionary):
+			continue
+		var islands = hole.get("children")
+		if islands is Array and islands.size() > 0:
+			changed[0] = true
+			for island in islands:
+				_flatten_poly_node(island, roots, changed)
+			hole["children"] = []
+	outer["children"] = holes
 
 
 func _update_bounds():

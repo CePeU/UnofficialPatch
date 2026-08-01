@@ -17,6 +17,7 @@ var _icon_unstar = null    # fav0.png - icon for remove from favorites
 var _icon_fav_badge = null  # fav1.png - badge texture (with filtering)
 var _icon_fav_badge_img = null  # fav1.png - raw Image for pre-scaling
 var _icon_ft = null            # free_transform.png - icon for FT context menu item
+var _icon_hidden = null        # hidden.png - icon for the mode button (Hidden view)
 var _badged_icons = {}  # src_path -> badged ImageTexture (cache)
 var _badge_tex_cache = {}  # badge_size -> pre-scaled ImageTexture
 # Optimization: invalidation tracking
@@ -176,6 +177,7 @@ func _apply_badge_size(size_px: int) -> void:
 func initialize():
 	_read_custom_dir()
 	_load_favorites()
+	_load_hidden()
 	_load_settings()
 	_load_icons()
 	# Drop any stale baked icons from a previous load of this mod — earlier
@@ -254,6 +256,15 @@ func _load_icons():
 		var tex_ft = ImageTexture.new()
 		tex_ft.create_from_image(img_ft, 0)
 		_icon_ft = tex_ft
+	
+	var img_h = Image.new()
+	if img_h.load(root + "icons/hidden.png") == OK:
+		var hw = int(img_h.get_width() * 0.75)
+		var hh = int(img_h.get_height() * 0.75)
+		img_h.resize(hw, hh, Image.INTERPOLATE_LANCZOS)
+		var tex_h = ImageTexture.new()
+		tex_h.create_from_image(img_h, 0)
+		_icon_hidden = tex_h
 
 
 # ===== Cache invalidation helpers =====
@@ -935,6 +946,8 @@ func update(delta):
 							_d_ovl.invalidate()
 						break
 	
+	_hidden_update()
+	
 	# Right-click entièrement géré par right_click_util
 	# (qui appelle check_right_click() pour les listes)
 	
@@ -1119,6 +1132,7 @@ func _show_list_context_popup(global_pos: Vector2):
 		if _icon_unstar:
 			_list_ctx_menu.set_item_icon(rem_idx, _icon_unstar)
 	
+	_add_hide_menu_items(metas, count_str)
 	_list_ctx_menu.connect("id_pressed", self, "_on_list_ctx_pressed")
 	_list_ctx_menu.popup(Rect2(global_pos, Vector2(1, 1)))
 
@@ -1482,9 +1496,16 @@ func _enable_free_transform():
 func _get_popup_layer() -> CanvasLayer:
 	if _popup_layer and is_instance_valid(_popup_layer):
 		return _popup_layer
+	# Cross-session guard: free a popup layer left over from a previous mod
+	# instance still parented to the persistent tree root.
+	if Engine.has_meta("fav_popup_layer"):
+		var _old_pl = Engine.get_meta("fav_popup_layer")
+		if is_instance_valid(_old_pl):
+			_old_pl.queue_free()
 	_popup_layer = CanvasLayer.new()
 	_popup_layer.name = "FavoritesPopupLayer"
 	_popup_layer.layer = 128  # above DD's UI layers
+	Engine.set_meta("fav_popup_layer", _popup_layer)
 	_g.World.get_tree().root.add_child(_popup_layer)
 	return _popup_layer
 
@@ -1867,11 +1888,15 @@ func _inject_wall_panel(wall_list: ItemList):
 	if not wall_tool or not is_instance_valid(wall_tool):
 		return
 	
-	var ep = wall_tool.get("EditPoints")
-	if not ep or not is_instance_valid(ep):
-		return
-	
-	var parent = ep.get_parent()
+	# Anchor on the list's own parent so the toggle follows the library when
+	# library_right_panel relocates it to the right-side panel. The EditPoints
+	# container is only a fallback for an orphaned list.
+	var parent = wall_list.get_parent()
+	if not parent:
+		var ep = wall_tool.get("EditPoints")
+		if not ep or not is_instance_valid(ep):
+			return
+		parent = ep.get_parent()
 	if not parent:
 		return
 	
@@ -2058,7 +2083,7 @@ func _try_inject_roof_panel():
 	var all_lists = []
 	_collect_item_lists(panel, all_lists, 0)
 	
-	var roof_list = null
+	var roof_list = _lib_control("RoofTool", "Texture")
 	for il in all_lists:
 		if il.get_item_count() == 0:
 			continue
@@ -2714,8 +2739,8 @@ func _try_inject_floor_panel():
 	var all_lists = []
 	_collect_item_lists(panel, all_lists, 0)
 	
-	var wall_list = null
-	var tileset_list = null
+	var wall_list = _lib_control("FloorShapeTool", "WallTexture")
+	var tileset_list = _lib_control("FloorShapeTool", "SmartTileId")
 	
 	# First pass: identify by metadata
 	for il in all_lists:
@@ -2770,9 +2795,14 @@ func _try_inject_floor_panel():
 	if wall_list == null and tileset_list == null:
 		return
 	
-	# Find inject parent (VBoxContainer named "Align") — search recursively
-	# because ResizeLeftPanel may have wrapped Align in an intermediate HBoxContainer.
-	var inject_parent = _find_align_vbox(panel, 0)
+	# Anchor on the list's own parent so the toggle follows the library when
+	# library_right_panel relocates it. Fall back to the tool panel's Align,
+	# searched recursively because ResizeLeftPanel may have wrapped Align in an
+	# intermediate HBoxContainer.
+	var first_list = tileset_list if tileset_list else wall_list
+	var inject_parent = first_list.get_parent()
+	if inject_parent == null:
+		inject_parent = _find_align_vbox(panel, 0)
 	if inject_parent == null:
 		inject_parent = panel
 	
@@ -2785,7 +2815,6 @@ func _try_inject_floor_panel():
 		fav_btn.icon = _icon_star
 	
 	# Insert button above the label that precedes the floor tileset list
-	var first_list = tileset_list if tileset_list else wall_list
 	var btn_index = 0
 	if first_list.get_parent() == inject_parent:
 		btn_index = first_list.get_index()
@@ -3042,9 +3071,11 @@ func _inject_into_panel(panel_name: String, menu_name: String, key: String, fav_
 		var used_btn = _find_node_by_name(align, "UsedButton")
 		if used_btn and is_instance_valid(used_btn):
 			used_btn.connect("pressed", self, "_on_other_tab_pressed", [key])
+			used_btn.connect("pressed", self, "_on_filter_tab_exits_view_mode", [key])
 		var tags_btn = _find_node_by_name(align, "TagsButton")
 		if tags_btn and is_instance_valid(tags_btn):
 			tags_btn.connect("pressed", self, "_on_other_tab_pressed", [key])
+			tags_btn.connect("pressed", self, "_on_filter_tab_exits_view_mode", [key])
 	
 	_panels[key] = {
 		"lib_panel": lib_panel,
@@ -3089,7 +3120,9 @@ func _try_inject_light_panel():
 	if root == null:
 		return
 	
-	var light_list = _find_light_style_list(root, 0, 15)
+	var light_list = _lib_control("LightTool", "Texture")
+	if light_list == null:
+		light_list = _find_light_style_list(root, 0, 15)
 	if light_list == null:
 		return
 	
@@ -3174,7 +3207,9 @@ func _try_inject_cave_panel():
 		return
 	
 	# Find the ItemList with cave texture metadata
-	var cave_list = _find_cave_item_list(cpanel, 0, 5)
+	var cave_list = _lib_control("CaveBrush", "Texture")
+	if cave_list == null:
+		cave_list = _find_cave_item_list(cpanel, 0, 5)
 	if not cave_list:
 		return
 	
@@ -3247,6 +3282,25 @@ func _find_tool_texture_menu(tool_name: String):
 	var tex_menu = t.get("textureMenu")
 	if tex_menu and is_instance_valid(tex_menu) and tex_menu is ItemList:
 		return tex_menu
+	return null
+
+
+# Resolve a tool library through Tool.Controls. Scanning the ToolPanel subtree
+# for an ItemList fails once library_right_panel has relocated the library to
+# the right-side panel; Controls points at the same node in both cases.
+func _lib_control(tool_key: String, control_key: String):
+	var tools = _g.Editor.get("Tools")
+	if not tools or not tools is Dictionary:
+		return null
+	var t = tools.get(tool_key)
+	if not t or not is_instance_valid(t):
+		return null
+	var controls = t.get("Controls")
+	if not controls or not controls is Dictionary:
+		return null
+	var c = controls.get(control_key)
+	if c and is_instance_valid(c) and c is ItemList:
+		return c
 	return null
 
 
@@ -3389,54 +3443,7 @@ func _show_favs_for_panel(key: String):
 		print("[Favs] sample colorable set paths: ", set_sample)
 	
 	# Create overlay ItemList if not already done
-	if not panel.has("overlay_list"):
-		var overlay = ItemList.new()
-		overlay.name = "FavsOverlay"
-		overlay.focus_mode = Control.FOCUS_NONE
-		# Match DD list properties
-		overlay.rect_min_size = item_list.rect_min_size
-		overlay.size_flags_horizontal = item_list.size_flags_horizontal
-		overlay.size_flags_vertical = item_list.size_flags_vertical
-		overlay.max_columns = item_list.max_columns
-		overlay.icon_mode = item_list.icon_mode
-		overlay.fixed_icon_size = item_list.fixed_icon_size
-		overlay.same_column_width = item_list.same_column_width
-		overlay.fixed_column_width = item_list.fixed_column_width
-		overlay.select_mode = item_list.select_mode
-		overlay.icon_scale = item_list.icon_scale  # match picker scale
-		overlay.rect_min_size = Vector2(0, 100)
-		# Mirror DD's theme so separators, font colors, and stylebox match.
-		# Just copying a few constant overrides isn't enough — separator lines
-		# between items come from the ItemList stylebox which lives in theme.
-		if item_list.theme != null:
-			overlay.theme = item_list.theme
-		for c in ["vseparation", "hseparation", "icon_margin"]:
-			var v = item_list.get_constant(c)
-			if v != 0:
-				overlay.add_constant_override(c, v)
-		# Also mirror stylebox overrides DD may have set directly on its list
-		for sb_name in ["bg", "bg_focus", "selected", "selected_focus", "cursor", "cursor_unfocused"]:
-			var sb = item_list.get_stylebox(sb_name) if item_list.has_stylebox_override(sb_name) else null
-			if sb != null:
-				overlay.add_stylebox_override(sb_name, sb)
-		# Mirror guide_color — the line drawn between rows. Default theme
-		# uses a gray color, but when the DD shader material is attached the
-		# shader paints these lines white (shader ignores modulate in the
-		# else branch). Make them transparent to hide.
-		overlay.add_color_override("guide_color", Color(0, 0, 0, 0))
-		# Insert right after DD's list in the same parent
-		var parent = item_list.get_parent()
-		var idx = item_list.get_index()
-		parent.add_child(overlay)
-		parent.move_child(overlay, idx + 1)
-		
-		# Connect selection signal to forward to DD
-		overlay.connect("item_selected", self, "_on_overlay_selected", [key])
-		overlay.connect("item_activated", self, "_on_overlay_activated", [key])
-		overlay.connect("multi_selected", self, "_on_overlay_multi_selected", [key])
-		overlay.connect("gui_input", self, "_on_list_gui_input", [key])
-		
-		panel["overlay_list"] = overlay
+	_ensure_panel_overlay(key)
 	
 	var overlay = panel["overlay_list"]
 	overlay.clear()
@@ -3687,6 +3694,12 @@ func _show_favs_for_panel(key: String):
 			search_edit.connect("focus_exited", self, "_on_search_focus_exited")
 		# Sync poll baseline so poll doesn't immediately re-filter
 		_last_search_text[key] = search_edit.text
+		# Apply any search text already sitting in the box (DD keeps it across
+		# tool switches and mode cycles) — the baseline sync above prevents the
+		# poll from doing it, so a pre-existing search would otherwise leave
+		# the freshly built overlay unfiltered.
+		if search_edit.text.strip_edges() != "":
+			_filter_overlay(key, search_edit.text)
 	
 	var kept = overlay.get_item_count()
 	panel["last_count"] = kept
@@ -4101,6 +4114,21 @@ func _on_other_tab_pressed(key: String = "object"):
 		_favs_reapply_cooldown = 2
 
 
+func _on_filter_tab_exits_view_mode(key: String = "object"):
+	# The Favorites/Hidden overlays are built against the full library (Hidden
+	# even repopulates the native list via AllButton) and ignore DD's
+	# Used/Tags filters — combining both views is undefined and just showed
+	# the same content as the All tab. When the user picks Used or Tags while
+	# in Show: Favorites/Hidden, drop back to Show: All so the tab displays
+	# what it claims. Deferred: DD's own tab handler must finish repopulating
+	# first. Not wired on AllButton, which we emit programmatically in
+	# _repopulate_native.
+	if not _panels.has(key):
+		return
+	if int(_panels[key].get("mode", _MODE_ALL)) != _MODE_ALL:
+		call_deferred("_set_panel_mode", key, _MODE_ALL)
+
+
 func _restore_dd_list_for_panel(key: String):
 	if not _panels.has(key):
 		return
@@ -4174,22 +4202,23 @@ func _refresh_active_panels():
 
 
 func _toggle_visible_panel_favs():
-	var toggled_btn = null
 	for key in _panels:
 		var panel = _panels[key]
-		var fav_btn = panel["fav_btn"]
-		if not fav_btn or not is_instance_valid(fav_btn) or not fav_btn.is_visible_in_tree():
-			continue
-		# Skip if we already toggled this same button (floor_wall/floor_pattern share one)
-		if fav_btn == toggled_btn:
-			continue
-		var item_list = panel["item_list"]
+		var item_list = panel.get("item_list")
 		var overlay = panel.get("overlay_list")
 		var list_visible = is_instance_valid(item_list) and item_list.visible and item_list.is_visible_in_tree()
 		var overlay_visible = overlay and is_instance_valid(overlay) and overlay.visible and overlay.is_visible_in_tree()
-		if list_visible or overlay_visible:
+		if not (list_visible or overlay_visible):
+			continue
+		# Cycling mode button (All/Favorites/Hidden) if present, else the
+		# legacy fav checkbox (deferred panels: terrain, floor).
+		var mb = panel.get("mode_btn")
+		if mb and is_instance_valid(mb) and mb.is_visible_in_tree():
+			_on_mode_cycle(key)
+			return
+		var fav_btn = panel.get("fav_btn")
+		if fav_btn and is_instance_valid(fav_btn) and fav_btn.is_visible_in_tree():
 			fav_btn.pressed = not fav_btn.pressed
-			toggled_btn = fav_btn
 			return
 
 
@@ -4273,9 +4302,11 @@ func _apply_badges_to_dd_lists():
 			# Use the same BadgeDrawOverlay system as the main DD list for
 			# visual consistency between Fav Only and normal modes.
 			if overlay_visible:
-				# badge_all=true: every item in the Fav Only list IS a favorite,
-				# so badge all visible items (no Lookup needed)
-				var ovl_draw = _get_or_create_draw_overlay(overlay_list, fav_type_b, true, key)
+				# Favorites mode: every overlay item IS a favorite -> badge_all.
+				# Hidden/Normal filter overlay: badge per-item so only real
+				# favorites are marked (draw overlay falls back to metadata scan).
+				var _badge_all = _is_panel_toggle_on(key)
+				var ovl_draw = _get_or_create_draw_overlay(overlay_list, fav_type_b, _badge_all, key)
 				if ovl_draw != null:
 					# Hide legacy TextureRect overlay badge — superseded by draw overlay
 					if panel.has("overlay_badge") and is_instance_valid(panel.get("overlay_badge")):
@@ -4451,12 +4482,17 @@ func _on_list_gui_input(event: InputEvent, key: String):
 		if _icon_unstar:
 			_list_ctx_menu.set_item_icon(rem_idx, _icon_unstar)
 	
+	_add_hide_menu_items(metas, count_str)
 	_list_ctx_menu.connect("id_pressed", self, "_on_list_ctx_pressed")
 	_list_ctx_menu.popup(Rect2(click_list.rect_global_position + local_pos, Vector2(1, 1)))
 
 
 func _on_list_ctx_pressed(id: int):
 	if _list_ctx_metas.size() == 0:
+		return
+	if id == 2 or id == 3:
+		_apply_hide_change(id == 2)
+		_list_ctx_metas = []
 		return
 	
 	# Block all add/remove while the Favorites pack is loaded — DD holds
@@ -4485,6 +4521,9 @@ func _on_list_ctx_pressed(id: int):
 			# disappears from the Favorites pack (not just the UI).
 			if _favorites.size() > 0:
 				_rebuild_or_defer()
+				# The pack rebuild above may be deferred; rebuild the Favorites
+				# overlay now so the removed asset disappears immediately.
+				_refresh_active_panels()
 			else:
 				var dir = Directory.new()
 				if _pack_path != "" and dir.file_exists(_pack_path):
@@ -4525,8 +4564,92 @@ func _on_list_ctx_pressed(id: int):
 			_save_favorites()
 			_rebuild_or_defer()
 		print("[Favorites] Added ", added_count, " from list (", _list_ctx_metas.size(), " attempted)")
+		# Favoriting an asset un-hides it (inverse of Hide removing the favorite).
+		var unhid = 0
+		for meta in _list_ctx_metas:
+			if _hidden.has(meta):
+				_hidden.erase(meta)
+				unhid += 1
+		if unhid > 0:
+			_hidden_version += 1
+			_save_hidden()
+			for k in _panels:
+				_panels[k].erase("hidden_sig")
+			print("[Favorites] Un-hid ", unhid, " asset(s) on favorite")
 	
 	_list_ctx_metas = []
+
+
+func _reapply_object_search() -> void:
+	# Re-run DD's object search for the text still in the search box, then
+	# restore the selection highlight (the re-search clears it). The subsequent
+	# hidden re-filter keeps the selection via _apply_native_hide_objects.
+	var panel = _panels.get("object")
+	if panel == null:
+		return
+	var le = panel.get("search_lineedit")
+	if le == null or not is_instance_valid(le):
+		le = _find_search_lineedit(panel.get("lib_panel"))
+	var text = ""
+	if le != null and is_instance_valid(le) and le.text != null:
+		text = le.text
+	# Prefer the full (multi)selection snapshotted when we left All; fall back to
+	# the current tool asset if there was none.
+	var texs = panel.get("saved_all_selection", [])
+	if texs == null or texs.size() == 0:
+		texs = _current_tool_textures()
+	# Re-apply the search if there is one (otherwise All already shows all).
+	# Only when the box is visible: DD hides it on the Used/Tags tabs, and
+	# firing the All-tab search over a Used/Tags-populated list would be wrong
+	# (e.g. when a tab click kicks us out of a Favorites/Hidden view).
+	if text != "" and le != null and is_instance_valid(le) and le.is_visible_in_tree():
+		le.emit_signal("text_entered", text)
+	# Restore the selection via DD's own methods, which use the internal C#
+	# Lookup — no marshalling of a 150k+ dict, so it also works for full All.
+	var il = panel.get("item_list")
+	if il == null or not is_instance_valid(il) or texs.size() == 0 or il.get_item_count() == 0:
+		return
+	if texs.size() == 1:
+		il.call("SelectTexture", texs[0])
+	else:
+		il.unselect_all()
+		for t in texs:
+			if t != null and is_instance_valid(t):
+				il.call("MultiselectTexture", t)
+	var _sel = il.get_selected_items()
+	if _sel.size() > 0:
+		# ensure_current_is_visible scrolls to the "current" item, which the
+		# C# MultiselectTexture path does not set — pin it explicitly or the
+		# list stays scrolled wherever it was.
+		il.select(_sel[0], false)
+		il.ensure_current_is_visible()
+
+
+func _current_tool_textures() -> Array:
+	# Current asset texture from the active tool's Preview (Preview has a getter,
+	# unlike the write-only ObjectTool.Texture / ScatterTool.Textures).
+	var out = []
+	if _g == null or not ("Editor" in _g) or _g.Editor == null or not is_instance_valid(_g.Editor):
+		return out
+	var editor = _g.Editor
+	var tools = editor.get("Tools")
+	if not (tools is Dictionary):
+		return out
+	var active = editor.get("ActiveToolName")
+	var tool = null
+	if active == "ScatterTool":
+		tool = tools.get("ScatterTool")
+	else:
+		tool = tools.get("ObjectTool")
+	if tool == null or not is_instance_valid(tool):
+		return out
+	var preview = tool.get("Preview")
+	if preview == null or not is_instance_valid(preview):
+		return out
+	var tex = preview.get("Texture")
+	if tex != null and is_instance_valid(tex):
+		out.append(tex)
+	return out
 
 
 func _find_search_lineedit(lib_panel: Node):
@@ -4867,3 +4990,731 @@ func _compute_md5(data: PoolByteArray) -> PoolByteArray:
 	var zeros = PoolByteArray()
 	zeros.resize(16)
 	return zeros
+
+
+func _ensure_panel_overlay(key: String):
+	# Shared overlay-ItemList factory used by Favorites mode and by the
+	# Hidden/Normal filtering (no duplication).
+	var panel = _panels[key]
+	var item_list = panel["item_list"]
+	if not panel.has("overlay_list"):
+		var overlay = ItemList.new()
+		overlay.name = "FavsOverlay"
+		overlay.focus_mode = Control.FOCUS_NONE
+		# Match DD list properties
+		overlay.rect_min_size = item_list.rect_min_size
+		overlay.size_flags_horizontal = item_list.size_flags_horizontal
+		overlay.size_flags_vertical = item_list.size_flags_vertical
+		overlay.max_columns = item_list.max_columns
+		overlay.icon_mode = item_list.icon_mode
+		overlay.fixed_icon_size = item_list.fixed_icon_size
+		overlay.same_column_width = item_list.same_column_width
+		overlay.fixed_column_width = item_list.fixed_column_width
+		overlay.select_mode = item_list.select_mode
+		overlay.icon_scale = item_list.icon_scale  # match picker scale
+		overlay.rect_min_size = Vector2(0, 100)
+		# Mirror DD's theme so separators, font colors, and stylebox match.
+		# Just copying a few constant overrides isn't enough — separator lines
+		# between items come from the ItemList stylebox which lives in theme.
+		if item_list.theme != null:
+			overlay.theme = item_list.theme
+		for c in ["vseparation", "hseparation", "icon_margin"]:
+			var v = item_list.get_constant(c)
+			if v != 0:
+				overlay.add_constant_override(c, v)
+		# Also mirror stylebox overrides DD may have set directly on its list
+		for sb_name in ["bg", "bg_focus", "selected", "selected_focus", "cursor", "cursor_unfocused"]:
+			var sb = item_list.get_stylebox(sb_name) if item_list.has_stylebox_override(sb_name) else null
+			if sb != null:
+				overlay.add_stylebox_override(sb_name, sb)
+		# Mirror guide_color — the line drawn between rows. Default theme
+		# uses a gray color, but when the DD shader material is attached the
+		# shader paints these lines white (shader ignores modulate in the
+		# else branch). Make them transparent to hide.
+		overlay.add_color_override("guide_color", Color(0, 0, 0, 0))
+		# Insert right after DD's list in the same parent
+		var parent = item_list.get_parent()
+		var idx = item_list.get_index()
+		parent.add_child(overlay)
+		parent.move_child(overlay, idx + 1)
+		
+		# Connect selection signal to forward to DD
+		overlay.connect("item_selected", self, "_on_overlay_selected", [key])
+		overlay.connect("item_activated", self, "_on_overlay_activated", [key])
+		overlay.connect("multi_selected", self, "_on_overlay_multi_selected", [key])
+		overlay.connect("gui_input", self, "_on_list_gui_input", [key])
+		
+		panel["overlay_list"] = overlay
+	return panel["overlay_list"]
+
+
+# ============================================================================
+# Hidden Assets subsystem  (single-control: Show All / Favorites / Hidden)
+# ----------------------------------------------------------------------------
+# A single cycling button per panel replaces the "Favorites only" checkbox and
+# selects one of three mutually-exclusive views:
+#     All        -> everything EXCEPT hidden assets   (default)
+#     Favorites  -> only favorited assets             (existing fav machinery)
+#     Hidden     -> only hidden assets                (to review / unhide them)
+#
+# The original "Favorites only" CheckButton is kept but hidden; the cycling
+# button drives it programmatically so every existing favorites code path
+# (overlay build, update-loop reapply, badges, search, forwarding) keeps
+# working with zero changes on that side.
+#
+# Object panel hiding is done via DD's native ObjectLibraryPanel.ShowObjectsArray
+# (Texture[]), which re-shows a filtered set and rebuilds GridMenu.Lookup
+# consistently — so SelectTexture / eyedropper / asset_cycle stay correct, with
+# no size cap. Other panels reuse the parallel-overlay technique.
+# ============================================================================
+
+var _hidden = {}          # {res_path: type_int}
+var _hidden_version = 0    # bumped on any change — invalidates panel rebuild sigs
+
+# Panels whose live filtering isn't wired yet (terrain multi-pack browsing and
+# the composite floor panel need dedicated handling). Right-click Hide/Unhide
+# still records into _hidden for these; only the display filtering waits, and
+# they keep their original "Favorites only" checkbox.
+const _HIDDEN_DEFERRED_KEYS = ["terrain", "terrain_aso", "terrain_aso_popup", "floor_wall", "floor_pattern"]
+
+# Above this native item count we skip the OVERLAY Normal-filter (used only by
+# non-object panels). The object panel uses the native path and has no cap.
+const _HIDDEN_NORMAL_OVERLAY_CAP = 100000
+
+# Panel mode constants.
+const _MODE_ALL = 0
+const _MODE_FAV = 1
+const _MODE_HIDDEN = 2
+
+
+func _hidden_path() -> String:
+	return "user://UnofficialPatch/Favorites/hidden.json"
+
+
+func _load_hidden():
+	var f = File.new()
+	if f.open(_hidden_path(), File.READ) == OK:
+		var text = f.get_as_text()
+		f.close()
+		var parsed = JSON.parse(text)
+		if parsed.error == OK and parsed.result is Dictionary:
+			for k in parsed.result:
+				_hidden[k] = int(parsed.result[k])
+
+
+func _save_hidden():
+	var dir = Directory.new()
+	if not dir.dir_exists("user://UnofficialPatch/Favorites"):
+		dir.make_dir_recursive("user://UnofficialPatch/Favorites")
+	var f = File.new()
+	if f.open(_hidden_path(), File.WRITE) == OK:
+		f.store_string(JSON.print(_hidden, "\t"))
+		f.close()
+
+
+func _is_hidden_deferred_key(key: String) -> bool:
+	return key in _HIDDEN_DEFERRED_KEYS
+
+
+# --- Per-frame driver ------------------------------------------------------
+
+func _hidden_update():
+	for key in _panels:
+		if _is_hidden_deferred_key(key):
+			continue
+		_ensure_mode_control(key)
+		var mode = int(_panels[key].get("mode", _MODE_ALL))
+		if mode == _MODE_FAV:
+			pass  # existing favorites machinery handles this panel
+		elif mode == _MODE_HIDDEN:
+			_maintain_hidden_view(key)
+		else:
+			_maintain_normal_filter(key)
+		# Count refresh — skipped when a filter above already refreshed it.
+		var _il = _panels[key].get("item_list")
+		var _lc = _il.get_item_count() if is_instance_valid(_il) else 0
+		if _panels[key].get("count_sig", null) != [_fav_version, _hidden_version, _lc]:
+			_update_mode_count_label(key)
+
+
+func _ensure_mode_control(key: String):
+	var panel = _panels[key]
+	if panel.has("mode_btn") and is_instance_valid(panel["mode_btn"]):
+		return
+	var fav_btn = panel.get("fav_btn")
+	if fav_btn == null or not is_instance_valid(fav_btn):
+		return
+	var parent = fav_btn.get_parent()
+	if parent == null or not is_instance_valid(parent):
+		return
+	# Hide the original fav checkbox; the cycling button (+ count label under
+	# it) takes its place, wrapped in a VBox so the label sits below the button
+	# regardless of the parent's layout orientation.
+	fav_btn.visible = false
+	var box = VBoxContainer.new()
+	box.name = "AssetFilterBox_" + key
+	box.size_flags_horizontal = fav_btn.size_flags_horizontal
+	var mb = Button.new()
+	mb.name = "AssetFilterButton_" + key
+	mb.toggle_mode = false
+	mb.hint_tooltip = "Cycle asset view: All / Favorites / Hidden"
+	if fav_btn.has_font_override("font"):
+		mb.add_font_override("font", fav_btn.get_font("font"))
+	mb.connect("pressed", self, "_on_mode_cycle", [key])
+	box.add_child(mb)
+	var lbl = Label.new()
+	lbl.name = "AssetFilterCount_" + key
+	lbl.align = Label.ALIGN_CENTER
+	lbl.modulate = Color(0.72, 0.72, 0.72)
+	box.add_child(lbl)
+	parent.add_child(box)
+	parent.move_child(box, fav_btn.get_index() + 1)
+	_shrink_font(lbl, 0.85)
+	panel["mode_btn"] = mb
+	panel["mode_lbl"] = lbl
+	panel["count_sig"] = null
+	panel["mode"] = _MODE_FAV if fav_btn.pressed else _MODE_ALL
+	_update_mode_button_label(key)
+	_update_mode_count_label(key)
+
+
+func _update_mode_button_label(key: String):
+	var panel = _panels[key]
+	var mb = panel.get("mode_btn")
+	if mb == null or not is_instance_valid(mb):
+		return
+	var mode = int(panel.get("mode", _MODE_ALL))
+	if mode == _MODE_FAV:
+		mb.text = "Show: Favorites"
+		mb.icon = _icon_star
+	elif mode == _MODE_HIDDEN:
+		mb.text = "Show: Hidden"
+		mb.icon = _icon_hidden
+	else:
+		mb.text = "Show: All"
+		mb.icon = null
+
+
+func _shrink_font(ctrl: Control, factor: float) -> void:
+	# Make a Control's text smaller by duplicating its effective DynamicFont at
+	# a reduced size. No-op if the font isn't a resizable DynamicFont.
+	if ctrl == null or not is_instance_valid(ctrl):
+		return
+	var f = ctrl.get_font("font")
+	if f is DynamicFont:
+		var sf = f.duplicate()
+		sf.size = int(max(8, floor(f.size * factor)))
+		ctrl.add_font_override("font", sf)
+
+
+func _update_mode_count_label(key: String):
+	var panel = _panels[key]
+	var lbl = panel.get("mode_lbl")
+	if lbl == null or not is_instance_valid(lbl):
+		return
+	var il = panel.get("item_list")
+	var ft = int(panel.get("type", 4))
+	var lcount = il.get_item_count() if is_instance_valid(il) else 0
+	# Snapshot the set of paths actually present in the (native) list — this is
+	# what DD really loaded/shows, unlike ResourceLoader.exists which doesn't
+	# see custom-pack assets. Refreshed only when the list repopulates (count
+	# change) so we don't marshal a huge Lookup on every favorite edit.
+	if panel.get("lookup_snap_count", -1) != lcount:
+		var snap = {}
+		if is_instance_valid(il):
+			var lk = il.get("Lookup")
+			if lk is Dictionary and lk.size() > 0:
+				for pth in lk:
+					snap[pth] = true
+			else:
+				for i in range(lcount):
+					var m = il.get_item_metadata(i)
+					if m is String and m != "":
+						snap[m] = true
+		panel["lookup_snap"] = snap
+		panel["lookup_snap_count"] = lcount
+	var loaded = panel.get("lookup_snap", {})
+	var favc = 0
+	for pth in _favorites:
+		var info = _favorites[pth]
+		if not (info is Dictionary):
+			continue
+		if not _types_match(int(info.get("type", 4)), ft):
+			continue
+		if _is_from_favs_pack(pth):
+			continue
+		if loaded.has(pth):
+			favc += 1
+	var hidc = 0
+	for pth in _hidden:
+		if not _types_match(int(_hidden[pth]), ft):
+			continue
+		if loaded.has(pth):
+			hidc += 1
+	lbl.text = str(favc) + " Favorites | " + str(hidc) + " Hidden"
+	panel["count_sig"] = [_fav_version, _hidden_version, lcount]
+
+
+func _on_mode_cycle(key: String = ""):
+	if not _panels.has(key):
+		return
+	var mode = int(_panels[key].get("mode", _MODE_ALL))
+	_set_panel_mode(key, (mode + 1) % 3)
+
+
+func reapply_panel_mode(key: String, restore_textures = null) -> bool:
+	# Public (called by search_persist via the Engine-meta singleton): re-enter
+	# the panel's current view mode after DD repopulated the native list on
+	# Object/Scatter tool re-entry — that reset visually shows "All" while our
+	# stored mode still says Favorites/Hidden. Returns true when a non-All mode
+	# was re-applied (the full mode entry rebuilds list, search and selection,
+	# so the caller has nothing more to restore).
+	if not _panels.has(key):
+		return false
+	var panel = _panels[key]
+	var mode = int(panel.get("mode", _MODE_ALL))
+	if mode == _MODE_ALL:
+		return false
+	# Fake a transition from All so _set_panel_mode runs its full entry logic
+	# (it early-returns when mode == prev). Skip the selection snapshot: the
+	# list currently holds only the single texture DD restored on tool entry,
+	# which would overwrite the good multi-selection saved when leaving All.
+	panel["mode"] = _MODE_ALL
+	var fb = panel.get("fav_btn")
+	if fb != null and is_instance_valid(fb) and fb.pressed:
+		fb.pressed = false  # emits toggled -> tears down the Favorites overlay state
+	if panel.get("hidden_mode", false):
+		_restore_native_from_hidden(key)
+	_set_panel_mode(key, mode, true)
+	# Restore the caller's saved (multi)selection into the freshly rebuilt
+	# overlay — the mode entry itself starts with nothing selected.
+	if restore_textures is Array and restore_textures.size() > 0:
+		_select_overlay_textures(key, restore_textures)
+	return true
+
+
+func _select_overlay_textures(key: String, texs: Array) -> void:
+	# Select the overlay items whose metadata (res:// path) matches the given
+	# textures' resource_path, then forward through the normal overlay->native
+	# path so the tool (ScatterTool.textures included) picks it up.
+	var panel = _panels.get(key)
+	if panel == null:
+		return
+	var overlay = panel.get("overlay_list")
+	if overlay == null or not is_instance_valid(overlay) or not overlay.visible:
+		return
+	var wanted = {}
+	for t in texs:
+		if t != null and is_instance_valid(t) and t is Texture and t.resource_path != "":
+			wanted[t.resource_path] = true
+	if wanted.size() == 0:
+		return
+	var picked = []
+	for i in range(overlay.get_item_count()):
+		var m = overlay.get_item_metadata(i)
+		if m is String and wanted.has(m):
+			picked.append(i)
+	if picked.size() == 0:
+		return
+	# The per-frame select_mode sync may not have run yet on this rebuilt
+	# overlay — mirror the native list now or a multi pick collapses to one.
+	var il = panel.get("item_list")
+	if il != null and is_instance_valid(il):
+		overlay.select_mode = il.select_mode
+	var first = true
+	for i in picked:
+		overlay.select(i, first)
+		first = false
+	overlay.ensure_current_is_visible()
+	_forward_overlay_to_dd(picked[0], key)
+
+
+func _set_panel_mode(key: String, mode: int, skip_selection_snapshot: bool = false):
+	var panel = _panels[key]
+	var prev = int(panel.get("mode", _MODE_ALL))
+	if mode == prev:
+		return
+	# Snapshot the current selection BEFORE this transition touches the list.
+	# Every mode forwards its selection to the native list, so this captures the
+	# latest pick (in All, Favorites or Hidden). We keep the last non-empty one
+	# so it survives the intermediate Hidden step (which repopulates the list)
+	# when cycling Favorites -> Hidden -> All. GetMultiselectedTextures() is
+	# readable, unlike the write-only ScatterTool.Textures.
+	var trans_sel = []
+	if key == "object" and not skip_selection_snapshot:
+		var _il0 = panel.get("item_list")
+		if _il0 != null and is_instance_valid(_il0) and _il0.has_method("GetMultiselectedTextures"):
+			var _got = _il0.call("GetMultiselectedTextures")
+			var _cs = []
+			if _got != null:
+				for _t in _got:
+					if _t != null and is_instance_valid(_t):
+						_cs.append(_t)
+			if _cs.size() > 0:
+				panel["saved_all_selection"] = _cs
+				trans_sel = _cs
+	panel["mode"] = mode
+	# Tear down the Hidden/Normal overlay if we were showing one.
+	if prev == _MODE_HIDDEN or (prev == _MODE_ALL and panel.get("hidden_mode", false)):
+		_restore_native_from_hidden(key)
+	# Drive Favorites through the (hidden) fav checkbox to reuse its machinery.
+	var fb = panel.get("fav_btn")
+	var want_fav = (mode == _MODE_FAV)
+	if fb and is_instance_valid(fb) and fb.pressed != want_fav:
+		fb.pressed = want_fav  # emits "toggled" -> _on_favs_toggled shows/restores
+	# Keep the assets in common across the switch: re-select in the freshly
+	# built Favorites overlay the items that were selected before this
+	# transition (e.g. All -> Favorites keeps the selected assets that are
+	# also favorites; the others are simply dropped by the matcher).
+	if mode == _MODE_FAV and trans_sel.size() > 0:
+		_select_overlay_textures(key, trans_sel)
+	# Enter the new mode.
+	panel.erase("hidden_sig")
+	if mode == _MODE_HIDDEN:
+		if key == "object":
+			_repopulate_native(key)
+		_show_subset_overlay(key, true)
+		var il = panel.get("item_list")
+		panel["hidden_sig"] = [_MODE_HIDDEN, (il.get_item_count() if is_instance_valid(il) else 0), _hidden_version]
+	elif mode == _MODE_ALL and key == "object":
+		# Returning to All repopulated the list (AllButton), dropping the search
+		# results — re-apply the kept search for the Object/Scatter tools.
+		_reapply_object_search()
+	_update_mode_button_label(key)
+
+
+# --- Hidden view (mode = Hidden) : overlay of only the hidden items --------
+
+func _maintain_hidden_view(key: String):
+	var panel = _panels[key]
+	var il = panel.get("item_list")
+	if not is_instance_valid(il):
+		return
+	var sig = [_MODE_HIDDEN, il.get_item_count(), _hidden_version]
+	if panel.get("hidden_sig", null) == sig:
+		return
+	panel["hidden_sig"] = sig
+	_show_subset_overlay(key, true)
+
+
+# --- Normal view (mode = All) : hide the hidden assets ---------------------
+
+func _maintain_normal_filter(key: String):
+	var panel = _panels[key]
+	var il = panel.get("item_list")
+	if not is_instance_valid(il):
+		return
+	var dd_count = il.get_item_count()
+	var sig = [_MODE_ALL, dd_count, _hidden_version]
+	if panel.get("hidden_sig", null) == sig:
+		return
+	panel["hidden_sig"] = sig
+	if _hidden.size() == 0:
+		if panel.get("hidden_mode", false):
+			_restore_native_from_hidden(key)
+		return
+	# Object libraries can hold 150k+ assets. Rather than copy them into an
+	# overlay, we ask DD to re-show the list minus the hidden assets via its
+	# native ShowObjectsArray/ShowSet — O(N), and it rebuilds Lookup correctly
+	# so badges, favorites mode and the eyedropper all keep working. Other
+	# (small) panels keep the exact parallel overlay.
+	if key == "object":
+		_apply_native_hide_objects(key)
+		return
+	if not _view_has_hidden(key):
+		if panel.get("hidden_mode", false):
+			_restore_native_from_hidden(key)
+		return
+	if dd_count <= _HIDDEN_NORMAL_OVERLAY_CAP:
+		_show_subset_overlay(key, false)
+	# else (non-object, huge): leave as-is (narrow by tag/search).
+
+
+func _get_object_library_panel():
+	if not _g.Editor or not is_instance_valid(_g.Editor):
+		return null
+	var olp = _g.Editor.get("ObjectLibraryPanel")
+	if olp != null and is_instance_valid(olp):
+		return olp
+	return _g.Editor.get_node_or_null("VPartition/Panels/HSplit/ObjectLibraryPanel")
+
+
+func _repopulate_native(key: String) -> void:
+	# Ask DD to rebuild the full native list (and its Lookup). Used before the
+	# Hidden view so the hidden items (which Normal mode removed from the list)
+	# are present again.
+	var panel = _panels[key]
+	if key == "object":
+		var align = _find_node_by_name(panel.get("lib_panel"), "Align")
+		if align:
+			var all_btn = _find_node_by_name(align, "AllButton")
+			if all_btn and is_instance_valid(all_btn):
+				all_btn.emit_signal("pressed")
+	panel.erase("hidden_sig")
+
+
+func _apply_native_hide_objects(key: String) -> void:
+	# Re-show the object GridMenu with hidden assets removed, using DD's native
+	# ShowObjectsArray (rebuilds Lookup consistently). A single O(N) pass builds
+	# both the kept-thumbnail list and the loaded-path snapshot for the count.
+	var panel = _panels[key]
+	var il = panel.get("item_list")
+	if not is_instance_valid(il):
+		return
+	var ft = int(panel.get("type", 4))
+	var n = il.get_item_count()
+	# A complete loaded-paths snapshot (for the count) can only come from a full
+	# list. If the current list is our own filtered output (a re-filter after a
+	# new hide), it is missing the already-hidden items, so we keep the last
+	# full snapshot instead of overwriting it with an incomplete one.
+	var is_filtered = (n == int(panel.get("native_filtered_count", -1)))
+	# Preserve the current selection + scroll across the rebuild (DD repopulates
+	# the list on tool switches; without this the selection/scroll would reset).
+	var sel_set = {}
+	for si in il.get_selected_items():
+		var sm = il.get_item_metadata(si)
+		if sm is String and sm != "":
+			sel_set[sm] = true
+	var vscroll = il.get_v_scroll()
+	var saved_scroll = vscroll.value if is_instance_valid(vscroll) else 0.0
+	var kept = []
+	var snap = {}
+	var sel_new_indices = []
+	var any_hidden = false
+	var rev = null
+	for i in range(n):
+		var m = il.get_item_metadata(i)
+		if m == null or not (m is String) or m == "":
+			if rev == null:
+				rev = {}
+				var lk = il.get("Lookup")
+				if lk is Dictionary:
+					for pth in lk:
+						var li = lk[pth]
+						if li is int:
+							rev[li] = pth
+			m = rev.get(i, "")
+		if m is String and m != "":
+			snap[m] = true
+			if _hidden.has(m) and _types_match(int(_hidden[m]), ft):
+				any_hidden = true
+				continue
+			if sel_set.has(m):
+				sel_new_indices.append(kept.size())
+		kept.append(il.get_item_icon(i))
+	# Loaded-path snapshot for the count (includes hidden). Only trust it when
+	# built from a full list.
+	if not is_filtered:
+		panel["lookup_snap"] = snap
+	if not any_hidden:
+		panel["lookup_snap_count"] = n
+		_update_mode_count_label(key)
+		return
+	var olp = _get_object_library_panel()
+	var done = false
+	if olp != null and olp.has_method("ShowObjectsArray"):
+		olp.call("ShowObjectsArray", kept)
+		done = true
+	elif il.has_method("ShowSet"):
+		il.call("ShowSet", kept)
+		done = true
+	if not done:
+		return
+	# ShowSet preserves the order of `kept`, so kept positions are the new
+	# indices — restore selection and scroll without re-querying Lookup.
+	var first = true
+	for ni in sel_new_indices:
+		if ni >= 0 and ni < il.get_item_count():
+			il.select(ni, first)
+			first = false
+	var vs2 = il.get_v_scroll()
+	if is_instance_valid(vs2):
+		vs2.value = saved_scroll
+	panel["hidden_mode"] = false
+	panel["native_filtered_count"] = il.get_item_count()
+	panel["dd_list_count"] = il.get_item_count()
+	panel["hidden_sig"] = [_MODE_ALL, il.get_item_count(), _hidden_version]
+	panel["lookup_snap_count"] = il.get_item_count()
+	_update_mode_count_label(key)
+
+
+func _view_has_hidden(key: String) -> bool:
+	if _hidden.size() == 0:
+		return false
+	var panel = _panels[key]
+	var il = panel.get("item_list")
+	if not is_instance_valid(il):
+		return false
+	var ft = int(panel.get("type", 4))
+	var dd_count = il.get_item_count()
+	# Fast path: probe DD's Lookup with our (small) hidden set.
+	var lookup = il.get("Lookup")
+	if lookup is Dictionary and lookup.size() > 0:
+		for h in _hidden:
+			if not _types_match(int(_hidden[h]), ft):
+				continue
+			var idx = lookup.get(h)
+			if idx != null and idx is int and idx >= 0 and idx < dd_count:
+				return true
+		return false
+	for i in range(dd_count):
+		var m = il.get_item_metadata(i)
+		if m is String and _hidden.has(m) and _types_match(int(_hidden[m]), ft):
+			return true
+	return false
+
+
+# --- Shared overlay build (Hidden view, and Normal view for non-object) ----
+
+func _show_subset_overlay(key: String, want_hidden: bool):
+	var panel = _panels[key]
+	var il = panel.get("item_list")
+	if not is_instance_valid(il):
+		return
+	if key == "floor_pattern":
+		_populate_floor_tile_metadata(il)
+	var ft = int(panel.get("type", 4))
+	var overlay = _ensure_panel_overlay(key)
+	overlay.clear()
+	overlay.material = il.material
+	var dd_count = il.get_item_count()
+	# Reverse Lookup (index -> path) is built lazily and only if some item lacks
+	# metadata (ShowSet/search mode). In "All" mode metadata is present, so we
+	# avoid marshalling a potentially huge Lookup dict entirely.
+	var rev = null
+	var fav_map = []
+	for i in range(dd_count):
+		var meta = il.get_item_metadata(i)
+		if meta == null or not (meta is String) or meta == "":
+			if rev == null:
+				rev = {}
+				var lk = il.get("Lookup")
+				if lk is Dictionary:
+					for pth in lk:
+						var li = lk[pth]
+						if li is int:
+							rev[li] = pth
+			if rev.has(i):
+				meta = rev[i]
+		var has_meta = meta is String and meta != ""
+		var is_hidden = false
+		if has_meta:
+			is_hidden = _hidden.has(meta) and _types_match(int(_hidden[meta]), ft)
+		var keep = is_hidden if want_hidden else (not is_hidden)
+		if not keep:
+			continue
+		var fi = overlay.get_item_count()
+		overlay.add_item(il.get_item_text(i), il.get_item_icon(i), true)
+		if has_meta:
+			overlay.set_item_metadata(fi, meta)
+		if il.get_item_tooltip(i) != "":
+			overlay.set_item_tooltip(fi, il.get_item_tooltip(i))
+		var mod = il.get_item_icon_modulate(i)
+		if mod != Color(1, 1, 1, 1):
+			overlay.set_item_icon_modulate(fi, mod)
+		fav_map.append(i)
+	panel["fav_to_dd_index"] = fav_map
+	panel["overlay_all_fav_map"] = fav_map.duplicate()
+	panel["dd_list_count"] = dd_count
+	panel["in_favs"] = true
+	panel["hidden_mode"] = true
+	var snap = []
+	for i in range(overlay.get_item_count()):
+		snap.append({
+			"name": overlay.get_item_text(i),
+			"icon": overlay.get_item_icon(i),
+			"meta": overlay.get_item_metadata(i),
+			"tooltip": overlay.get_item_tooltip(i)
+		})
+	panel["overlay_all_items"] = snap
+	il.visible = false
+	overlay.visible = true
+	overlay.select_mode = il.select_mode
+	var se = _find_search_lineedit(panel.get("lib_panel"))
+	if se != null:
+		panel["search_lineedit"] = se
+		_last_search_text[key] = se.text
+		# Same as the Favorites overlay: apply a pre-existing search once, the
+		# poll only reacts to text changes after this baseline sync.
+		if se.text.strip_edges() != "":
+			_filter_overlay(key, se.text)
+	var kind = "hidden" if want_hidden else "normal"
+	print("[Favorites] Hidden subsystem: showing ", overlay.get_item_count(), " ", key, " assets (", kind, " view)")
+
+
+func _restore_native_from_hidden(key: String):
+	var panel = _panels[key]
+	if not panel.get("hidden_mode", false) and not panel.has("overlay_list"):
+		return
+	panel["hidden_mode"] = false
+	panel["in_favs"] = false
+	panel.erase("fav_to_dd_index")
+	panel.erase("overlay_all_items")
+	panel.erase("overlay_all_fav_map")
+	_last_search_text.erase(key)
+	var il = panel.get("item_list")
+	if is_instance_valid(il):
+		il.visible = true
+	if panel.has("overlay_list") and is_instance_valid(panel["overlay_list"]):
+		panel["overlay_list"].visible = false
+
+
+# --- Right-click Hide / Unhide --------------------------------------------
+
+func _add_hide_menu_items(metas, count_str: String):
+	if _list_ctx_menu == null or not is_instance_valid(_list_ctx_menu):
+		return
+	if metas.size() == 0:
+		return
+	var all_hidden = true
+	var any_hidden = false
+	for m in metas:
+		if _hidden.has(m):
+			any_hidden = true
+		else:
+			all_hidden = false
+	if not all_hidden:
+		_list_ctx_menu.add_item("Hide from list" + count_str, 2)
+		if _icon_hidden:
+			_list_ctx_menu.set_item_icon(_list_ctx_menu.get_item_index(2), _icon_hidden)
+	if any_hidden:
+		_list_ctx_menu.add_item("Unhide" + count_str, 3)
+		if _icon_hidden:
+			_list_ctx_menu.set_item_icon(_list_ctx_menu.get_item_index(3), _icon_hidden)
+
+
+func _apply_hide_change(hide: bool):
+	if _list_ctx_metas.size() == 0:
+		return
+	var changed = 0
+	var newly_hidden = []
+	for meta in _list_ctx_metas:
+		if hide:
+			if not _hidden.has(meta):
+				_hidden[meta] = int(_list_ctx_type)
+				newly_hidden.append(meta)
+				changed += 1
+		else:
+			if _hidden.has(meta):
+				_hidden.erase(meta)
+				changed += 1
+	var removed_fav = false
+	# Hiding also un-favorites the asset (request: Hidden disables the favorite).
+	if hide and newly_hidden.size() > 0:
+		var fav_entries = []
+		for m in newly_hidden:
+			if _favorites.has(m):
+				fav_entries.append({"tex_path": m})
+		if fav_entries.size() > 0:
+			_remove_from_favorites(fav_entries)
+			removed_fav = true
+	if changed > 0:
+		_hidden_version += 1
+		_save_hidden()
+		for k in _panels:
+			_panels[k].erase("hidden_sig")
+	# If we removed favorites, rebuild the Favorites overlay now so the asset
+	# disappears immediately instead of lingering until the next refresh.
+	if removed_fav:
+		_refresh_active_panels()
+	print("[Favorites] ", ("Hid " if hide else "Unhid "), changed, " asset(s), total hidden=", _hidden.size())

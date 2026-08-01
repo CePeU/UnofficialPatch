@@ -86,8 +86,17 @@ func cleanup() -> void:
 # ── Overlay creation ──────────────────────────────────────────────────────
 
 func _create_overlay() -> void:
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_gridruler_layer"):
+		var _old_n = Engine.get_meta("up_gridruler_layer")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	_canvas_layer = CanvasLayer.new()
 	_canvas_layer.name = "GridRulerLayer"
+	Engine.set_meta("up_gridruler_layer", _canvas_layer)
 	# Above regular UI (~0), below popup/modal layers (100+).
 	_canvas_layer.layer = 50
 

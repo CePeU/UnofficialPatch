@@ -1822,8 +1822,17 @@ func _setup_busy_popup() -> void:
 	if root == null:
 		return
 
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_uir_busy"):
+		var _old_n = Engine.get_meta("up_uir_busy")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	var layer = CanvasLayer.new()
 	layer.name = "UIRescalerBusyLayer"
+	Engine.set_meta("up_uir_busy", layer)
 	layer.layer = 1000  # above DD UI
 	layer.set_meta("_uir_skip", true)
 

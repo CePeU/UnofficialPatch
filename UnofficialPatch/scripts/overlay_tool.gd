@@ -1934,6 +1934,22 @@ func _update_pattern_hover(level, mouse_world):
 	or (_hover_obj != null and is_instance_valid(_hover_obj)):
 		_clear_pattern_highlight()
 		return
+	# DD pioche par priorite decroissante : Light > Roof > Portal > Object > Wall
+	# > Path > Pattern (HighlightThingAtPoint). Le pattern est le DERNIER : si DD
+	# surligne deja un non-pattern sous le curseur, ce dernier est dessine au-dessus
+	# et c'est LUI la cible du clic. Afficher l'overlay pattern par-dessus vole alors
+	# la selection (bug: light au-dessus d'un pattern non selectionnable). Les gardes
+	# _hover_wall/path/obj ci-dessus couvrent murs/paths/objets/portails ; ce garde
+	# couvre le reste (lights, toits) en s'alignant sur le pick natif de DD.
+	var _sth = _g.Editor.Tools["SelectTool"] if _g.Editor != null else null
+	if _sth != null:
+		var _hh = _sth.get("highlighted")
+		if _hh != null and typeof(_hh) == TYPE_OBJECT and is_instance_valid(_hh):
+			var _hht = _hh.get("Type")
+			# 7 = PatternShape : seul cas ou le pattern est bien la cible du dessus.
+			if typeof(_hht) == TYPE_INT and _hht != 7:
+				_clear_pattern_highlight()
+				return
 	# Respecter le filter du SelectTool (si la cle existe).
 	if _g.Editor.ActiveToolName == "SelectTool":
 		var st = _g.Editor.Tools["SelectTool"]

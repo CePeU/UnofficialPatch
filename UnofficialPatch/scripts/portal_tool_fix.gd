@@ -93,10 +93,18 @@ func initialize():
 	_texture_menu.connect("item_selected", self, "_on_portal_item_selected")
 	
 	# Timer to detect tool switching and new portal placement
+	# Cross-session guard: _g.Editor persists across map reloads, so an autostart
+	# Timer added by a previous mod instance keeps ticking forever. Free the
+	# previous one before adding ours -- otherwise they accumulate per reload.
+	if Engine.has_meta("ptf_timer"):
+		var _old_t = Engine.get_meta("ptf_timer")
+		if is_instance_valid(_old_t):
+			_old_t.queue_free()
 	_timer = Timer.new()
 	_timer.wait_time = CHECK_INTERVAL
 	_timer.autostart = true
 	_timer.connect("timeout", self, "_tick")
+	Engine.set_meta("ptf_timer", _timer)
 	_g.Editor.add_child(_timer)
 	
 	_last_tool_panel_visible = _is_portal_tool_active()

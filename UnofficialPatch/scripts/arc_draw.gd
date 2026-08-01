@@ -482,6 +482,9 @@ func _write_path_pts(path, pts: Array):
 	path.call("SetEditPoints", pool)
 	if was_loop:
 		path.call("set_loop", true)
+	# Path length changed (curve-override arc, undo/redo): recompute the
+	# ModifyPaths/CMT fade shader parameters on the new geometry.
+	_cmt_refresh_path_fade_later(path)
 
 
 func _write_wall_pts(wall, pts: Array):
@@ -932,6 +935,9 @@ func _apply_loop_closing_arc() -> bool:
 		tool.call("EndPath", false)
 		_trim_path_cursor_point(active_path_before, arc_end)
 		_force_loop_path(active_path_before)
+		# Closing the loop changes the smoothed length after the shader
+		# parameters were computed — refresh them on the final geometry.
+		_cmt_refresh_path_fade_later(active_path_before)
 	elif tool.has_method("EndWall"):
 		# WallTool : EndWall(loop) prend un paramètre loop natif, on passe
 		# true pour créer directement un wall en boucle (DD gère le segment
@@ -1028,6 +1034,145 @@ func _apply_pending_arc_injection():
 			tool.call("EndWall", false)
 
 
+# ── ModifyPaths / CMT fade refresh bridge ────────────────────────────────────
+# The third-party ModifyPaths mod renders custom fade distances through CMT's
+# universal shader. Its "path_length_in_uv" uniform is computed at the moment
+# the custom data is applied to the node. Any geometry change made afterwards
+# by arc_draw (cursor-point trim after EndPath, forced loop close, arc segment
+# replacement, undo/redo) leaves that uniform stale: the fade-out zone then
+# falls beyond the actual end of the path, so the exit end is not faded.
+# Fix: after each of our geometry mutations on a Pathway, re-emit the CMT
+# manager's "apply_custom_data_to_node" signal so shader parameters are
+# recomputed on the final geometry. No third-party file is modified.
+var _cmt_manager = null
+var _cmt_lookup_attempts := 0
+
+
+var _cmt_shader = null  # combinedshader instance grabbed from ModifyPaths
+
+
+func _cmt_get_manager():
+	"""Lazily locates the CMT CustomDataManager. Primary route: ModifyPaths
+	connects PathTool's TransitionIn OptionButton ("item_selected" →
+	"_on_path_options_changed"), which exposes the ModifyPaths instance and,
+	through it, its customdatamanager and combinedshader members. Fallback:
+	the SelectTool copy/paste button connections wired by the manager itself
+	(the paste one may have been neutralised by clipboard_fix)."""
+	if _cmt_manager != null and is_instance_valid(_cmt_manager):
+		return _cmt_manager
+	_cmt_manager = null
+	_cmt_shader = null
+	if _cmt_lookup_attempts > 600:
+		return null  # mod considered absent, stop probing
+	_cmt_lookup_attempts += 1
+	if _g == null or _g.get("Editor") == null:
+		return null
+	
+	# ── Route 1: ModifyPaths instance via its TransitionIn connection ──
+	var tools = _g.Editor.get("Tools")
+	var ptool = tools.get("PathTool") if tools != null else null
+	var controls = ptool.get("Controls") if ptool != null else null
+	if controls != null and controls.has("TransitionIn"):
+		var opt = controls["TransitionIn"]
+		if opt != null and is_instance_valid(opt):
+			for c in opt.get_signal_connection_list("item_selected"):
+				if c.get("method") == "_on_path_options_changed":
+					var mp = c.get("target")
+					if mp != null and is_instance_valid(mp):
+						var mgr = mp.get("customdatamanager")
+						var shd = mp.get("combinedshader")
+						if mgr != null and is_instance_valid(mgr):
+							_cmt_manager = mgr
+							_cmt_shader = shd if (shd != null and is_instance_valid(shd)) else null
+							print("[ArcDraw] CMT bridge active via ModifyPaths (shader=%s)" % str(_cmt_shader != null))
+							return _cmt_manager
+	
+	# ── Route 2: manager connections on the SelectTool copy/paste buttons ──
+	if _g.Editor.get("Toolset") == null:
+		return null
+	var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+	if panel == null or not is_instance_valid(panel):
+		return null
+	for probe in ["pasteButton", "copyButton"]:
+		var btn = panel.get(probe)
+		if btn == null or not is_instance_valid(btn):
+			continue
+		for c in btn.get_signal_connection_list("pressed"):
+			var target = c.get("target")
+			if target != null and is_instance_valid(target) \
+					and target.has_user_signal("apply_custom_data_to_node"):
+				_cmt_manager = target
+				print("[ArcDraw] CMT bridge active via %s (%s)" % [probe, str(c.get("method"))])
+				return _cmt_manager
+	
+	return null
+
+
+func _cmt_refresh_path_fade(path) -> void:
+	"""Re-applies the CMT/ModifyPaths custom data to a Pathway so the fade
+	shader recomputes its length-dependent uniforms on the final geometry.
+	No-op when the CMT framework is absent or the node carries only default
+	data (vanilla gradient fade handles that case correctly)."""
+	if path == null or not is_instance_valid(path):
+		return
+	if path.get("GlobalEditPoints") == null:
+		return  # not a Pathway
+	var manager = _cmt_get_manager()
+	if manager == null:
+		return
+	var config = null
+	if path.has_meta("node_id") and manager.has_method("has_data") \
+			and manager.has_data(path.get_meta("node_id")):
+		config = manager.get_data(path.get_meta("node_id"))
+	elif manager.has_method("get_combined_ui_stored_state"):
+		# Freshly finalised path whose data is not stored yet: the config that
+		# was applied to it is the PathTool "main" UI state.
+		config = manager.get_combined_ui_stored_state("PathTool", "main")
+	if config == null or not (config is Dictionary) or config.empty():
+		return
+	if manager.has_method("is_data_default") and manager.is_data_default(config):
+		return  # no custom shader on this path, vanilla fade handles it
+	# Same application path as ModifyPaths.update_placed_paths_with_new_values:
+	# direct combinedshader call when available, signal fallback otherwise,
+	# then the same post-apply refresh calls.
+	if _cmt_shader != null and is_instance_valid(_cmt_shader) \
+			and _cmt_shader.has_method("set_custom_attributes_on_node"):
+		_cmt_shader.set_custom_attributes_on_node(path, config)
+	else:
+		manager.emit_signal("apply_custom_data_to_node", path, config)
+	if path.has_method("UpdateGradient"):
+		path.call("UpdateGradient")
+	if path.has_method("Smooth"):
+		path.call("Smooth")
+
+
+func _cmt_refresh_path_fade_later(path) -> void:
+	"""Schedules the fade refresh on a short one-shot Timer attached to the
+	path itself. Running the refresh synchronously right after EndPath crashes
+	DD — the path / CMT state is still being finalised at that point. A few
+	frames of delay are enough to escape that call stack (50ms ≈ 3 frames at
+	60fps). If the path is freed in the meantime, the timer dies with it and
+	the refresh is safely skipped."""
+	if path == null or not is_instance_valid(path):
+		return
+	if not path.is_inside_tree():
+		return
+	var t = Timer.new()
+	t.one_shot = true
+	t.wait_time = 0.05
+	path.add_child(t)
+	t.connect("timeout", self, "_cmt_refresh_timer_fired", [path, t])
+	t.start()
+
+
+func _cmt_refresh_timer_fired(path, t) -> void:
+	if t != null and is_instance_valid(t):
+		t.queue_free()
+	if _destroyed:
+		return
+	_cmt_refresh_path_fade(path)
+
+
 func _get_last_polyline_position(world_ui) -> Vector2:
 	"""Lit la position du dernier point du polyline courant (= fin d'arc B)."""
 	var polyline = world_ui.get("Polyline")
@@ -1072,6 +1217,10 @@ func _trim_path_cursor_point(pathway, expected_end: Vector2):
 			pathway.call("Smooth")
 		if pathway.has_method("UpdateOccluder"):
 			pathway.call("UpdateOccluder")
+		# The parasite cursor point was part of the geometry when ModifyPaths/
+		# CMT computed the fade shader parameters ("path_length_in_uv") —
+		# refresh them now that the path has its final, shorter length.
+		_cmt_refresh_path_fade_later(pathway)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

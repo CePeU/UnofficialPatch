@@ -23,6 +23,8 @@ var _style_cache := []
 # ── État SelectTool ───────────────────────────────────────────────────────────
 var last_selected_roofs := []
 var injected_panel       = null
+# Style list hosted by library_right_panel when that mod is active.
+var _style_list_in_panel = null
 var was_mouse_pressed   := false
 var _press_pos          := Vector2.ZERO
 var _press_over_ui      := false
@@ -161,16 +163,46 @@ func _find_align(node: Node, depth: int = 0):
 	return null
 
 
+func _lib_panel():
+	# library_right_panel publishes itself in ModMapData when loaded.
+	if _g == null or _g.get("ModMapData") == null or not (_g.ModMapData is Dictionary):
+		return null
+	var lp = _g.ModMapData.get("_library_right_panel")
+	if lp == null or not is_instance_valid(lp):
+		return null
+	if not lp.has_method("is_active") or not lp.is_active():
+		return null
+	return lp
+
+
+# Resolve the RoofTool STYLE list through Tool.Controls. Scanning the tool
+# panel for "Label STYLE followed by an ItemList" fails when another sub-mod
+# (library_right_panel) has relocated the grid, and Controls is the same node
+# in both cases.
+func _resolve_roof_style_list():
+	var tools = _g.Editor.get("Tools")
+	if not (tools is Dictionary): return null
+	var rt = tools.get("RoofTool")
+	if rt == null or not is_instance_valid(rt): return null
+	var controls = rt.get("Controls")
+	if not (controls is Dictionary): return null
+	var c = controls.get("Texture")
+	if c == null or not is_instance_valid(c) or not (c is ItemList): return null
+	return c
+
+
 func _cache_roof_panel_nodes() -> void:
 	var tp = _g.Editor.Toolset.GetToolPanel("RoofTool")
 	if tp == null: return
 	var align = _find_align(tp)
 	if align == null: return
 
+	_roof_style_list = _resolve_roof_style_list()
+
 	var children = align.get_children()
 	for i in range(children.size()):
 		var c = children[i]
-		if c is Label and c.text == "STYLE":
+		if c is Label and c.text == "STYLE" and _roof_style_list == null:
 			if i + 1 < children.size() and children[i + 1] is ItemList:
 				_roof_style_list = children[i + 1]
 		if c is CheckButton and c.text == "SHADE":
@@ -315,6 +347,9 @@ func _is_mouse_over_select_ui() -> bool:
 	if injected_panel != null and is_instance_valid(injected_panel) and injected_panel is Control:
 		if injected_panel.get_global_rect().has_point(injected_panel.get_global_mouse_position()):
 			return true
+	var lp = _lib_panel()
+	if lp != null and lp.has_method("contains_mouse") and lp.contains_mouse():
+		return true
 	return false
 
 
@@ -460,9 +495,14 @@ func _inject_roof_panel(roofs: Array) -> void:
 	align.add_child(vbox)
 	injected_panel = vbox
 
-	vbox.add_child(HSeparator.new())
-	var lbl = Label.new(); lbl.text = "STYLE"
-	vbox.add_child(lbl)
+	# When library_right_panel is active, the STYLE list goes to the right
+	# panel like every other library; only the shade options stay on the left.
+	var lp = _lib_panel()
+
+	if lp == null:
+		vbox.add_child(HSeparator.new())
+		var lbl = Label.new(); lbl.text = "STYLE"
+		vbox.add_child(lbl)
 
 	var item_list = ItemList.new()
 	item_list.rect_min_size     = Vector2(0, 250)
@@ -477,7 +517,15 @@ func _inject_roof_panel(roofs: Array) -> void:
 	if match_idx >= 0:
 		item_list.select(match_idx)
 	item_list.connect("item_selected", self, "_on_style_selected", [roofs])
-	vbox.add_child(item_list)
+	if lp != null:
+		item_list.rect_min_size = Vector2(0, 0)
+		item_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		if lp.attach_dynamic("roof_select_style", item_list, "Roofs"):
+			_style_list_in_panel = item_list
+		else:
+			vbox.add_child(item_list)
+	else:
+		vbox.add_child(item_list)
 
 	if _roof_shade_btn != null:
 		vbox.add_child(HSeparator.new())
@@ -559,6 +607,13 @@ func _find_style_index_for_roof(roof) -> int:
 
 
 func _remove_injected_panel() -> void:
+	if _style_list_in_panel != null:
+		var lp = _lib_panel()
+		if lp != null:
+			lp.detach_dynamic("roof_select_style")
+		elif is_instance_valid(_style_list_in_panel):
+			_style_list_in_panel.queue_free()
+		_style_list_in_panel = null
 	if injected_panel != null and is_instance_valid(injected_panel):
 		injected_panel.queue_free()
 	injected_panel = null

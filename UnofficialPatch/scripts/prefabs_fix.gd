@@ -73,8 +73,17 @@ func _install_input_listener() -> void:
 	if purged > 0:
 		print("[PrefabsFix] Purged %d orphan input listener(s)" % purged)
 
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_prefabsfix_listener"):
+		var _old_n = Engine.get_meta("up_prefabsfix_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	input_listener = Node.new()
 	input_listener.name = "PrefabsFixListener"
+	Engine.set_meta("up_prefabsfix_listener", input_listener)
 	var listener_script = GDScript.new()
 	listener_script.source_code = """extends Node
 var handler = null
@@ -123,12 +132,11 @@ func _on_input(event) -> void:
 			print("[PrefabsFix] Fix2: Ctrl+C ignored (RawSelectables null/empty)")
 	elif event.scancode == KEY_V:
 		Engine.set_meta("pfx_paste_cooldown", 12)  # 12 frames de grace apres paste
-		var map_max = _find_max_prefab_id_on_map()
-		var engine_last = int(Engine.get_meta("pfx_last_pid")) if Engine.has_meta("pfx_last_pid") else 10000
-		var first_pid = max(max(map_max, engine_last) + 1, 10001)
-		print("[PrefabsFix] Fix2: Ctrl+V, first_pid=%d (map_max=%d, engine_last=%d)" % [first_pid, map_max, engine_last])
-		var last_used = _rewrite_clipboard_prefab_id_to(first_pid)
-		Engine.set_meta("pfx_last_pid", last_used)
+		# Le clipboard est parsé AVANT tout scan de map : s'il ne contient aucun
+		# prefab_id (sélection sans vrai prefab), le remap est un no-op silencieux.
+		var last_used = _rewrite_clipboard_prefab_ids()
+		if last_used > 0:
+			Engine.set_meta("pfx_last_pid", last_used)
 	elif event.scancode == KEY_S:
 		_on_save_triggered()
 
@@ -225,17 +233,11 @@ func _log_selection_on_copy() -> void:
 			continue
 		var thing = sel.Thing
 		var pid = thing.get_meta("prefab_id") if (thing is Node and thing.has_meta("prefab_id")) else null
-		var nid = thing.get_meta("node_id") if (thing is Node and thing.has_meta("node_id")) else null
 		var z = thing.get_index() if thing is Node else 0
 		var tex = ""
 		var spr = thing.get("Sprite")
 		if spr and spr.texture:
 			tex = spr.texture.resource_path
-		var layer = thing.get("layer") if thing.get("layer") != null else -1
-		print("[PrefabsFix] Fix2:   node=%s nid=%s prefab_id=%s z=%s tex=%s" % [
-			thing.name if thing is Node else str(thing),
-			str(nid), str(pid), str(z), tex
-		])
 		if pid != null:
 			seen_pids[str(pid)] = seen_pids.get(str(pid), 0) + 1
 		if tex != "":
@@ -286,19 +288,23 @@ func _rewrite_clipboard_prefab_id_only() -> void:
 # ======================================================
 
 
-func _rewrite_clipboard_prefab_id_to(first_pid: int) -> int:
+func _rewrite_clipboard_prefab_ids() -> int:
+	# Remap des prefab_id du clipboard vers des ids frais (fix du bug vanilla :
+	# les copies collées gardaient l'id d'origine et fusionnaient avec le
+	# prefab source). Renvoie le dernier pid alloué, ou -1 si rien à faire.
 	var clipboard = OS.get_clipboard()
 	if clipboard.empty():
-		print("[PrefabsFix] Fix2: clipboard empty on paste")
-		return first_pid - 1
+		return -1
 	var parsed = JSON.parse(clipboard)
 	if parsed.error != OK:
-		return first_pid - 1
+		return -1
 	var data = parsed.result
 	if not data is Dictionary or not data.has("dungeondraft_clipboard"):
-		return first_pid - 1
+		return -1
 
-	# 1. Collecter les pids distincts dans le clipboard
+	# 1. Collecter les pids distincts dans le clipboard. AUCUN scan de map ni
+	# log tant qu'on ne sait pas qu'il y a de vrais prefabs à traiter : ce
+	# chemin tourne sur CHAQUE paste.
 	var old_pids_seen = {}
 	for section in ["objects", "pathways", "walls", "lights", "portals", "pattern_shapes", "roofs"]:
 		if data.has(section) and data[section] is Array:
@@ -307,10 +313,13 @@ func _rewrite_clipboard_prefab_id_to(first_pid: int) -> int:
 					old_pids_seen[str(item.prefab_id)] = true
 
 	if old_pids_seen.size() == 0:
-		print("[PrefabsFix] Fix2: no prefab_id in clipboard on paste")
-		return first_pid - 1
+		return -1
 
-	# 2. Construire le mapping old_pid -> new_pid
+	# 2. Allouer les pids frais : max(map TOUS NIVEAUX, dernier alloué) + 1.
+	var map_max = _find_max_prefab_id_on_map()
+	var engine_last = int(Engine.get_meta("pfx_last_pid")) if Engine.has_meta("pfx_last_pid") else 10000
+	var first_pid = max(max(map_max, engine_last) + 1, 10001)
+	print("[PrefabsFix] Fix2: paste remap, first_pid=%d (map_max=%d, engine_last=%d)" % [first_pid, map_max, engine_last])
 	var pid_map = {}
 	var next_pid = first_pid
 	for old_pid_str in old_pids_seen.keys():
@@ -699,14 +708,10 @@ func _on_paste_button_pressed() -> void:
 	if not Engine.has_meta("pfx_active_instance") or Engine.get_meta("pfx_active_instance") != _instance_id:
 		return
 	Engine.set_meta("pfx_paste_cooldown", 12)
-	print("[PrefabsFix] Fix2: paste button pressed")
-	# Meme logique que Ctrl+V
-	var map_max = _find_max_prefab_id_on_map()
-	var engine_last = int(Engine.get_meta("pfx_last_pid")) if Engine.has_meta("pfx_last_pid") else 10000
-	var first_pid = max(max(map_max, engine_last) + 1, 10001)
-	print("[PrefabsFix] Fix2: paste button first_pid=%d" % first_pid)
-	var last_used = _rewrite_clipboard_prefab_id_to(first_pid)
-	Engine.set_meta("pfx_last_pid", last_used)
+	# Meme logique que Ctrl+V : parse d'abord, scan seulement si nécessaire.
+	var last_used = _rewrite_clipboard_prefab_ids()
+	if last_used > 0:
+		Engine.set_meta("pfx_last_pid", last_used)
 
 
 func _hook_save_ui() -> void:
@@ -783,22 +788,47 @@ func _find_max_prefab_id_on_map() -> int:
 	return max_pid
 
 func _get_all_prefab_nodes() -> Array:
+	# TOUS les niveaux : l'expansion de groupe Godot (GetNodesInGroup) est
+	# tree-wide — un groupe peut vivre sur un autre niveau que le courant.
+	# Ne scanner que World.Level laissait le max sous-évalué -> pids réalloués
+	# en collision avec un groupe existant (fusion au paste).
 	var result = []
-	var level = _g.World.Level
-	if level == null:
-		return result
-	for cname in ["Objects", "Pathways", "Portals", "Lights", "PatternShapes", "Roofs"]:
-		var container = level.get_node_or_null(cname)
-		if container:
-			for child in container.get_children():
+	var levels = _all_levels()
+	if levels.empty() and _g.World.Level != null:
+		levels = [_g.World.Level]
+	for level in levels:
+		if level == null or not is_instance_valid(level):
+			continue
+		for cname in ["Objects", "Pathways", "Portals", "Lights", "Roofs"]:
+			var container = level.get_node_or_null(cname)
+			if container:
+				for child in container.get_children():
+					if child.has_meta("prefab_id"):
+						result.append(child)
+		# PatternShapes : les enfants directs sont des LAYERS, les shapes sont
+		# leurs enfants.
+		var patterns = level.get_node_or_null("PatternShapes")
+		if patterns:
+			for layer in patterns.get_children():
+				for sh in layer.get_children():
+					if sh.has_meta("prefab_id"):
+						result.append(sh)
+		var walls = level.get_node_or_null("Walls")
+		if walls:
+			for child in walls.get_children():
 				if child.has_meta("prefab_id"):
 					result.append(child)
-	var walls = level.get_node_or_null("Walls")
-	if walls:
-		for child in walls.get_children():
-			if child.has_meta("prefab_id"):
-				result.append(child)
-			for sub in child.get_children():
-				if sub.has_meta("prefab_id"):
-					result.append(sub)
+				for sub in child.get_children():
+					if sub.has_meta("prefab_id"):
+						result.append(sub)
 	return result
+
+
+func _all_levels() -> Array:
+	if _g == null:
+		return []
+	var w = _g.get("World")
+	if w == null or not is_instance_valid(w):
+		return []
+	var a = w.call("get_AllLevels")
+	return a if (a is Array) else []

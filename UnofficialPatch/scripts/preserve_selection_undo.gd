@@ -145,7 +145,7 @@ func update(_delta):
 	# selection box and the internal selection state aren't relevant to
 	# the user, and forcing EnableTransformBox(true) or calling
 	# SelectThing would make the box appear over other tools.
-	if editor.ActiveToolName != "SelectTool":
+	if _active_tool_name() != "SelectTool":
 		_prev_frame_sel_size = 0
 		_restore_pending_frames = 0
 		_hide_dd_box_frames = 0
@@ -472,3 +472,43 @@ func _restore_selection(select_tool) -> void:
 	elif not has_portal:
 		if select_tool.has_method("EnableTransformBox"):
 			select_tool.call("EnableTransformBox", true)
+
+
+# ── Per-frame cached editor state (published by Main.gd, Engine metadata) ──
+# Reading native/C# editor properties marshals a fresh GDScript object across
+# the interop boundary on EVERY access; with dozens of submods polling every
+# frame this is a steady allocation stream (background commit-charge growth).
+# Main.gd reads ActiveToolName once per frame and publishes it; we read the
+# shared copy here. THREE rules, each learned from a measured failure:
+#   1. PRECONDITION: never serve a cached name when this mod's _g.Editor is
+#      unreachable — callers would reach into editor objects that are unsafe
+#      to touch (native access violation c0000005 on tool switch / map churn).
+#   2. MEMOIZATION: the _g.Editor null-check itself marshals a wrapper per
+#      access; doing it per call cost as much as the problem this cache
+#      solves (+0.037 MB/s, +12% main CPU over 600 s). One read per mod per
+#      process tick keeps the safety signal at ~1/10th the volume.
+#   3. FORCED COPY: never hand out a COW reference to the String stored in
+#      the shared Dictionary — hence "%s" % v.
+var _uu_ed_frame := -1
+var _uu_ed_ok := false
+
+
+func _active_tool_name() -> String:
+	if not _uu_editor_reachable():
+		return ""
+	if Engine.has_meta("_uu_editor_state"):
+		var s = Engine.get_meta("_uu_editor_state")
+		if s is Dictionary:
+			var v = s.get("active_tool_name")
+			if v is String:
+				return "%s" % v
+	return str(_g.Editor.ActiveToolName)
+
+
+func _uu_editor_reachable() -> bool:
+	var f = Engine.get_idle_frames()
+	if f == _uu_ed_frame:
+		return _uu_ed_ok
+	_uu_ed_frame = f
+	_uu_ed_ok = _g != null and _g.Editor != null
+	return _uu_ed_ok

@@ -612,8 +612,15 @@ func _ensure_tooltip_layer() -> void:
 		return
 	if _tool_panel == null or _tool_panel.get_tree() == null:
 		return
+	# Cross-session guard: free a tooltip layer left over from a previous mod
+	# instance still parented to the persistent tree root.
+	if Engine.has_meta("ms_tt_layer"):
+		var _old_tt = Engine.get_meta("ms_tt_layer")
+		if is_instance_valid(_old_tt):
+			_old_tt.queue_free()
 	_tt_layer = CanvasLayer.new()
 	_tt_layer.name = "ModSettingsTooltipLayer"
+	Engine.set_meta("ms_tt_layer", _tt_layer)
 	_tt_layer.layer = 4096
 
 	_tt_panel = PanelContainer.new()
@@ -684,12 +691,19 @@ func _on_toggled(value, id):
 		return
 	entry["value"] = bool(value)
 	_save_settings_to_disk()
-	_fire_callback(entry)
-	_refresh_child_disabled_states()
-	# Notifie debug_settings : settings -> debug. Les mods debug lies a ce
-	# settings_id sont force-OFF si on coche, restored si on coche.
+	# Notifie debug_settings AVANT le callback : settings -> debug. Les mods
+	# debug lies a ce settings_id sont force-OFF si on decoche, restored si on
+	# coche.
+	# L'ordre est critique. Un consumer Pattern B appelle _debug_enabled() dans
+	# son _load_*(), qui lit debug_settings._mods[id]["enabled"]. Tant que
+	# on_setting_changed n'a pas tourne, cette valeur vaut encore false (le mod
+	# etait force-OFF parce que le settings etait OFF), donc le premier hot
+	# toggle OFF -> ON d'un mod jamais charge au demarrage echouait
+	# silencieusement : le script n'etait pas charge et _load_*() sortait.
 	if debug_settings != null and debug_settings.has_method("on_setting_changed"):
 		debug_settings.on_setting_changed(str(id), bool(value))
+	_fire_callback(entry)
+	_refresh_child_disabled_states()
 
 
 func _fire_callback(entry):

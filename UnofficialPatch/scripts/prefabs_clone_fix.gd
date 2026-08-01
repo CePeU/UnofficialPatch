@@ -160,8 +160,17 @@ func _hook_save_for_fix4b() -> void:
 	if root == null:
 		return
 	# Create a listener node for save events
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_pcf_listener"):
+		var _old_n = Engine.get_meta("up_pcf_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	_fix4b_listener = Node.new()
 	_fix4b_listener.name = "PrefabsCloneFixListener"
+	Engine.set_meta("up_pcf_listener", _fix4b_listener)
 	var ls = GDScript.new()
 	ls.source_code = """extends Node
 var handler = null

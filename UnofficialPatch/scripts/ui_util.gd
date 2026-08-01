@@ -8,15 +8,64 @@ var _right_edge := 99999.0
 var _bottom_edge := 99999.0
 var _edge_cache_frame := -1
 
-# Per-frame cache for _has_visible_popup. Without this, every caller of
-# is_mouse_over_ui (text_transform, text_tool_fix, etc) triggers a recursive
-# tree walk each frame — measurable in SelectTool when multiple mods poll.
-var _popup_cache_frame := -1
-var _popup_cache_value := false
+# ═══ Caches PARTAGÉS entre toutes les instances de ui_util ═══════════════════
+# Plusieurs mods instancient leur propre copie de ui_util (text_transform,
+# text_tool_fix, free_transform, terrain_slots_extended) en plus de l'instance
+# de Main. Avant, chaque instance avait ses propres caches → chacune payait le
+# walk récursif complet de _has_visible_popup toutes les 3 frames (~7-8 ms sur
+# une scène DD chargée), soit ~2,6 ms/frame PAR INSTANCE dans SelectTool.
+# Les caches vivent maintenant dans Engine meta (pattern déjà utilisé par
+# text_tool_fix pour son listener) : une seule détection sert tout le monde.
+#
+# En plus du partage, la détection de popup n'est plus un walk d'arbre : un
+# registre des Popup/WindowDialog est maintenu via les signaux node_added /
+# node_removed du SceneTree (seed initial par un unique walk complet). Le
+# check périodique ne parcourt plus que les ~quelques dizaines de popups.
+const _UU_CACHE_META := "_uu_shared_cache"   # Dictionary : caches par frame
+const _UU_REG_META := "_uu_popup_registry"   # Dictionary : id → Popup/WindowDialog
+const _UU_MGR_META := "_uu_popup_manager"    # WeakRef : instance connectée aux signaux
+const _UU_STATE_META := "_uu_editor_state"   # Dictionary: per-frame editor state (Main.gd)
 
-# Cache par frame pour is_mouse_over_hud (walk d'arbre pour la floatbar).
-var _hud_cache_frame := -1
-var _hud_cache_value := false
+# Référence locale au registre (le même Dictionary que dans Engine meta) pour
+# que les handlers node_added/removed n'aient pas à refaire get_meta à chaque
+# nœud ajouté (ça fire pour TOUS les nœuds, ex. au chargement d'une map).
+var _reg_ref = null
+
+func _shared_cache() -> Dictionary:
+	if not Engine.has_meta(_UU_CACHE_META):
+		Engine.set_meta(_UU_CACHE_META, {})
+	return Engine.get_meta(_UU_CACHE_META)
+
+
+# ── Per-frame editor-state cache ──────────────────────────────────────────
+# Main.gd publishes a Dictionary through Engine metadata at the top of its
+# update loop: { "active_tool_name": String, "frame": int }. Reading native
+# editor properties (ActiveToolName, ...) marshals a fresh GDScript object
+# across the C++ boundary on every access; the shared cache reduces that to
+# a single read per frame for the whole mod suite.
+func editor_state() -> Dictionary:
+	if Engine.has_meta(_UU_STATE_META):
+		var s = Engine.get_meta(_UU_STATE_META)
+		if s is Dictionary:
+			return s
+	return {}
+
+
+# Cached ActiveToolName, with a direct-read fallback (safe before the first
+# Main.update() tick, or if the cache is ever unavailable).
+func active_tool_name(editor) -> String:
+	# PRECONDITION: if the caller's editor is not reachable, report "no
+	# tool" so it takes its safe early-out — never serve a cached name in
+	# a state where editor objects are unsafe to touch (native AV hazard).
+	if editor == null:
+		return ""
+	var s = editor_state()
+	var v = s.get("active_tool_name")
+	if v is String:
+		# Forced copy — never hand out a COW reference to the String stored
+		# in the shared Dictionary (native AV hazard, see Main.gd).
+		return "%s" % v
+	return str(editor.get("ActiveToolName"))
 
 # Cache for find_aso_terrain_window. The full scene-tree scan it performs is
 # O(scene nodes) and was being run multiple times per frame by asset_cycle's
@@ -25,67 +74,169 @@ var _hud_cache_value := false
 # drop. We keep the found window instance and validate it with cheap checks (no
 # tree walk); when no ASO window exists we only re-run the full scan every
 # _ASO_RESCAN_FRAMES frames instead of every frame.
-var _aso_win_cache = null
-var _aso_scan_frame := -100000
 const _ASO_RESCAN_FRAMES := 60
 
 func _cached_has_visible_popup(tree: SceneTree) -> bool:
+	var cache = _shared_cache()
 	var frame = Engine.get_frames_drawn()
-	if frame - _popup_cache_frame < 3:
-		return _popup_cache_value
-	_popup_cache_frame = frame
-	_popup_cache_value = _has_visible_popup(tree.root)
-	return _popup_cache_value
+	if frame - int(cache.get("popup_frame", -100)) < 3:
+		return bool(cache.get("popup_val", false))
+	cache["popup_frame"] = frame
+	cache["popup_val"] = _registry_has_visible_popup(tree)
+	return cache["popup_val"]
 
-func is_mouse_over_ui(listener_node: Node) -> bool:
+
+# Vérifie la visibilité sur le registre de popups (pas de walk d'arbre).
+# Même sémantique que l'ancien _has_visible_popup : un Popup/WindowDialog
+# visible n'importe où dans l'arbre → true. is_inside_tree() reproduit le fait
+# que l'ancien walk partait de root (un popup hors arbre n'était pas trouvé).
+func _registry_has_visible_popup(tree: SceneTree) -> bool:
+	_ensure_popup_registry(tree)
+	var reg = Engine.get_meta(_UU_REG_META)
+	if not (reg is Dictionary):
+		return false
+	var stale := []
+	var found := false
+	for id in reg:
+		var n = reg[id]
+		if n == null or not is_instance_valid(n):
+			stale.append(id)
+			continue
+		if n.visible and n.is_inside_tree():
+			found = true
+			break
+	for id in stale:
+		reg.erase(id)
+	return found
+
+
+# Installe (ou réinstalle) le registre : un unique walk complet pour le seed,
+# puis maintenance incrémentale via les signaux du SceneTree. Si l'instance
+# gestionnaire est libérée (ses connexions tombent avec elle), la prochaine
+# instance appelante réinstalle tout — le re-seed complet évite les trous.
+func _ensure_popup_registry(tree: SceneTree) -> void:
+	if Engine.has_meta(_UU_MGR_META) and Engine.has_meta(_UU_REG_META):
+		var wr = Engine.get_meta(_UU_MGR_META)
+		if wr is WeakRef and wr.get_ref() != null:
+			# Gestionnaire vivant : rafraîchit juste notre référence locale.
+			if _reg_ref == null:
+				_reg_ref = Engine.get_meta(_UU_REG_META)
+			return
+	var reg := {}
+	_seed_popup_registry(tree.root, reg, 0)
+	Engine.set_meta(_UU_REG_META, reg)
+	_reg_ref = reg
+	if not tree.is_connected("node_added", self, "_on_uu_node_added"):
+		tree.connect("node_added", self, "_on_uu_node_added")
+	if not tree.is_connected("node_removed", self, "_on_uu_node_removed"):
+		tree.connect("node_removed", self, "_on_uu_node_removed")
+	Engine.set_meta(_UU_MGR_META, weakref(self))
+
+
+func _seed_popup_registry(node: Node, reg: Dictionary, depth: int) -> void:
+	if depth > 24 or not is_instance_valid(node):
+		return
+	# WindowDialog hérite de Popup en Godot 3, un seul test suffit.
+	if node is Popup:
+		reg[node.get_instance_id()] = node
+	for i in node.get_child_count():
+		_seed_popup_registry(node.get_child(i), reg, depth + 1)
+
+
+# Handlers de signaux : appelés pour CHAQUE nœud ajouté/retiré de l'arbre —
+# doivent rester ultra légers (un test de classe, un accès Dictionary).
+func _on_uu_node_added(node: Node) -> void:
+	if node is Popup and _reg_ref is Dictionary:
+		_reg_ref[node.get_instance_id()] = node
+
+
+func _on_uu_node_removed(node: Node) -> void:
+	if node is Popup and _reg_ref is Dictionary:
+		_reg_ref.erase(node.get_instance_id())
+
+# ignore_popups: skip the "ANY visible Popup anywhere in the tree" veto and
+# answer purely on geometry (toolbar / panel edges / registered extra rects).
+# The veto is the right default for mods that must freeze while a modal is up,
+# but it is far too broad for wheel-driven map interactions: Godot 3 tooltips
+# are Popups, so a tooltip left showing over the toolbar (or any hidden-but-
+# "visible" WindowDialog) makes this return true while the cursor is plainly
+# over the map. Callers that only need "is the cursor over a UI surface"
+# should pass true and hit-test the popup under the cursor separately with
+# is_mouse_over_popup().
+func is_mouse_over_ui(listener_node: Node, ignore_popups: bool = false) -> bool:
 	# Profiler hook: when Main's F10 profiler is active, accumulate this
 	# (per-frame-cached) UI walk so we can see its true cost separately —
 	# it's shared across ~20 callers and otherwise charged to whichever mod
 	# calls it first in the frame.
 	if _g == null or not (_g.ModMapData is Dictionary) or not _g.ModMapData.get("_prof_dsw_on", false):
-		return _is_mouse_over_ui_impl(listener_node)
+		return _is_mouse_over_ui_impl(listener_node, ignore_popups)
 	var _t0 := OS.get_ticks_usec()
-	var _r := _is_mouse_over_ui_impl(listener_node)
+	var _r := _is_mouse_over_ui_impl(listener_node, ignore_popups)
 	_g.ModMapData["_prof_umou_usec"] = _g.ModMapData.get("_prof_umou_usec", 0) + (OS.get_ticks_usec() - _t0)
 	return _r
 
 
-func _is_mouse_over_ui_impl(listener_node: Node) -> bool:
+func _is_mouse_over_ui_impl(listener_node: Node, ignore_popups: bool = false) -> bool:
+	# Frame-scoped RESULT cache, shared across all instances and callers.
+	# ~20 submods call is_mouse_over_ui at least once per frame; the result
+	# only depends on the mouse position and UI state, both constant within a
+	# frame. Without this, every caller re-ran the checks and the extra-rects
+	# loop below — O(callers × 60fps) work and allocations.
+	# The two variants answer different questions, so they get their own
+	# frame slot — sharing one would let whichever ran first poison the other.
+	var cache = _shared_cache()
+	var frame = Engine.get_frames_drawn()
+	var key_frame = "umou_np_frame" if ignore_popups else "umou_frame"
+	var key_val = "umou_np_val" if ignore_popups else "umou_val"
+	if int(cache.get(key_frame, -100)) == frame:
+		return bool(cache.get(key_val, true))
+
 	var tree = listener_node.get_tree()
-	if tree and _cached_has_visible_popup(tree):
-		return true
+	if not ignore_popups:
+		if tree and _cached_has_visible_popup(tree):
+			cache[key_frame] = frame
+			cache[key_val] = true
+			return true
 
 	var vp = listener_node.get_viewport()
 	if vp == null:
+		# Listener-specific degenerate case — don't poison the shared cache.
 		return true
 	var mouse = vp.get_mouse_position()
 	var vp_size = vp.size
+	var over := false
 
 	# Toolbar
 	if mouse.y < 50:
-		return true
+		over = true
 
-	# Dynamic left/right panel edges
-	_update_panel_edges(tree, vp_size)
-	if mouse.x < _left_edge or mouse.x > _right_edge:
-		return true
-
-	# Barre du bas (floatbar / barre d'état)
-	if mouse.y > _bottom_edge:
-		return true
+	if not over:
+		# Dynamic left/right panel edges
+		_update_panel_edges(tree, vp_size)
+		if mouse.x < _left_edge or mouse.x > _right_edge:
+			over = true
+		# Bottom bar (floatbar / status bar)
+		elif mouse.y > _bottom_edge:
+			over = true
 
 	# Extra UI rects registered by floating mod panels (e.g. SelectFilterBar),
-	# which the edge/toolbar checks above don't cover.
-	if _g != null:
+	# which the edge/toolbar checks above don't cover. Iterate the Dictionary
+	# keys directly: values() allocated a fresh Array on EVERY call, i.e. once
+	# per caller per frame across the whole mod suite.
+	if not over and _g != null:
 		var mmd = _g.get("ModMapData")
 		if mmd is Dictionary and mmd.has("_extra_ui_rects"):
 			var rects = mmd["_extra_ui_rects"]
 			if rects is Dictionary:
-				for r in rects.values():
+				for k in rects:
+					var r = rects[k]
 					if r is Rect2 and r.has_point(mouse):
-						return true
+						over = true
+						break
 
-	return false
+	cache[key_frame] = frame
+	cache[key_val] = over
+	return over
 
 
 # Comme is_mouse_over_ui, mais ajoute un hit-test direct des Controls interactifs du
@@ -95,18 +246,19 @@ func _is_mouse_over_ui_impl(listener_node: Node) -> bool:
 func is_mouse_over_hud(listener_node: Node) -> bool:
 	if is_mouse_over_ui(listener_node):
 		return true
+	var cache = _shared_cache()
 	var frame = Engine.get_frames_drawn()
-	if frame == _hud_cache_frame:
-		return _hud_cache_value
-	_hud_cache_frame = frame
-	_hud_cache_value = false
+	if frame == int(cache.get("hud_frame", -100)):
+		return bool(cache.get("hud_val", false))
+	cache["hud_frame"] = frame
+	cache["hud_val"] = false
 	var vp = listener_node.get_viewport()
 	var tree = listener_node.get_tree()
 	if vp == null or tree == null:
 		return false
 	var mouse = vp.get_mouse_position()
-	_hud_cache_value = _find_hud_control_at(tree.root, mouse, vp.size, 0) != null
-	return _hud_cache_value
+	cache["hud_val"] = _find_hud_control_at(tree.root, mouse, vp.size, 0) != null
+	return cache["hud_val"]
 
 
 # DFS : le Control interactif le plus profond sous la souris gagne. Exclut le canvas
@@ -116,8 +268,8 @@ func _find_hud_control_at(node: Node, mouse: Vector2, vp_size: Vector2, depth: i
 		return null
 	if node is CanvasItem and not node.is_visible_in_tree():
 		return null
-	for child in node.get_children():
-		var found = _find_hud_control_at(child, mouse, vp_size, depth + 1)
+	for i in node.get_child_count():
+		var found = _find_hud_control_at(node.get_child(i), mouse, vp_size, depth + 1)
 		if found != null:
 			return found
 	if node is Control and node.mouse_filter != Control.MOUSE_FILTER_IGNORE:
@@ -199,8 +351,8 @@ func _find_popup_at(node: Node, mouse: Vector2):
 				return node
 	
 	# Check children
-	for child in node.get_children():
-		var found = _find_popup_at(child, mouse)
+	for i in node.get_child_count():
+		var found = _find_popup_at(node.get_child(i), mouse)
 		if found != null:
 			return found
 	
@@ -223,8 +375,8 @@ func _find_scroll_in_node(node: Node, mouse: Vector2) -> ScrollContainer:
 			result = node
 	
 	# Check children for a more specific (deeper) ScrollContainer
-	for child in node.get_children():
-		var found = _find_scroll_in_node(child, mouse)
+	for i in node.get_child_count():
+		var found = _find_scroll_in_node(node.get_child(i), mouse)
 		if found != null:
 			result = found  # Deeper one wins
 	
@@ -232,10 +384,16 @@ func _find_scroll_in_node(node: Node, mouse: Vector2) -> ScrollContainer:
 
 
 func _update_panel_edges(tree: SceneTree, vp_size: Vector2) -> void:
+	# Cache partagé : une seule instance fait le scan toutes les 12 frames,
+	# les autres relisent les bords calculés.
+	var cache = _shared_cache()
 	var frame = Engine.get_frames_drawn()
-	if frame - _edge_cache_frame < 12:
+	if frame - int(cache.get("edge_frame", -100)) < 12:
+		_left_edge = float(cache.get("edge_left", 0.0))
+		_right_edge = float(cache.get("edge_right", vp_size.x))
+		_bottom_edge = float(cache.get("edge_bottom", vp_size.y))
 		return
-	_edge_cache_frame = frame
+	cache["edge_frame"] = frame
 
 	_left_edge = 0.0
 	_right_edge = vp_size.x
@@ -243,25 +401,48 @@ func _update_panel_edges(tree: SceneTree, vp_size: Vector2) -> void:
 
 	_scan_edge_panels(tree.root, vp_size, 0)
 
+	cache["edge_left"] = _left_edge
+	cache["edge_right"] = _right_edge
+	cache["edge_bottom"] = _bottom_edge
+
 
 func _scan_edge_panels(node: Node, vp_size: Vector2, depth: int) -> void:
 	if depth > 5:
 		return
-	for child in node.get_children():
+	for i in node.get_child_count():
+		var child = node.get_child(i)
+		# Floating windows are never screen-edge HUD panels: skip the whole
+		# subtree, visible or not. (WindowDialog inherits Popup.)
+		if child is Popup:
+			continue
+		# is_visible_in_tree(), NOT .visible: inner panels of a hidden dialog
+		# keep visible=true. Without the width cap (removed for
+		# ResizeLeftPanel), such a panel can pass the height filter once
+		# "Enlarge UI" scales everything up, and corrupt both edges -- the
+		# guard then classifies the WHOLE screen as UI (total wheel block).
+		# Skip the node AND its subtree, same pattern as grid_ruler.
+		if child is Control and not child.is_visible_in_tree():
+			continue
 		if child is Control and child.visible:
 			var rect = child.get_global_rect()
-			# Real side panels: narrow (<25% viewport), tall (>50% viewport)
+			# Real side panels: tall (>80% viewport). No width cap (see above).
 			# Must be Panel or PanelContainer (not generic containers)
-			if (child is Panel or child is PanelContainer) and rect.size.y > vp_size.y * 0.8 and rect.size.x > 50 and rect.size.x < vp_size.x * 0.25:
-				# Left panel: starts near x=0
-				if rect.position.x < 5:
-					var right = rect.position.x + rect.size.x
-					if right > _left_edge:
-						_left_edge = right
-				# Right panel: ends near viewport right edge
-				if rect.position.x + rect.size.x > vp_size.x - 5:
-					if rect.position.x < _right_edge:
-						_right_edge = rect.position.x
+			if (child is Panel or child is PanelContainer) and rect.size.y > vp_size.y * 0.8 and rect.size.x > 50:
+				var left_x = rect.position.x
+				var right_x = rect.position.x + rect.size.x
+				# Panneau gauche : collé au bord gauche mais SANS atteindre le bord
+				# droit (un fond plein écran, lui, l'atteint et doit rester exclu).
+				# Volontairement indépendant de la largeur pour qu'un panneau élargi
+				# par ResizeLeftPanel au-delà de l'ancien plafond 25% du viewport
+				# reste reconnu comme UI.
+				if left_x < 5 and right_x < vp_size.x - 5:
+					if right_x > _left_edge:
+						_left_edge = right_x
+				# Panneau droit : collé au bord droit mais ne partant pas du bord
+				# gauche.
+				if right_x > vp_size.x - 5 and left_x > 5:
+					if left_x < _right_edge:
+						_right_edge = left_x
 			# Barre du bas : large (>50% largeur), courte (<20% hauteur), collée au
 			# bas du viewport. Détectée seulement si présente (sinon pas de marge).
 			if (child is Panel or child is PanelContainer) and rect.size.x > vp_size.x * 0.5 and rect.size.y < vp_size.y * 0.2 and rect.position.y + rect.size.y > vp_size.y - 5:
@@ -270,6 +451,8 @@ func _scan_edge_panels(node: Node, vp_size: Vector2, depth: int) -> void:
 		_scan_edge_panels(child, vp_size, depth + 1)
 
 
+# Ancien walk récursif complet — plus utilisé par is_mouse_over_ui (remplacé
+# par le registre), conservé pour compat API si un mod l'importe directement.
 func _has_visible_popup(node: Node, depth: int = 0) -> bool:
 	if depth > 16:
 		return false
@@ -277,8 +460,8 @@ func _has_visible_popup(node: Node, depth: int = 0) -> bool:
 		return true
 	if node is WindowDialog and node.visible:
 		return true
-	for child in node.get_children():
-		if _has_visible_popup(child, depth + 1):
+	for i in node.get_child_count():
+		if _has_visible_popup(node.get_child(i), depth + 1):
 			return true
 	return false
 
@@ -351,24 +534,30 @@ func find_aso_terrain_window(editor):
 	if editor == null:
 		return null
 
+	# Shared cache: the found window AND the rescan throttle are per-process,
+	# not per-instance — private ui_util instances (free_transform, text_*,
+	# terrain_slots_extended) no longer each run their own full-tree scan.
+	var cache = _shared_cache()
+
 	# Fast path: a previously found ASO window, validated with cheap checks
 	# only (instance validity + not the native window). No tree walk here, so
 	# this is what keeps the Terrain tool from scanning the scene every frame.
-	if _aso_win_cache != null and is_instance_valid(_aso_win_cache):
+	var cached_win = cache.get("aso_win", null)
+	if cached_win != null and is_instance_valid(cached_win):
 		var native_now = get_native_terrain_window(editor)
-		if _aso_win_cache != native_now:
-			return _aso_win_cache
+		if cached_win != native_now:
+			return cached_win
 		# Cached node has become the native window (rare) — drop and rescan.
-		_aso_win_cache = null
+		cache["aso_win"] = null
 
 	# Throttle the expensive full-tree scan. When no ASO window currently
 	# exists we only rescan periodically instead of on every call/frame. ASO
 	# injects its window once at load, so a coarse interval is more than enough
 	# to pick it up.
 	var frame = Engine.get_frames_drawn()
-	if _aso_win_cache == null and frame - _aso_scan_frame < _ASO_RESCAN_FRAMES:
+	if cache.get("aso_win", null) == null and frame - int(cache.get("aso_scan_frame", -100000)) < _ASO_RESCAN_FRAMES:
 		return null
-	_aso_scan_frame = frame
+	cache["aso_scan_frame"] = frame
 
 	var native = get_native_terrain_window(editor)
 	# We still need a tree to scan. Use the native's tree if we have one,
@@ -393,7 +582,7 @@ func find_aso_terrain_window(editor):
 	if found == null and candidates.size() > 0:
 		found = candidates[0]
 
-	_aso_win_cache = found
+	cache["aso_win"] = found
 	return found
 
 
@@ -416,8 +605,8 @@ func _collect_aso_candidates(node: Node, native, out: Array, depth: int) -> void
 				and _has_descendant_named(node, "PackList") \
 				and _has_descendant_named(node, "TextureMenu"):
 			out.append(node)
-	for child in node.get_children():
-		_collect_aso_candidates(child, native, out, depth + 1)
+	for i in node.get_child_count():
+		_collect_aso_candidates(node.get_child(i), native, out, depth + 1)
 
 
 func _has_descendant_class(node: Node, cls: String) -> bool:
@@ -425,8 +614,8 @@ func _has_descendant_class(node: Node, cls: String) -> bool:
 		return false
 	if node.get_class() == cls:
 		return true
-	for c in node.get_children():
-		if _has_descendant_class(c, cls):
+	for i in node.get_child_count():
+		if _has_descendant_class(node.get_child(i), cls):
 			return true
 	return false
 
@@ -436,8 +625,8 @@ func _has_descendant_named(node: Node, target: String) -> bool:
 		return false
 	if node.name == target:
 		return true
-	for c in node.get_children():
-		if _has_descendant_named(c, target):
+	for i in node.get_child_count():
+		if _has_descendant_named(node.get_child(i), target):
 			return true
 	return false
 

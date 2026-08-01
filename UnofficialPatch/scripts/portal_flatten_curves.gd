@@ -165,10 +165,18 @@ func initialize():
 # Timer used to defer wall replacements (free + LoadWall). See
 # _pending_reload comments above for why a Timer is required.
 func _build_reload_timer():
+	# Cross-session guard: _g.Editor persists across map reloads, so an autostart
+	# Timer added by a previous mod instance keeps ticking forever. Free the
+	# previous one before adding ours -- otherwise they accumulate per reload.
+	if Engine.has_meta("pfc_reload_timer"):
+		var _old_t = Engine.get_meta("pfc_reload_timer")
+		if is_instance_valid(_old_t):
+			_old_t.queue_free()
 	_reload_timer = Timer.new()
 	_reload_timer.wait_time = RELOAD_CHECK_INTERVAL
 	_reload_timer.autostart = true
 	_reload_timer.connect("timeout", self, "_reload_tick")
+	Engine.set_meta("pfc_reload_timer", _reload_timer)
 	if _g.Editor != null:
 		_g.Editor.add_child(_reload_timer)
 
@@ -249,8 +257,17 @@ func _find_button_by_text(node, text):
 
 
 func _build_listener():
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_flatten_listener"):
+		var _old_n = Engine.get_meta("up_flatten_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	_listener = Node.new()
 	_listener.name = "FlattenCurvesListener"
+	Engine.set_meta("up_flatten_listener", _listener)
 	var listener_script = GDScript.new()
 	# Listener attached to the tree root with high priority so we
 	# receive mouse wheel events before DD's camera-zoom handler can

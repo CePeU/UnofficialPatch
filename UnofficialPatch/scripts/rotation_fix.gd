@@ -33,8 +33,17 @@ func initialize() -> void:
 
 
 func _install_input_listener() -> void:
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_rotfix_listener"):
+		var _old_n = Engine.get_meta("up_rotfix_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	input_listener = Node.new()
 	input_listener.name = "RotationFixListener"
+	Engine.set_meta("up_rotfix_listener", input_listener)
 	var listener_script = GDScript.new()
 	listener_script.source_code = """extends Node
 var handler = null
@@ -140,7 +149,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 	if event.button_index == BUTTON_WHEEL_DOWN:
 		step = -step
 
-	print("[RotationFix] wheel rotate: step=%.2f° z=%s shift=%s" % [step, z_held, shift_held])
 
 	# --- Pivot strategy ---
 	# When walls + non-walls are mixed, DragSelectWalls maintains the
@@ -166,11 +174,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 		if combined != null and combined.size.x > 0.0 and combined.size.y > 0.0:
 			target_pivot = combined.position + combined.size * 0.5
 			has_target_pivot = true
-			print("[rot] target_pivot from overlay box: %s (rect %s)" % [str(target_pivot), str(combined)])
-		else:
-			print("[rot] no target_pivot — overlay rect empty (size=%s)" % str(combined.size if combined != null else Vector2.ZERO))
-	else:
-		print("[rot] no target_pivot — drag_select_walls is null")
 	
 	# When the DragSelectWalls overlay isn't active (selection has no
 	# walls), check if Free Transform is active. FT can move/scale/skew
@@ -188,7 +191,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 		if ft_aabb.size.x > 0.0 and ft_aabb.size.y > 0.0:
 			ft_pivot = ft_aabb.position + ft_aabb.size * 0.5
 			ft_pivot_active = true
-			print("[rot] ft_pivot from FT visual aabb: %s" % str(ft_pivot))
 
 	var pre_centroid = _compute_centroid()  # only used for fallback path
 
@@ -198,7 +200,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 	# RotateTransformBox at all in this branch (it would push a separate
 	# DD record, requiring two Ctrl+Z to undo).
 	if has_target_pivot:
-		print("[rot] unified rotate_selection_around(%.2f°, %s)" % [step, str(target_pivot)])
 		drag_select_walls.rotate_selection_around(step, target_pivot)
 		input_listener.get_tree().set_input_as_handled()
 		return
@@ -208,7 +209,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 	# in this branch because it would push a separate DD record AND
 	# pivot around the wrong point.
 	if ft_pivot_active:
-		print("[rot] FT-aware rotate around %s" % str(ft_pivot))
 		_rotate_non_walls_around(ft_pivot, step)
 		input_listener.get_tree().set_input_as_handled()
 		return
@@ -277,12 +277,10 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 	var pivot_dd: Vector2
 	if witness != null and is_instance_valid(witness):
 		pivot_dd = _derive_pivot_from_rotation(before_pos, witness.global_position, step)
-		print("[rot] pivot_dd derived from witness: %s (witness moved %s -> %s, step=%.2f°)" % [str(pivot_dd), str(before_pos), str(witness.global_position), step])
 	else:
 		var bb = select_tool.boxBegin
 		var be = select_tool.boxEnd
 		pivot_dd = (bb + be) * 0.5
-		print("[rot] pivot_dd from box midpoint (no witness): %s" % str(pivot_dd))
 
 	# Rotate walls around the appropriate pivot.
 	var walls_pivot = target_pivot if has_target_pivot else pivot_dd
@@ -297,7 +295,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 		var v = target_pivot - pivot_dd
 		var rad = deg2rad(step)
 		var delta = v - v.rotated(rad)
-		print("[rot] step=%.2f° v=(%s) delta=(%s) (target=%s, dd=%s)" % [step, str(v), str(delta), str(target_pivot), str(pivot_dd)])
 		if delta.length() > 0.001:
 			_translate_non_walls(delta)
 		# Update the locked box: rotate it by `step` around target_pivot
@@ -308,7 +305,6 @@ func _handle_select_tool(event, shift_held, z_held) -> void:
 		# the box doesn't get re-AABB'd from the items' positions.
 		if drag_select_walls != null and drag_select_walls.has_method("box_rotate"):
 			drag_select_walls.box_rotate(rad, target_pivot)
-			print("[rot] box_rotate(%.2f rad, %s) — box now at rotation %s" % [rad, str(target_pivot), str(drag_select_walls._box_rotation)])
 	else:
 		# No overlay active: rely on DD's native rotation around the
 		# selection's bounding-box center.

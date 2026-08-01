@@ -61,6 +61,29 @@ var _nudge_cooldown := 0.0
 # Each entry: {type: "paste"|"delete", data: [...]}
 var _undo_stack : Array = []
 
+# ── Sélection mixte (textes + assets DD) ─────────────────────────────────────
+# Quand des textes ET des assets DD sont sélectionnés simultanément, on fusionne
+# les deux boxes en une seule : la box native de DD est étendue à l'union
+# (assets DD ∪ AABB des textes) et les textes suivent les transforms de DD
+# (Move / Rotate / Scale via transformMode), sur le modèle de DragSelectWalls.
+# Nos propres poignées/box sont masquées dans ce mode.
+var _mixed_cache_frame  := -1        # cache par frame de _is_mixed_selection
+var _mixed_cached       := false
+var _mixed_transforming := false     # un transform DD est en cours (tm > 0)
+var _mixed_mode         := 0         # 1=Move 2=Rotate 3=Scale (transformMode DD)
+var _mixed_pre_xf       := Transform2D.IDENTITY  # transform du widget au début du drag
+var _mixed_pre_rot      := 0.0                   # rotation du widget au début du drag
+var _mixed_pre_size     := Vector2.ONE           # taille (Rect) du widget au début du drag
+var _mixed_states : Array = []       # snapshots des textes au début du drag
+var _mixed_box_probe_done := false   # print de diagnostic one-shot
+var _mixed_rot_watch       := 0.0    # rotation du widget au dernier passage (hors drag)
+var _mixed_rot_watch_valid := false  # watcher molette : RotateTransformBox est
+                                     # instantané (transformMode reste à 0), on
+                                     # détecte donc la rotation du widget par polling
+var _dswm_cache_frame := -1          # cache par frame de _dsw_mixed_active
+var _dswm_cached      := false
+var _dsw_states : Array = []         # snapshots des textes pendant un drag custom DSW
+
 # ── Clipboard ─────────────────────────────────────────────────────────────────
 var _clipboard : Array = []
 # [{text, font_name, font_size, font_color, position, rotation, sx, sy, align_mode}]
@@ -176,7 +199,11 @@ func _do_setup() -> void:
 	_g.World.add_child(_input_listener)
 
 	var uu = ResourceLoader.load(_g.Root + "scripts/ui_util.gd", "GDScript", true)
-	if uu: _ui_util = uu.new()
+	if uu:
+		_ui_util = uu.new()
+		# _g requis pour les _extra_ui_rects (SelectFilterBar) et l'attribution
+		# correcte du temps de is_mouse_over_ui dans le profiler partagé.
+		_ui_util._g = _g
 
 	# Get DD's SelectTool
 	var tools = _g.Editor.get("Tools")
@@ -324,11 +351,21 @@ func update(_delta: float) -> void:
 
 	# Passive drag-box — read mouse state without consuming events
 	var lmb_down = Input.is_mouse_button_pressed(BUTTON_LEFT)
-	_mouse_over_ui = _ui_util != null and _ui_util.is_mouse_over_ui(_input_listener)
+	# is_mouse_over_hud (not is_mouse_over_ui): also hit-tests floating HUD
+	# Controls (floatbar, floating buttons, sliders) that the edge/toolbar
+	# heuristics miss, so a drag-box can't start through the floatbar.
+	_mouse_over_ui = _ui_util != null and _ui_util.is_mouse_over_hud(_input_listener)
+
+	# ── Sélection mixte : box unique + suivi des transforms DD par les textes ──
+	_update_mixed_selection()
+
 	var vp_pb = tree.root.get_node_or_null(_viewport_path)
 	if vp_pb != null and not _mouse_over_ui:
 		var wp_pb = _mouse_world(vp_pb)
-		if lmb_down and not _pbox_active and _active_handle < 0 and not _group_moving:
+		# Garde transformMode : ne pas démarrer notre drag-box passif pendant
+		# qu'un transform DD (Move/Rotate/Scale) est en cours sur la box.
+		if lmb_down and not _pbox_active and _active_handle < 0 and not _group_moving \
+				and _dd_transform_mode() == 0 and not _dsw_drag_active():
 			var on_sel = false
 			for t in _selected_texts:
 				if is_instance_valid(t) and _text_aabb(t).has_point(wp_pb):
@@ -376,7 +413,9 @@ func update(_delta: float) -> void:
 			_set_move_cursor()
 		else:
 			var resolved = false
-			if _selected_texts.size() > 0:
+			# En sélection mixte (box DD fusionnée ou box custom DSW), la box
+			# active gère ses propres curseurs — ne pas les écraser.
+			if _selected_texts.size() > 0 and not _is_mixed_selection() and not _dsw_mixed_active():
 				var hit = _hit_handle(wp_cur, vp_cur)
 				if hit >= 0:
 					_set_cursor(hit)
@@ -471,9 +510,23 @@ func _on_input(event: InputEvent) -> void:
 		if event.control and event.scancode == KEY_Z:
 			# Seulement si des textes sont sélectionnés — sinon DD gère son propre undo
 			if _selected_texts.size() > 0:
-				_undo_action(vp); tree.set_input_as_handled(); return
+				# Pile vide : rien à défaire côté textes, laisser passer à DD.
+				if _undo_stack.empty():
+					return
+				var top = _undo_stack.back()
+				var mixed_undo = top is Dictionary and top.get("mixed", false)
+				_undo_action(vp)
+				# Entrée issue d'un transform mixte : ne PAS consommer, pour que
+				# DD défasse en parallèle sa part (les assets) du même geste.
+				if mixed_undo:
+					return
+				tree.set_input_as_handled(); return
 		if event.scancode in [KEY_DELETE, KEY_BACKSPACE] and _selected_texts.size() > 0:
+			var dd_sel_del = _dd_has_selection()
 			_delete_selection()
+			# Sélection mixte : ne pas consommer pour que DD supprime aussi ses assets.
+			if dd_sel_del:
+				return
 			tree.set_input_as_handled(); return
 		# Enter on a single selected text → start inline edit
 		if event.scancode == KEY_ENTER or event.scancode == KEY_KP_ENTER:
@@ -481,7 +534,10 @@ func _on_input(event: InputEvent) -> void:
 				_start_inline_edit(_selected_texts[0])
 				tree.set_input_as_handled(); return
 
-	if _ui_util != null and _ui_util.is_mouse_over_ui(_input_listener):
+	# is_mouse_over_hud: block map clicks (select/deselect/move) that land on
+	# floating HUD Controls the edge heuristics miss — e.g. selecting a text
+	# through the bottom floatbar.
+	if _ui_util != null and _ui_util.is_mouse_over_hud(_input_listener):
 		return
 
 	var wp = _mouse_world(vp)
@@ -512,11 +568,25 @@ func _on_input(event: InputEvent) -> void:
 				if event.doubleclick and dbl_target != null:
 					_start_inline_edit(dbl_target)
 					tree.set_input_as_handled(); return
-				_start_group_move(wp)
-				tree.set_input_as_handled(); return
+				# Sélection mixte : ne PAS démarrer notre move — le clic arme le
+				# Move de la box active (DD ou custom DSW) et les textes suivent.
+				if not _is_mixed_selection() and not _dsw_mixed_active():
+					_start_group_move(wp)
+					tree.set_input_as_handled(); return
 
 		# 3. Click on any text → select (if filter enabled)
 		if not _texts_filter_enabled: return
+		# Sélection mixte : un clic dans une zone interactive de la box fusionnée
+		# (corps = Move, coins = Scale, anneau = Rotate) appartient à DD. Ne pas
+		# voler la sélection ni consommer — et surtout ne PAS la vider (branche 4),
+		# sinon les textes lâchent le rotate/scale dès le press. Mêmes hit-tests
+		# que SelectTool.GetTransformMode (widget), synchrones et indépendants de
+		# l'ordre des handlers.
+		if _is_mixed_selection() and _mixed_box_wants_click():
+			return
+		# Idem pour la box custom DSW (murs dans la sélection).
+		if _dsw_mixed_active() and _dsw_box_wants_click(wp):
+			return
 		var texts = _get_current_texts()
 		if texts:
 			var hit_node = null
@@ -680,6 +750,9 @@ func _rot_handle_world(handles: Array, vp: Node) -> Vector2:
 	return handles[1] + Vector2(0, -36.0 / zoom)
 
 func _hit_handle(wp: Vector2, vp: Node) -> int:
+	# Sélection mixte (box native fusionnée ou box custom DSW) : nos poignées
+	# sont masquées, la box active les remplace.
+	if _is_mixed_selection() or _dsw_mixed_active(): return -1
 	var hs = _current_handle_positions(vp)
 	if hs.empty(): return -1
 	var zoom = vp.canvas_transform.get_scale().x
@@ -1318,7 +1391,20 @@ func _delete_selection() -> void:
 		t.queue_free()
 	_selected_texts.clear()
 	_primary_text = null
-	# Register undo action via DD's history if possible
+	# Undo via l'historique DD (undo_lib → CreateCustomRecord) : Ctrl+Z restaure
+	# les textes au bon point de la timeline MÊME sans texte sélectionné —
+	# indispensable après un cut ou un Delete mixte (plus rien n'est sélectionné,
+	# notre pile interne n'était donc plus jamais atteignable).
+	var undo = _g.ModMapData.get("_undo_lib") if _g.ModMapData is Dictionary else null
+	if undo != null and undo is Object and is_instance_valid(undo) \
+			and undo.has_method("record_callback"):
+		var ctx = {"snap": snap, "nodes": []}
+		if undo.record_callback(self, "_hist_restore_deleted_texts", [ctx],
+				self, "_hist_redelete_texts", [ctx]):
+			print("[TextTransform] Deleted %d texts (undo via DD history)" % snap.size())
+			return
+	# Repli : ancien comportement (pile interne, atteignable seulement avec des
+	# textes sélectionnés).
 	if _select_tool != null:
 		_select_tool.call("RecordTransforms")
 	_undo_stack.append({"type": "delete", "data": snap})
@@ -1362,36 +1448,77 @@ func _undo_action(vp: Node) -> void:
 		print("[TextTransform] Undo transform: restored %d nodes" % action["entries"].size())
 	elif action["type"] == "delete":
 		# Undo delete: restore nodes from snapshot
-		var snap = action["data"]
-		var texts = _get_current_texts()
-		if texts == null: return
-		var template : Node = null
-		for t in texts.get_children():
-			if t is Control: template = t; break
-		if template == null: return
-		var ttf = _g.ModMapData.get("_ttf_handler")
-		var tree = _g.World.get_tree()
-		var restored = []
-		for item in snap:
-			var nd = template.duplicate()
-			texts.add_child(nd)
-			var fc = item["font_color"]; if fc == null: fc = Color.white
-			var dof2 = nd.get("dataOnFocus")
-			if dof2 != null: dof2["position"] = item["position"]; nd.set("dataOnFocus", dof2)
-			nd.call("SetFont", item["font_name"], item["font_size"])
-			nd.call("SetFontColor", fc)
-			nd.text = item["text"]
-			nd.rect_rotation = item["rotation"]
-			var pos = item["position"]; var sx = item["sx"]; var sy = item["sy"]
-			var tmp1 = tree.create_timer(0.0)
-			tmp1.connect("timeout", nd, "set", ["rect_scale",    Vector2(sx, sy)])
-			var tmp2 = tree.create_timer(0.0)
-			tmp2.connect("timeout", nd, "set", ["rect_position", pos])
-			if ttf: ttf.register_anchor_external(nd, pos, item["align_mode"])
-			restored.append(nd)
+		var restored = _restore_texts_from_snap(action["data"])
 		_selected_texts = restored
 		_primary_text   = restored[0] if restored.size() > 0 else null
 		print("[TextTransform] Undo delete: restored %d texts" % restored.size())
+
+
+# Restaure des textes depuis un snapshot de _delete_selection. Renvoie les
+# nodes recréés (ne modifie PAS la sélection — au choix de l'appelant).
+func _restore_texts_from_snap(snap: Array) -> Array:
+	var restored = []
+	var texts = _get_current_texts()
+	if texts == null: return restored
+	var template : Node = null
+	for t in texts.get_children():
+		if t is Control: template = t; break
+	if template == null: return restored
+	var ttf = _g.ModMapData.get("_ttf_handler")
+	var tree = _g.World.get_tree()
+	for item in snap:
+		var nd = template.duplicate()
+		texts.add_child(nd)
+		var fc = item["font_color"]; if fc == null: fc = Color.white
+		var dof2 = nd.get("dataOnFocus")
+		if dof2 != null: dof2["position"] = item["position"]; nd.set("dataOnFocus", dof2)
+		nd.call("SetFont", item["font_name"], item["font_size"])
+		nd.call("SetFontColor", fc)
+		nd.text = item["text"]
+		nd.rect_rotation = item["rotation"]
+		var pos = item["position"]; var sx = item["sx"]; var sy = item["sy"]
+		var tmp1 = tree.create_timer(0.0)
+		tmp1.connect("timeout", nd, "set", ["rect_scale",    Vector2(sx, sy)])
+		var tmp2 = tree.create_timer(0.0)
+		tmp2.connect("timeout", nd, "set", ["rect_position", pos])
+		if ttf: ttf.register_anchor_external(nd, pos, item["align_mode"])
+		restored.append(nd)
+	return restored
+
+
+# ── Undo/redo de suppression via l'historique DD (callback_history_record) ────
+# ctx partagé entre undo et redo : {"snap": [...], "nodes": [...]}. L'undo
+# recrée les textes depuis snap et mémorise les nodes ; le redo les resupprime
+# (en rafraîchissant snap au passage). Les textes restaurés ne sont PAS
+# sélectionnés : un Ctrl+Z suivant doit continuer à dérouler l'historique DD
+# sans être intercepté par notre pile interne.
+func _hist_restore_deleted_texts(ctx: Dictionary) -> void:
+	var restored = _restore_texts_from_snap(ctx.get("snap", []))
+	ctx["nodes"] = restored
+	print("[TextTransform] History undo: restored %d texts" % restored.size())
+
+
+func _hist_redelete_texts(ctx: Dictionary) -> void:
+	var ttf = _g.ModMapData.get("_ttf_handler")
+	var new_snap = []
+	for nd in ctx.get("nodes", []):
+		if not is_instance_valid(nd): continue
+		var fi = _read_node_font(nd)
+		var am = 0
+		if ttf:
+			var id2 = nd.get_instance_id()
+			if ttf._anchors.has(id2): am = ttf._anchors[id2]["mode"]
+		new_snap.append({"text": nd.text if nd.get("text") != null else "",
+			"font_name": fi["font_name"], "font_size": fi["font_size"],
+			"font_color": fi["font_color"], "position": nd.rect_position,
+			"rotation": nd.rect_rotation, "sx": fi["sx"], "sy": fi["sy"], "align_mode": am})
+		if ttf: ttf._anchors.erase(nd.get_instance_id())
+		_selected_texts.erase(nd)
+		nd.queue_free()
+	if not new_snap.empty():
+		ctx["snap"] = new_snap
+	ctx["nodes"] = []
+	print("[TextTransform] History redo: re-deleted %d texts" % new_snap.size())
 
 
 # ══ Copy / Paste ══════════════════════════════════════════════════════════════
@@ -1409,6 +1536,11 @@ func _copy_selection() -> void:
 	_clipboard.clear()
 	# Mémorise si la copie est mixte (textes + assets DD) pour router le collage.
 	_clipboard_mixed = _dd_has_selection()
+	# Copy/cut texte-seul : vider le presse-papiers OS (celui de DD — son copy
+	# sérialise dans OS.clipboard). Sinon, un Ctrl+V après un copy mixte
+	# antérieur recollerait les assets périmés en plus des textes.
+	if not _clipboard_mixed:
+		OS.set_clipboard("")
 	var ttf = _g.ModMapData.get("_ttf_handler")
 	for t in _selected_texts:
 		if not is_instance_valid(t): continue
@@ -1514,6 +1646,430 @@ func _call_ttf_anchor_update() -> void:
 		if is_instance_valid(t): ttf.update_anchor_after_move(t)
 
 
+# ══ Sélection mixte (textes + assets DD) ══════════════════════════════════════
+# La box native de DD est étendue à l'union (rect DD ∪ AABB des textes) et les
+# textes suivent les transforms de la box (Move/Rotate/Scale) en répliquant le
+# pattern de DragSelectWalls : snapshot d'un item DD de référence + application
+# par frame d'une transform monde W aux textes.
+
+func _is_mixed_selection() -> bool:
+	if _mixed_transforming:
+		return true
+	var frame = Engine.get_frames_drawn()
+	if frame == _mixed_cache_frame:
+		return _mixed_cached
+	_mixed_cache_frame = frame
+	_mixed_cached = _selected_texts.size() > 0 and _dd_has_selection() and not _dsw_custom_active()
+	return _mixed_cached
+
+
+# Instance GDScript de DragSelectWalls (publiée dans ModMapData), ou null.
+func _get_dsw():
+	if not (_g.ModMapData is Dictionary):
+		return null
+	var dsw = _g.ModMapData.get("_drag_select_walls")
+	if dsw == null or not (dsw is Object) or not is_instance_valid(dsw):
+		return null
+	return dsw
+
+
+# Quand DragSelectWalls affiche sa box custom (murs dans la sélection), la box
+# native de DD est cachée : la fusion de box et le suivi transformMode ne
+# s'appliquent pas (les drags custom de DSW ne passent pas par transformMode).
+# L'intégration des textes se fait alors côté DSW via les hooks dsw_* ci-dessous.
+func _dsw_custom_active() -> bool:
+	var dsw = _get_dsw()
+	if dsw != null and dsw.has_method("_is_custom_active"):
+		return dsw._is_custom_active()
+	return false
+
+
+# Vrai si des textes sont sélectionnés pendant que la box custom DSW est active :
+# notre box/poignées sont masquées, les clics dans les zones de la box custom
+# appartiennent à DSW, et les textes suivent via les hooks dsw_*.
+func _dsw_mixed_active() -> bool:
+	var frame = Engine.get_frames_drawn()
+	if frame == _dswm_cache_frame:
+		return _dswm_cached
+	_dswm_cache_frame = frame
+	_dswm_cached = _selected_texts.size() > 0 and _dsw_custom_active()
+	return _dswm_cached
+
+
+# Vrai si un drag custom DSW est en cours (flag publié par DSW).
+func _dsw_drag_active() -> bool:
+	if not (_g.ModMapData is Dictionary):
+		return false
+	return bool(_g.ModMapData.get("_drag_select_walls_active", false))
+
+
+# Vrai si wp tombe dans une zone interactive de la box custom DSW (corps,
+# coins, anneau de rotation) — mêmes hit-tests que DSW.
+func _dsw_box_wants_click(wp: Vector2) -> bool:
+	var dsw = _get_dsw()
+	if dsw == null or not dsw.has_method("_custom_hit_test"):
+		return false
+	var rect = dsw.get("_last_combined")
+	if not (rect is Rect2) or rect.size == Vector2.ZERO:
+		return false
+	var hit = dsw._custom_hit_test(wp, rect)
+	return hit is Dictionary and int(hit.get("mode", 0)) != 0
+
+
+func _dd_transform_mode() -> int:
+	if _select_tool == null or not is_instance_valid(_select_tool):
+		return 0
+	var tm = _select_tool.get("transformMode")
+	return int(tm) if tm != null else 0
+
+
+func _dd_is_drawing() -> bool:
+	if _select_tool == null or not is_instance_valid(_select_tool):
+		return false
+	var d = _select_tool.get("isDrawing")
+	return bool(d) if d != null else false
+
+
+# Rect monde courant de la box DD (boxBegin/boxEnd normalisés).
+func _dd_box_rect() -> Rect2:
+	if _select_tool == null or not is_instance_valid(_select_tool):
+		return Rect2()
+	var bb = _select_tool.get("boxBegin")
+	var be = _select_tool.get("boxEnd")
+	if not (bb is Vector2) or not (be is Vector2):
+		return Rect2()
+	return Rect2(
+		Vector2(min(bb.x, be.x), min(bb.y, be.y)),
+		Vector2(abs(be.x - bb.x), abs(be.y - bb.y)))
+
+
+# Vrai si la souris est dans une zone interactive du widget de la box : corps
+# (Move), coin (Scale, rayon de grab débordant du rect) ou anneau de rotation
+# (Rect.Grow(64), donc AU-DELÀ du rect). Réplique SelectTool.GetTransformMode.
+func _mixed_box_wants_click() -> bool:
+	var tbox = _get_transform_box()
+	if tbox == null or not tbox.visible:
+		return false
+	if tbox.has_method("IsMouseOnCorner") and int(tbox.IsMouseOnCorner()) != -1:
+		return true
+	if tbox.has_method("IsMouseInside") and tbox.IsMouseInside():
+		return true
+	if tbox.has_method("IsMouseInRotateZone") and tbox.IsMouseInRotateZone():
+		return true
+	return false
+
+
+# Machine à états, appelée chaque frame depuis update() quand SelectTool est actif.
+func _update_mixed_selection() -> void:
+	if _select_tool == null or not is_instance_valid(_select_tool):
+		return
+	var tm = _dd_transform_mode()
+	if _mixed_transforming:
+		if tm == 0:
+			_end_mixed_transform()
+		else:
+			_update_mixed_transform()
+		return
+	if not _is_mixed_selection():
+		_mixed_rot_watch_valid = false
+		return
+	if tm > 0 and not _dd_is_drawing():
+		_start_mixed_transform(tm)
+	elif tm == 0 and not _dd_is_drawing():
+		# Rotation molette / RotateTransformBox (rotation_snap, select_rotation…) :
+		# instantanée, transformMode reste à 0 → on détecte le delta de rotation
+		# du widget entre deux frames et on l'applique aux textes.
+		_watch_native_box_rotation()
+		_enforce_mixed_box()
+		# Resynchronise le watcher APRÈS l'enforce : Enable() remet la rotation
+		# du widget à 0 quand la box est ré-imposée.
+		var tbox_w = _get_transform_box()
+		if tbox_w != null and tbox_w.visible:
+			_mixed_rot_watch = tbox_w.rotation
+			_mixed_rot_watch_valid = true
+		else:
+			_mixed_rot_watch_valid = false
+
+
+# Widget de la box de transformation (TransformBoxWidget C#), ou null.
+func _get_transform_box():
+	if _select_tool == null or not is_instance_valid(_select_tool):
+		return null
+	var tbox = _select_tool.get("transformBox")
+	if tbox == null or not is_instance_valid(tbox):
+		return null
+	return tbox
+
+
+# Impose à la box DD l'union (rect naturel DD ∪ AABB des textes sélectionnés).
+#
+# Source de vérité (décompilé TransformBoxWidget.cs / SelectTool.cs) :
+#   - Les visuels ET les hit-tests (IsMouseInside / IsMouseOnCorner /
+#     IsMouseInRotateZone → GetTransformMode) viennent du WIDGET transformBox.
+#   - Sa propriété `Rect` est en LECTURE SEULE (=> jamais de set("Rect") :
+#     l'écriture lève une exception côté glue C#). Le rect local est centré sur
+#     le node et agrandi de 1 px (Grow(1)).
+#   - SelectTool.EnableTransformBox(true) re-fit TOUJOURS le widget sur
+#     GetSelectionRect() (assets DD seuls) → ne JAMAIS l'appeler pour rafraîchir
+#     la box fusionnée, sinon elle re-rétrécit aussitôt.
+#   - La primitive correcte est widget.Enable(center, size) : publique, remet
+#     Rotation=0, pose position/taille/coins, recalcule AspectRatio (utilisé par
+#     le scale à ratio verrouillé) et Show().
+# boxBegin/boxEnd sont synchronisés par cohérence pour les autres mods.
+func _enforce_mixed_box() -> void:
+	var tbox = _get_transform_box()
+	# Box non visible (ex. sélection verrouillée / static) : ne pas conjurer de
+	# box que DD n'a pas voulue.
+	if tbox == null or not tbox.visible:
+		return
+	if not _select_tool.has_method("GetSelectionRect"):
+		return
+	var tb = _selection_bbox()
+	if tb.size == Vector2.ZERO:
+		return
+	var dd_rect = _select_tool.GetSelectionRect()
+	var target : Rect2
+	if dd_rect is Rect2 and (dd_rect.size.x > 0.5 or dd_rect.size.y > 0.5):
+		target = dd_rect.merge(tb)
+	else:
+		target = tb
+	var target_center = target.position + target.size * 0.5
+
+	# Déjà en place ? (Rect local du widget = taille cible + Grow(1), centre =
+	# position du node, rotation nulle) → rien à faire.
+	var wrect = tbox.get("Rect")
+	if wrect is Rect2 \
+			and abs(tbox.rotation) < 0.001 \
+			and tbox.position.distance_to(target_center) < 1.0 \
+			and (wrect.size - Vector2(2.0, 2.0)).distance_to(target.size) < 2.0:
+		return
+
+	tbox.call("Enable", target_center, target.size)
+	if tbox is CanvasItem:
+		tbox.update()
+	_select_tool.boxBegin = target.position
+	_select_tool.boxEnd = target.end
+	if not _mixed_box_probe_done:
+		_mixed_box_probe_done = true
+		print("[TextTransform] Box mixte : widget.Enable(", target_center, ", ", target.size, ")")
+
+
+# Démarre le suivi : snapshot du transform et de la taille du widget + snapshot
+# des textes. DD applique ensuite « Thing.Transform = t_box * initialRelative »
+# à ses assets ; en suivant le widget, les textes répliquent EXACTEMENT la même
+# transformation (pivot inclus), quel que soit le mode.
+func _start_mixed_transform(tm: int) -> void:
+	var tbox = _get_transform_box()
+	if tbox == null or not tbox.visible:
+		return
+	var wrect = tbox.get("Rect")
+	if not (wrect is Rect2):
+		return
+	_mixed_mode = tm
+	# preDragTransform = snapshot fait par DD au press (avant tout mouvement du
+	# widget) — plus fiable que lire le widget si un motion a déjà été traité.
+	var pre = _select_tool.get("preDragTransform")
+	if pre is Transform2D:
+		_mixed_pre_xf = pre
+		_mixed_pre_rot = pre.get_rotation()
+	else:
+		_mixed_pre_xf = Transform2D(tbox.rotation, tbox.position)
+		_mixed_pre_rot = tbox.rotation
+	if tm == 3:
+		var ps = _select_tool.get("transformPreDragBoxSize")
+		_mixed_pre_size = ps if (ps is Vector2 and ps.x > 0.001 and ps.y > 0.001) else wrect.size
+	else:
+		_mixed_pre_size = wrect.size
+	_mixed_states = _snapshot_selected_texts()
+	if _mixed_states.empty():
+		return
+	_mixed_transforming = true
+	_mixed_rot_watch_valid = false
+
+
+# Chaque frame du drag : W = t_widget_courant (avec le facteur d'échelle du
+# Rect, comme DD pose t.Scale) * pre⁻¹, appliquée aux textes. Math identique à
+# SelectTool.ApplyTransforms → lockstep parfait avec les assets DD.
+func _update_mixed_transform() -> void:
+	var tbox = _get_transform_box()
+	if tbox == null or not tbox.visible:
+		_end_mixed_transform()
+		return
+	var wrect = tbox.get("Rect")
+	if not (wrect is Rect2):
+		_end_mixed_transform()
+		return
+	var fx := 1.0
+	var fy := 1.0
+	if _mixed_mode == 3 and _mixed_pre_size.x > 0.001 and _mixed_pre_size.y > 0.001:
+		fx = wrect.size.x / _mixed_pre_size.x
+		fy = wrect.size.y / _mixed_pre_size.y
+	var cur_t = Transform2D(tbox.rotation, tbox.position)
+	cur_t.x *= fx
+	cur_t.y *= fy
+	var W = cur_t * _mixed_pre_xf.affine_inverse()
+	var rot_delta_deg = rad2deg(tbox.rotation - _mixed_pre_rot)
+	for st in _mixed_states:
+		if not is_instance_valid(st.node):
+			continue
+		st.node.rect_position = W.xform(st.pos)
+		st.node.rect_rotation = st.rot + rot_delta_deg
+		if _mixed_mode == 3:
+			st.node.rect_scale = Vector2(st.sx * fx, st.sy * fy)
+
+
+# Fin du drag : commit uniquement si quelque chose a réellement bougé.
+func _end_mixed_transform() -> void:
+	var states = _mixed_states
+	_mixed_transforming = false
+	_mixed_mode = 0
+	_mixed_states = []
+	# Le widget peut rester tourné après un drag Rotate : sans invalidation, le
+	# watcher molette prendrait ce delta pour une rotation instantanée (double
+	# application). Resync au prochain passage tm == 0.
+	_mixed_rot_watch_valid = false
+	_commit_mixed_states(states)
+
+
+# Snapshot des textes sélectionnés (état de référence d'un drag/commit).
+func _snapshot_selected_texts() -> Array:
+	var states = []
+	for t in _selected_texts:
+		if not is_instance_valid(t):
+			continue
+		var fi = _read_node_font_no_absorb(t)
+		states.append({
+			"node": t,
+			"pos": t.rect_position,
+			"rot": t.rect_rotation,
+			"sx": t.rect_scale.x,
+			"sy": t.rect_scale.y,
+			"font_size": fi["font_size"],
+			"font_name": fi["font_name"],
+		})
+	return states
+
+
+# Commit d'un lot de snapshots après transformation : dataOnFocus (sérialisation
+# DD) + persistance rot/scale ModMapData + undo (taguée mixed) + ancres ttf.
+# No-op si rien n'a réellement bougé.
+func _commit_mixed_states(states: Array) -> void:
+	var moved = false
+	for st in states:
+		if not is_instance_valid(st.node):
+			continue
+		if st.node.rect_position.distance_to(st.pos) > 0.01 \
+				or abs(st.node.rect_rotation - st.rot) > 0.01 \
+				or abs(st.node.rect_scale.x - st.sx) > 0.0001 \
+				or abs(st.node.rect_scale.y - st.sy) > 0.0001:
+			moved = true
+			break
+	if not moved:
+		return
+	var undo_entries = []
+	for st in states:
+		if not is_instance_valid(st.node):
+			continue
+		undo_entries.append({
+			"node": st.node,
+			"pos": st.pos,
+			"rot": st.rot,
+			"sx": st.sx,
+			"sy": st.sy,
+			"font_name": st.font_name,
+			"font_size": st.font_size,
+		})
+		_refresh_dof(st.node)
+		_save_transform_for_node(st.node)
+	if not undo_entries.empty():
+		# mixed=true : Ctrl+Z ne consommera pas l'évènement, DD/DSW défont leur part.
+		_undo_stack.append({"type": "transform", "entries": undo_entries, "font_commit": false, "mixed": true})
+	_call_ttf_anchor_update()
+
+
+# Watcher de rotation instantanée du widget natif (molette, RotateTransformBox).
+# Pivot = position du widget (centre de la box), comme SelectTool.RotateTransformBox.
+func _watch_native_box_rotation() -> void:
+	var tbox = _get_transform_box()
+	if tbox == null or not tbox.visible:
+		_mixed_rot_watch_valid = false
+		return
+	if not _mixed_rot_watch_valid:
+		return  # premier passage : resync fait par l'appelant après l'enforce
+	var delta = tbox.rotation - _mixed_rot_watch
+	if abs(delta) < 0.0005:
+		return
+	var states = _snapshot_selected_texts()
+	if states.empty():
+		return
+	var deg = rad2deg(delta)
+	for st in states:
+		if not is_instance_valid(st.node):
+			continue
+		st.node.rect_position = tbox.position + (st.pos - tbox.position).rotated(delta)
+		st.node.rect_rotation = st.rot + deg
+	_commit_mixed_states(states)
+
+
+# ══ API publique pour DragSelectWalls (box custom murs ∪ textes) ═══════════════
+# Quand des murs sont sélectionnés, DSW remplace la box native par sa box custom
+# (drags hors transformMode). Ces hooks permettent à DSW d'inclure les textes
+# dans le fit de sa box et de leur appliquer le même W que le reste.
+
+func dsw_get_texts_bbox() -> Rect2:
+	return _selection_bbox()
+
+
+# Signature de la sélection de textes — DSW re-fit sa box quand elle change.
+func dsw_get_texts_signature() -> int:
+	var sig = _selected_texts.size()
+	for t in _selected_texts:
+		if is_instance_valid(t):
+			sig = sig ^ t.get_instance_id()
+	return sig
+
+
+func dsw_begin_transform() -> void:
+	_dsw_states = _snapshot_selected_texts()
+
+
+# W monde par frame du drag custom DSW. mode : 1=move 2=rotate 3=scale.
+# sx/sy : facteurs de scale du frame (mode 3). Sémantique alignée sur
+# _custom_apply_W de DSW : scale uniforme sans Shift, reposition seule avec
+# Shift (comme les assets).
+func dsw_apply_W(W: Transform2D, mode: int, sx: float, sy: float, shift_held: bool) -> void:
+	var rot_deg = rad2deg(W.get_rotation())
+	for st in _dsw_states:
+		if not is_instance_valid(st.node):
+			continue
+		st.node.rect_position = W.xform(st.pos)
+		if mode == 2:
+			st.node.rect_rotation = st.rot + rot_deg
+		elif mode == 3 and not shift_held:
+			var f = abs(sx)
+			st.node.rect_scale = Vector2(st.sx * f, st.sy * f)
+
+
+func dsw_end_transform() -> void:
+	var states = _dsw_states
+	_dsw_states = []
+	_commit_mixed_states(states)
+
+
+# Application instantanée (rotation molette via rotate_selection_around de DSW).
+func dsw_apply_instant_W(W: Transform2D) -> void:
+	var states = _snapshot_selected_texts()
+	if states.empty():
+		return
+	var rot_deg = rad2deg(W.get_rotation())
+	for st in states:
+		if not is_instance_valid(st.node):
+			continue
+		st.node.rect_position = W.xform(st.pos)
+		st.node.rect_rotation = st.rot + rot_deg
+	_commit_mixed_states(states)
+
+
 # ══ Drawing ═══════════════════════════════════════════════════════════════════
 
 func _draw_overlay(overlay: Node2D) -> void:
@@ -1556,8 +2112,13 @@ func _draw_overlay(overlay: Node2D) -> void:
 		overlay.draw_line(br, bl, box_col, lw)
 		overlay.draw_line(bl, tl, box_col, lw)
 
+	# En sélection mixte (box DD fusionnée ou box custom DSW), la box active
+	# remplace notre AABB et nos poignées — on ne garde que le surlignage
+	# individuel des textes au-dessus.
+	var mixed_draw = _is_mixed_selection() or _dsw_mixed_active()
+
 	# Draw AABB outline for multi-selection
-	if _selected_texts.size() > 1:
+	if _selected_texts.size() > 1 and not mixed_draw:
 		var bb  = _selection_bbox()
 		var o2  = bb.position
 		var w2  = bb.size.x; var h2 = bb.size.y
@@ -1568,7 +2129,7 @@ func _draw_overlay(overlay: Node2D) -> void:
 		overlay.draw_line(o2 + Vector2(0,  h2),       o2,                   out_col, lw)
 
 	# Draw transform handles
-	if _selected_texts.size() > 0:
+	if _selected_texts.size() > 0 and not mixed_draw:
 		var hs = _current_handle_positions(vp)
 		for k in range(hs.size()):
 			var hp = hs[k]

@@ -5,7 +5,8 @@
 # Feature 2: Paste at cursor (Ctrl+V) - moves pasted items to cursor position
 # Feature 3: Paste in place (Ctrl+Shift+V) - pastes items at their original position
 # Feature 4: Wall copy/paste (DD doesn't support it natively)
-#   NOTE: Portals are NOT copied due to DD API limitations
+#   Portals are copied too, via Wall.AddPortal() (API C# publique qui
+#   instancie le prefab, calcule WallDistance et fait RemakeLines).
 # Feature 5: Instant snap at paste - snaps items BEFORE showing them (no visible movement)
 # Feature 6: Snap after drag - free movement during drag, snap when released
 
@@ -24,11 +25,40 @@ var _copy_center := Vector2.ZERO
 var _has_copy_center := false
 var _paste_in_place := false
 
+# Context-menu (right_click_util) paste driving.
+# _ctx_paste_mode: 0 = normal button click / keyboard (native in-place),
+#                  1 = context "Paste" (reposition to _ctx_paste_world_pos).
+# The context paste-in-place path reuses the native in-place behaviour, so it
+# does not need a dedicated mode. Read once in _on_paste_button_pressed.
+var _ctx_paste_mode := 0
+var _ctx_paste_world_pos := Vector2.ZERO
+var _ctx_has_paste_world_pos := false
+
+# Text paste settling. text_transform._paste_selection() fixes each pasted
+# text's rect_position via a one-shot create_timer(0.0), which can fire AFTER
+# our first _move_pasted_texts_to_cursor() and overwrite the cursor move —
+# leaving the text at its original (+30) position, far from cursor-pasted
+# assets. We therefore re-apply the text move for a few frames so it always
+# wins the race (idempotent: it no-ops once the text is at target).
+# _text_extra_offset carries the grid-snap that assets/walls receive so the
+# text group stays aligned with them.
+var _text_settle_frames := -1
+var _text_extra_offset := Vector2.ZERO
+# True when the last copy contained DD assets alongside text: the text group
+# then follows the asset group at paste. False for a text-only copy, where the
+# text is placed at the cursor and needs WorldUI→canvas space conversion.
+var _text_paste_mixed := false
+
 # Wall clipboard
 var _wall_clipboard := []
 var _has_wall_clipboard := false
 var _rebuild_box_frames := -1
 var _last_pasted_walls := []
+# Bases (2x2) des lights copiées, alignées par node_id croissant. null =
+# light sans base miroir. Transférées aux lights collées : DD ne persiste
+# que position + rotation (Lights.SaveLight), la composante miroir posée
+# par la symétrie Free Transform serait perdue au paste.
+var _light_basis_clipboard := []
 
 # Drag snap state (from paste_snap_fix)
 var _pasted_ids := {}
@@ -49,7 +79,6 @@ var _prev_transform_mode := 0
 
 # State pour reconstruire le clipboard quand DD le rend vide sur une selection
 # mixte (roofs + autres). Snapshot pris au Ctrl+C, verifie 2 frames apres.
-var _post_copy_check_counter := -1
 var _post_copy_selection: Array = []
 var _rebuilding_clipboard := false  # Garde-fou pendant la reconstruction
 
@@ -65,6 +94,11 @@ var _rebuilding_clipboard := false  # Garde-fou pendant la reconstruction
 var _cmt_manager = null          # Instance de CustomDataManager du mod tiers
 var _cmt_setup_done := false
 var _cmt_setup_attempts := 0
+
+# Hook du bouton Copy du SelectTool panel (le bouton appelle Copy() en direct,
+# sans passer par un InputEventKey -> le chemin Ctrl+C ne le voit pas).
+var _copy_btn_hooked := false
+var _copy_btn_hook_attempts := 0
 
 # Constants
 const SELECTABLE_WALL := 1
@@ -272,11 +306,10 @@ func _is_wall_move_enabled() -> bool:
 func _get_screen_center_world() -> Vector2:
 	var camera = _g.Camera
 	if camera and camera is Camera2D:
-		var viewport = camera.get_viewport()
-		if viewport:
-			var screen_center = viewport.size * 0.5
-			var canvas_xform = camera.get_canvas_transform()
-			return canvas_xform.affine_inverse().xform(screen_center)
+		# get_camera_screen_center() : centre ecran en coordonnees monde,
+		# calcule par Godot lui-meme (immunise contre les ecarts de scaling
+		# du calcul manuel viewport + canvas transform).
+		return camera.get_camera_screen_center()
 	return _mouse_world_pos
 
 
@@ -303,6 +336,10 @@ func _on_input(event) -> void:
 			_save_copy_center()
 			_snapshot_selection_for_rebuild()
 		elif event.scancode == KEY_V:
+			# Un Ctrl+V rapide peut arriver avant le flush deferre du Ctrl+C :
+			# on force le reorder/rebuild du clipboard maintenant, avant que
+			# DD ne colle.
+			_flush_pending_copy_check()
 			if event.shift:
 				_on_paste_in_place()
 			else:
@@ -319,6 +356,10 @@ func _on_process(_delta) -> void:
 	if not _cmt_setup_done:
 		_cmt_try_setup()
 
+	# Tentative de hook du bouton Copy du panel (no-op une fois fait).
+	if not _copy_btn_hooked:
+		_try_hook_copy_button()
+
 	# Handle paste movement
 	if _paste_move_counter > 0:
 		_paste_move_counter -= 1
@@ -327,6 +368,13 @@ func _on_process(_delta) -> void:
 	elif _paste_move_counter == 0:
 		_paste_move_counter = -1
 		_move_pasted_items_to_cursor()
+
+	# Re-apply the text reposition for a short window so text_transform's
+	# one-shot position timer can't leave pasted text at its original spot
+	# (would otherwise look "very offset" from cursor-pasted assets).
+	if _text_settle_frames > 0:
+		_text_settle_frames -= 1
+		_move_pasted_texts_to_cursor(true)
 
 	# Restore PreviousTool after DD has processed the X key
 	if _restore_frames > 0:
@@ -356,16 +404,6 @@ func _on_process(_delta) -> void:
 		_apply_paste_position_redo()
 		_redo_relocate_counter -= 1
 
-	# Post-Ctrl+C check : si DD a rendu un clipboard vide alors qu'on avait
-	# une selection (typiquement un mix roof+autres qui declenche un bug
-	# de serialisation DD), on reconstruit le clipboard en copiant chaque
-	# sous-ensemble separement puis en mergeant.
-	if _post_copy_check_counter > 0:
-		_post_copy_check_counter -= 1
-	elif _post_copy_check_counter == 0:
-		_post_copy_check_counter = -1
-		_check_and_rebuild_clipboard()
-
 
 func _apply_paste_position_redo() -> void:
 	if _paste_positions.empty():
@@ -386,6 +424,15 @@ func _apply_paste_position_redo() -> void:
 
 
 func _update_mouse_world_pos() -> void:
+	# Source de verite : WorldUI.MousePosition, la position monde que TOUS les
+	# outils natifs de DD utilisent. La conversion manuelle (viewport mouse +
+	# inverse du canvas transform) peut deriver d'un offset fixe en pixels
+	# ecran selon la resolution / le scaling UI / le DPI -- symptome rapporte
+	# par certains utilisateurs (paste decale bas-droite).
+	if _g != null and _g.get("WorldUI") != null:
+		_mouse_world_pos = _g.WorldUI.MousePosition
+		return
+	# Fallback : calcul manuel historique.
 	var camera = _g.Camera
 	if camera and camera is Camera2D:
 		var viewport = camera.get_viewport()
@@ -620,25 +667,62 @@ func _reset_drag_state() -> void:
 # CUT (Ctrl+X)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Sélection mixte : centre du groupe de textes au moment du copy/cut, et son
+# offset par rapport au centre des assets DD (_copy_center). Le paste replace
+# les textes à target + offset pour préserver leur position RELATIVE au groupe.
+var _text_copy_center := Vector2.ZERO
+var _has_text_copy_center := false
+var _text_copy_offset := Vector2.ZERO
+
+
 func _on_cut() -> void:
 	var tt = _tt()
-	if tt != null and tt._selected_texts.size() > 0:
-		_text_cut(tt)
-		return
+	var has_texts = tt != null and tt._selected_texts.size() > 0
 
 	var raw = select_tool.RawSelectables
 	var has_walls = _has_selected_walls(raw)
 	var has_copyable = select_tool.HasCopyable
 
+	# Textes seuls (aucun asset DD) : chemin texte historique.
+	if has_texts and not has_copyable and not has_walls:
+		_text_cut(tt)
+		return
+
 	if not has_copyable and not has_walls:
 		return
 
+	# Cut assets-seuls : invalider le presse-papiers texte, sinon un copy/cut
+	# mixte antérieur ferait coller ses textes périmés au prochain Ctrl+V.
+	# (Le Ctrl+C assets-seuls est déjà couvert côté text_transform.)
+	if tt != null and not has_texts:
+		tt._clipboard.clear()
+		tt._clipboard_mixed = false
+
+	# Sélection mixte : couper les textes EN PLUS des assets DD (avant, le
+	# return ci-dessus court-circuitait le cut des assets). _copy_selection
+	# marque le presse-papiers texte comme mixte → le prochain Ctrl+V collera
+	# textes (text_transform) ET assets DD en parallèle, comme pour Ctrl+C.
+	if has_texts:
+		tt._copy_selection()
+
+	# Centres (et offset textes/assets) AVANT la suppression des textes, sinon
+	# le paste mixte ne peut plus replacer les textes relativement au groupe.
 	_save_copy_center()
+
+	if has_texts:
+		tt._delete_selection()
 
 	_restore_previous_tool = _g.Editor.Toolset.PreviousTool
 	_g.Editor.Toolset.PreviousTool = "SelectTool"
 
 	if has_copyable:
+		# Reordonner la selection par z-order AVANT la Copy : le clipboard est
+		# ecrit dans l'ordre de selection (bug vanilla), et Delete() suit
+		# immediatement -- impossible de re-copier apres coup comme au Ctrl+C.
+		_sort_selection_zorder()
+		# Invalider un eventuel snapshot post-Ctrl+C en attente : les nodes
+		# vont etre supprimes, le flush differe ne doit rien reordonner.
+		_post_copy_selection.clear()
 		select_tool.Copy()
 
 	select_tool.Delete()
@@ -669,11 +753,13 @@ func _save_copy_center() -> void:
 		_has_copy_center = false
 		_has_wall_clipboard = false
 		_wall_clipboard = []
+		_text_paste_mixed = false
 		return
 
 	var center = Vector2.ZERO
 	var count = 0
 	_wall_clipboard = []
+	_capture_light_bases(raw)
 	# Toggle "Move, Transform and Copy Walls" : si OFF, on n'enregistre
 	# pas les walls dans le clipboard. Le paste cote walls n'aura donc
 	# rien a restaurer.
@@ -705,13 +791,126 @@ func _save_copy_center() -> void:
 		_copy_center = center / count
 		_has_copy_center = true
 
+	# Assets/walls present alongside any text = text follows that group at paste.
+	_text_paste_mixed = (count > 0)
+
+	# Sélection mixte : offset du groupe de textes par rapport au centre de
+	# copie DD — le paste replacera les textes à target + offset.
+	if count > 0 and _has_text_copy_center:
+		_text_copy_offset = _text_copy_center - _copy_center
+	else:
+		_text_copy_offset = Vector2.ZERO
+
 	if _has_wall_clipboard:
 		print("[ClipboardFix] Saved %d wall(s) to clipboard" % _wall_clipboard.size())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# HOOK DU BOUTON COPY (panel SelectTool)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Le bouton Copy du SelectToolPanel appelle SelectTool.Copy() directement, sans
+# InputEventKey : ni le centre de copie, ni le snapshot post-copie (reorder
+# z-order / rebuild) n'etaient declenches. On se branche sur "pressed" ; DD a
+# connecte le bouton avant nous, donc notre handler tourne APRES sa Copy()
+# native -- meme situation que le check differe post-Ctrl+C.
+func _try_hook_copy_button() -> void:
+	if _copy_btn_hooked:
+		return
+	_copy_btn_hook_attempts += 1
+	if _copy_btn_hook_attempts > 600:
+		_copy_btn_hooked = true  # abandon (panel introuvable)
+		return
+	if _g == null or _g.get("Editor") == null or _g.Editor.get("Toolset") == null:
+		return
+	var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+	if panel == null or not is_instance_valid(panel):
+		return
+	var copy_btn = panel.get("copyButton")
+	if copy_btn == null or not (copy_btn is BaseButton):
+		return
+	if not copy_btn.is_connected("pressed", self, "_on_copy_button_pressed"):
+		copy_btn.connect("pressed", self, "_on_copy_button_pressed")
+	# Le bouton Paste : "button_down" precede le "pressed" (sur lequel DD a
+	# connecte Paste()), donc on peut flusher le check post-copie en attente
+	# AVANT le collage natif.
+	var paste_btn = panel.get("pasteButton")
+	if paste_btn != null and paste_btn is BaseButton:
+		if not paste_btn.is_connected("button_down", self, "_on_paste_button_down"):
+			paste_btn.connect("button_down", self, "_on_paste_button_down")
+		# "pressed" arrive APRES le Paste() natif de DD (connecté avant nous) :
+		# les items collés sont déjà sélectionnés quand notre handler tourne.
+		if not paste_btn.is_connected("pressed", self, "_on_paste_button_pressed"):
+			paste_btn.connect("pressed", self, "_on_paste_button_pressed")
+	_copy_btn_hooked = true
+	print("[ClipboardFix] SelectTool copy/paste buttons hooked")
+
+
+func _on_copy_button_pressed() -> void:
+	# Meme chemin que Ctrl+C : centre de copie + snapshot pour le check differe
+	# (reorder z-order ou rebuild du clipboard vide).
+	if _rebuilding_clipboard:
+		return
+	# Textes (text_transform) : le chemin Ctrl+C de text_transform ne voit pas
+	# le bouton. Sélection avec textes → copier aussi les textes (presse-papiers
+	# mixte) ; sélection assets-seuls → invalider le presse-papiers texte pour
+	# ne pas recoller des textes périmés d'un copy mixte antérieur (parité avec
+	# le chemin clavier, géré côté text_transform).
+	var tt = _tt()
+	if tt != null:
+		if tt._selected_texts.size() > 0:
+			tt._copy_selection()
+		else:
+			tt._clipboard.clear()
+			tt._clipboard_mixed = false
+	_save_copy_center()
+	_snapshot_selection_for_rebuild()
+
+
+func _on_paste_button_down() -> void:
+	# Garantit un clipboard deja corrige avant le Paste() natif de DD (connecte
+	# sur "pressed", qui arrive apres notre "button_down").
+	if _rebuilding_clipboard:
+		return
+	_flush_pending_copy_check()
+
+
+func _on_paste_button_pressed() -> void:
+	# DD vient de coller (Paste() natif) aux positions sérialisées — le bouton
+	# est donc un collage « sur place ». On l'aligne sur Ctrl+Shift+V :
+	#  - collage des textes du presse-papiers text_transform (le chemin Ctrl+V
+	#    de text_transform ne voit pas le bouton),
+	#  - machinerie paste-in-place : no-op visuel pour les assets (déjà en
+	#    place), remet les textes à leur position exacte (annule le +30 du
+	#    paste texte), restaure murs / bases de lights / couleurs CMT.
+	if _rebuilding_clipboard:
+		return
+	var tt = _tt()
+	if tt != null and tt._clipboard.size() > 0 and tt.has_method("_paste_selection_btn"):
+		tt._paste_selection_btn()
+	# Context-menu "Paste" (right-click): reposition freshly pasted items to
+	# the clicked spot instead of leaving them in place. Any other invocation
+	# (real button click, context "Paste in Place") keeps native in-place.
+	var mode = _ctx_paste_mode
+	_ctx_paste_mode = 0
+	if mode == 1:
+		_on_paste()
+		return
+	if _has_copy_center or _has_wall_clipboard:
+		_on_paste_in_place()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CLIPBOARD REBUILD (workaround DD bug : mix roof+autres -> clipboard vide)
 # ══════════════════════════════════════════════════════════════════════════════
+
+func _flush_pending_copy_check() -> void:
+	# Execute le check post-copie en attente (reorder z-order ou rebuild).
+	# Appele en differe apres la copie, et de maniere synchrone juste avant
+	# un paste pour garantir que le clipboard est deja corrige. Idempotent :
+	# _check_and_rebuild_clipboard ne fait rien si aucun snapshot en attente.
+	_check_and_rebuild_clipboard()
+
 
 func _snapshot_selection_for_rebuild() -> void:
 	# Snapshot des Things selectionnees au moment du Ctrl+C, pour pouvoir
@@ -726,7 +925,10 @@ func _snapshot_selection_for_rebuild() -> void:
 		if s != null and s.Thing != null and is_instance_valid(s.Thing):
 			_post_copy_selection.append(s.Thing)
 	if _post_copy_selection.size() > 0:
-		_post_copy_check_counter = 2
+		# Fin de frame courante : toujours apres la Copy() native de DD (meme
+		# dispatch d'input), mais sans laisser 2 frames de fenetre pendant
+		# lesquelles un Ctrl+V rapide collerait le clipboard non reordonne.
+		call_deferred("_flush_pending_copy_check")
 
 
 func _check_and_rebuild_clipboard() -> void:
@@ -771,12 +973,10 @@ func _check_and_rebuild_clipboard() -> void:
 		if subset.empty():
 			continue
 		_copy_subset_into_merged(merged_data, subset, group_name)
-	# Restaurer la selection d'origine
+	# Restaurer la selection d'origine (expansion normale, sans doublons)
 	if select_tool.has_method("DeselectAll"):
 		select_tool.DeselectAll()
-	for thing in _post_copy_selection:
-		if is_instance_valid(thing):
-			select_tool.SelectThing(thing, true)
+	_select_things_no_dup(_post_copy_selection)
 	# Ecrire le clipboard merge
 	OS.set_clipboard(JSON.print(merged_data, "\t"))
 	var sections = merged_data.size() - 1
@@ -847,22 +1047,108 @@ func _reorder_clipboard_by_zorder() -> void:
 		return
 
 	_rebuilding_clipboard = true
-	select_tool.DeselectAll()
-	for t in sorted_things:
-		if is_instance_valid(t):
-			select_tool.SelectThing(t, true)
+	# Ordre exact requis (l'expansion de groupe le casserait) + zéro doublon.
+	_select_things_ordered_no_group(sorted_things)
 	select_tool.Copy()
 
-	# Restaurer la selection d'origine (meme ensemble, ordre d'origine) pour
-	# que l'utilisateur ne voie aucun changement.
+	# Restaurer la selection d'origine (meme ensemble) pour que l'utilisateur
+	# ne voie aucun changement — expansion de groupe normale, sans doublons.
 	select_tool.DeselectAll()
-	for t in things:
-		if is_instance_valid(t):
-			select_tool.SelectThing(t, true)
+	_select_things_no_dup(things)
 	if select_tool.has_method("OnFinishSelection"):
 		select_tool.OnFinishSelection()
 	_rebuilding_clipboard = false
 	print("[ClipboardFix] Clipboard reordonne par z-order (%d items)" % things.size())
+
+
+# Retrie la selection courante par z-order (bas -> haut). Retourne true si un
+# reorder a eu lieu. Utilise avant une Copy() dont on maitrise le flux (cut) ;
+# pas de restauration : l'appelant supprime ou remplace la selection ensuite.
+func _sort_selection_zorder() -> bool:
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return false
+	var things := []
+	for s in raw:
+		if s != null and s.Thing != null and is_instance_valid(s.Thing):
+			things.append(s.Thing)
+	if things.size() < 2:
+		return false
+	var sorted_things = things.duplicate()
+	sorted_things.sort_custom(self, "_cmp_zorder")
+	var same := true
+	for i in range(things.size()):
+		if things[i] != sorted_things[i]:
+			same = false
+			break
+	if same:
+		return false
+	# Ordre exact requis + zéro doublon (la sélection est supprimée/remplacée
+	# par l'appelant juste après, pas besoin de restaurer les flags de groupe).
+	_select_things_ordered_no_group(sorted_things)
+	return true
+
+
+# ── Sélection group-safe ──────────────────────────────────────────────────────
+# SelectTool.SelectThing(thing, true) crée TOUJOURS un nouveau Selectable
+# (aucun contrôle « déjà sélectionné » côté DD), et Select(true) étend la
+# sélection à tous les membres du groupe Godot du thing (groupes custom de
+# group_assets, prefabs). Re-sélectionner en boucle les membres d'un groupe
+# empile donc des Selectables en double, que Copy() sérialise N fois → assets
+# dupliqués au paste (bug du clic sur un membre de groupe : l'ordre de
+# sélection diffère alors du z-order, ce qui déclenche le reorder et ses
+# boucles de re-sélection ; une dragbox sélectionne déjà dans l'ordre z et n'y
+# passait pas).
+
+# Sélection sans doublons : ne sélectionne que les things ABSENTS de la
+# sélection courante (l'expansion de groupe amène le reste). Pour restaurer
+# une sélection visible par l'utilisateur.
+func _select_things_no_dup(things: Array) -> void:
+	for thing in things:
+		if thing == null or not is_instance_valid(thing):
+			continue
+		if _is_thing_selected(thing):
+			continue
+		select_tool.SelectThing(thing, true)
+
+
+func _is_thing_selected(thing) -> bool:
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return false
+	for s in raw:
+		if s != null and s.Thing == thing:
+			return true
+	return false
+
+
+# Sélection dans un ORDRE exact (l'ordre de `selected` = l'ordre de
+# sérialisation de Copy), sans doublons : on suspend l'expansion de groupe en
+# retirant temporairement les nœuds de leurs groupes Godot (metas prefab_id
+# intactes), on sélectionne un par un, puis on ré-inscrit les groupes. Les
+# groupes internes de Godot (préfixe \"_\") ne sont pas touchés. À réserver aux
+# sélections transitoires (re-Copy) : les flags IsInGroup des Selectables ne
+# sont pas posés — restaurer ensuite la sélection via _select_things_no_dup.
+func _select_things_ordered_no_group(things: Array) -> void:
+	var stripped := []
+	for t in things:
+		if t == null or not is_instance_valid(t):
+			continue
+		var gl := []
+		for gname in t.get_groups():
+			if str(gname).begins_with("_"):
+				continue
+			gl.append(gname)
+		for gname in gl:
+			t.remove_from_group(gname)
+		stripped.append({"thing": t, "groups": gl})
+	select_tool.DeselectAll()
+	for e in stripped:
+		select_tool.SelectThing(e["thing"], true)
+	for e in stripped:
+		for gname in e["groups"]:
+			if not e["thing"].is_in_group(gname):
+				e["thing"].add_to_group(gname)
 
 
 # Comparateur de tri : strict weak ordering. Meme parent -> index ascendant.
@@ -883,11 +1169,9 @@ func _cmp_zorder(a, b) -> bool:
 func _copy_subset_into_merged(merged_data: Dictionary, subset: Array, label: String) -> void:
 	# Selectionner uniquement `subset`, faire copier DD, parser le clipboard,
 	# fusionner les sections dans merged_data (concatenation des Arrays).
-	if select_tool.has_method("DeselectAll"):
-		select_tool.DeselectAll()
-	for thing in subset:
-		if is_instance_valid(thing):
-			select_tool.SelectThing(thing, true)
+	# Sélection du subset sans expansion de groupe ni doublons (sinon Copy()
+	# sérialise les membres du groupe plusieurs fois).
+	_select_things_ordered_no_group(subset)
 	select_tool.Copy()
 	var clipboard = OS.get_clipboard()
 	if clipboard.empty():
@@ -920,14 +1204,26 @@ func _snapshot_wall(wall) -> Dictionary:
 		for p in raw_pts:
 			pts.append(p)
 
-	# Count portals for info message (but don't copy them - API limitation)
-	var portal_count = 0
+	# Snapshot des portals (portes/fenetres) du wall. Toutes les proprietes
+	# necessaires sont des proprietes C# publiques lisibles depuis GDScript.
+	# La position d'un portal est locale au wall, mais le wall est a
+	# l'origine (ses Points sont en coordonnees monde), donc local == monde.
+	var portal_snaps := []
 	var portals = wall.Portals
 	if portals != null:
-		portal_count = portals.size()
-
-	if portal_count > 0:
-		print("[ClipboardFix] Wall has %d portal(s) - these will NOT be copied (DD API limitation)" % portal_count)
+		for p in portals:
+			if p == null or not is_instance_valid(p) or p.is_queued_for_deletion():
+				continue
+			portal_snaps.append({
+				"texture": p.Texture,
+				"closed": p.Closed,
+				"position": p.position,
+				"rotation": p.rotation,
+				"direction": p.Direction,
+				"point_index": int(p.WallPointIndex),
+				"radius": p.Radius,
+				"flip": p.Flip,
+			})
 
 	return {
 		"points": pts,
@@ -938,12 +1234,169 @@ func _snapshot_wall(wall) -> Dictionary:
 		"type": int(wall.Type),
 		"joint": int(wall.Joint),
 		"normalize_uv": wall.NormalizeUV,
+		"portals": portal_snaps,
 	}
+
+
+# Recree les portals d'un snapshot sur un wall frais (paste ou redo).
+# Wall.AddPortal() fait tout le travail cote C# : instanciation du prefab
+# (Cache.Prefabs.Portal, inaccessible depuis GDScript), calcul de
+# WallDistance depuis la position, WallID, AddChild et RemakeLines.
+# Seul AssignNodeID est a notre charge (comme le fait PortalTool apres
+# PortalSpot.Make()). On restaure ensuite la rotation exacte du snapshot :
+# AddPortal la recalcule depuis direction/flip, ce qui perdrait une
+# rotation modifiee apres coup (portal deplace/repositionne).
+func _recreate_portals(wall, portal_snaps: Array) -> void:
+	if wall == null or not is_instance_valid(wall) or portal_snaps.size() == 0:
+		return
+	var created = 0
+	for snap in portal_snaps:
+		var portal = wall.AddPortal(
+			snap["texture"],
+			snap["closed"],
+			snap["position"],
+			snap["direction"],
+			snap["point_index"],
+			snap["radius"],
+			snap["flip"]
+		)
+		if portal == null:
+			# Garde anti-doublon de DD (deux portals a la meme WallDistance).
+			continue
+		_g.World.AssignNodeID(portal)
+		portal.rotation = snap["rotation"]
+		created += 1
+	if created > 0:
+		print("[ClipboardFix] Recreated %d portal(s) on pasted wall" % created)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PASTE
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONTEXT-MENU ENTRY POINTS (right_click_util via clipboard_context.gd)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# True when the current selection contains something we can copy/cut/delete
+# (DD assets, walls, or text_transform texts).
+func has_copyable_selection() -> bool:
+	if select_tool == null:
+		return false
+	if select_tool.HasCopyable:
+		return true
+	var raw = select_tool.RawSelectables
+	if _has_selected_walls(raw):
+		return true
+	var tt = _tt()
+	if tt != null and tt._selected_texts.size() > 0:
+		return true
+	return false
+
+
+# True when a paste would produce something: DD-native clipboard section(s),
+# our wall clipboard, or the text_transform clipboard.
+func has_clipboard_content() -> bool:
+	if _has_wall_clipboard:
+		return true
+	var tt = _tt()
+	if tt != null and tt._clipboard.size() > 0:
+		return true
+	var cb = OS.get_clipboard()
+	if cb.empty():
+		return false
+	var parsed = JSON.parse(cb)
+	if parsed.error != OK:
+		return false
+	var data = parsed.result
+	# size() > 1 = the "dungeondraft_clipboard" marker key plus at least one
+	# content section (objects / paths / patterns / roofs...).
+	return data is Dictionary and data.has("dungeondraft_clipboard") and data.size() > 1
+
+
+# Copy the current selection. Mirrors the Ctrl+C / copy-button path, but calls
+# SelectTool.Copy() ourselves since there is no native key/button event here.
+func context_copy() -> void:
+	if select_tool == null:
+		return
+	var tt = _tt()
+	var has_texts = tt != null and tt._selected_texts.size() > 0
+	var has_dd = select_tool.HasCopyable
+	if tt != null:
+		if has_texts:
+			tt._copy_selection()
+		else:
+			tt._clipboard.clear()
+			tt._clipboard_mixed = false
+	# Only run DD's native copy when there is DD-copyable content. On a
+	# text-only selection, Copy() would overwrite the OS clipboard that
+	# _copy_selection() just cleared, with nothing useful to copy.
+	if has_dd:
+		select_tool.Copy()
+	_save_copy_center()
+	if has_dd:
+		_snapshot_selection_for_rebuild()
+
+
+# Cut = copy + delete. Reuses the complete Ctrl+X path.
+func context_cut() -> void:
+	_on_cut()
+
+
+# Delete the current selection (texts + DD assets + walls) without copying.
+func context_delete() -> void:
+	if select_tool == null:
+		return
+	var tt = _tt()
+	var has_texts = tt != null and tt._selected_texts.size() > 0
+	var raw = select_tool.RawSelectables
+	var has_walls = _has_selected_walls(raw)
+	var has_copyable = select_tool.HasCopyable
+	if has_texts:
+		tt._delete_selection()
+	if has_copyable or has_walls:
+		select_tool.Delete()
+	_hide_previews()
+
+
+# Paste at an explicit world position (the spot the user right-clicked).
+func context_paste_at(world_pos: Vector2) -> void:
+	_ctx_paste_world_pos = world_pos
+	_ctx_has_paste_world_pos = true
+	_flush_pending_copy_check()
+	_ctx_paste_mode = 1
+	_trigger_native_paste()
+
+
+# Paste in place (at the copied items' original positions).
+func context_paste_in_place() -> void:
+	_flush_pending_copy_check()
+	_ctx_paste_mode = 0
+	_trigger_native_paste()
+
+
+# Fire DD's native paste by pressing the SelectToolPanel pasteButton, whose
+# "pressed" signal is wired to DD's native Paste(). Our own hooks
+# (_on_paste_button_down / _on_paste_button_pressed) run around it, exactly as
+# for a real click — that's why the reposition/in-place machinery still fires.
+func _trigger_native_paste() -> void:
+	if _g == null or _g.get("Editor") == null or _g.Editor.get("Toolset") == null:
+		_ctx_paste_mode = 0
+		_ctx_has_paste_world_pos = false
+		return
+	var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+	if panel == null or not is_instance_valid(panel):
+		_ctx_paste_mode = 0
+		_ctx_has_paste_world_pos = false
+		return
+	var paste_btn = panel.get("pasteButton")
+	if paste_btn == null or not is_instance_valid(paste_btn) or not (paste_btn is BaseButton):
+		_ctx_paste_mode = 0
+		_ctx_has_paste_world_pos = false
+		return
+	paste_btn.emit_signal("button_down")
+	paste_btn.emit_signal("pressed")
+
 
 func _on_paste_in_place() -> void:
 	if not _has_copy_center and not _has_wall_clipboard:
@@ -963,10 +1416,16 @@ func _on_paste_in_place() -> void:
 
 func _on_paste() -> void:
 	_paste_in_place = false
+	# Context-menu "Paste": use the world position captured at right-click
+	# time (the void/selection spot the user clicked), regardless of the
+	# "Paste Under Cursor" toggle — the user pointed at where they want it.
+	if _ctx_has_paste_world_pos:
+		_paste_cursor_target = _ctx_paste_world_pos
+		_ctx_has_paste_world_pos = false
 	# Toggle: when "Paste Under Cursor" is OFF, paste at the center of the
 	# screen — that's vanilla DD's behavior. (NOT _copy_center, which would
 	# reproduce paste-in-place / Ctrl+Shift+V semantics.)
-	if _is_paste_under_cursor_enabled():
+	elif _is_paste_under_cursor_enabled():
 		_paste_cursor_target = _mouse_world_pos
 	else:
 		_paste_cursor_target = _get_screen_center_world()
@@ -1050,8 +1509,83 @@ func _compute_snap_delta(raw, pasted_walls := []) -> Vector2:
 	return deltas[best_key].delta
 
 
+# ══ Transfert des bases miroir des lights (copy → paste) ═══════════════════
+# La symétrie Free Transform pose une base réfléchie (det < 0) sur les
+# lights. DD ne sérialise que position + rotation au copy : la light collée
+# perd le miroir. On capture les bases au Ctrl+C (alignées par node_id
+# croissant) et on les réapplique aux lights collées (même tri = ordre de
+# création = ordre de collage, comme le pont CMT), en réécrivant aussi
+# l'entrée _ft_transforms sous le NOUVEAU node_id pour la persistance map.
+
+func _capture_light_bases(raw) -> void:
+	_light_basis_clipboard = []
+	var lights := []
+	for s in raw:
+		if s == null or s.Thing == null or not is_instance_valid(s.Thing):
+			continue
+		if s.Thing is Light2D and s.Thing.has_meta("node_id"):
+			lights.append(s.Thing)
+	if lights.empty():
+		return
+	lights.sort_custom(self, "_cmt_sort_by_node_id")
+	for l in lights:
+		var t = l.transform
+		var det = t.x.x * t.y.y - t.x.y * t.y.x
+		if det < 0.0:
+			_light_basis_clipboard.append([t.x.x, t.x.y, t.y.x, t.y.y])
+		else:
+			_light_basis_clipboard.append(null)
+
+
+func _apply_light_bases_to_pasted() -> void:
+	if _light_basis_clipboard.empty():
+		return
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return
+	var lights := []
+	for s in raw:
+		if s == null or s.Thing == null or not is_instance_valid(s.Thing):
+			continue
+		if s.Thing is Light2D and s.Thing.has_meta("node_id"):
+			lights.append(s.Thing)
+	# Garde anti-collage étranger : les comptes doivent correspondre à la
+	# dernière copie, sinon le presse-papiers ne vient pas de chez nous.
+	if lights.size() != _light_basis_clipboard.size():
+		return
+	lights.sort_custom(self, "_cmt_sort_by_node_id")
+	if not _g.ModMapData.has("_ft_transforms"):
+		_g.ModMapData["_ft_transforms"] = {}
+	var store = _g.ModMapData["_ft_transforms"]
+	var applied := 0
+	for i in range(lights.size()):
+		var b = _light_basis_clipboard[i]
+		if b == null:
+			continue
+		var l = lights[i]
+		l.transform = Transform2D(
+			Vector2(b[0], b[1]),
+			Vector2(b[2], b[3]),
+			l.position
+		)
+		# ox/oy : la position bouge encore juste après (déplacement vers
+		# le curseur) — le reapply de free_transform replie l'origine
+		# depuis node.position à chaque frame, donc l'entrée se met à
+		# jour toute seule.
+		store["node-id-" + str(l.get_meta("node_id"))] = {
+			"xx": b[0], "xy": b[1],
+			"yx": b[2], "yy": b[3],
+			"ox": l.position.x, "oy": l.position.y,
+		}
+		applied += 1
+	if applied > 0:
+		print("[ClipboardFix] Mirror basis re-applied to %d pasted light(s)" % applied)
+
+
 func _move_pasted_items_to_cursor() -> void:
+	_text_extra_offset = Vector2.ZERO
 	_move_pasted_texts_to_cursor()
+	_apply_light_bases_to_pasted()
 
 	var pasted_walls = _paste_walls_from_clipboard()
 
@@ -1124,6 +1658,15 @@ func _move_pasted_items_to_cursor() -> void:
 			for wall in pasted_walls:
 				if is_instance_valid(wall):
 					wall.Offset(snap_delta)
+			
+			# Garder les textes collés alignés avec les assets/murs snappés.
+			# _text_extra_offset est ré-appliqué par le settle des textes.
+			_text_extra_offset += snap_delta
+			var _tt_snap = _tt()
+			if _tt_snap != null:
+				for t in _tt_snap._selected_texts:
+					if is_instance_valid(t):
+						t.rect_position += snap_delta
 			
 			print("[ClipboardFix] Instant snap at paste: %s" % str(snap_delta))
 
@@ -1209,6 +1752,8 @@ func _paste_walls_from_clipboard() -> Array:
 		)
 		if wall == null:
 			continue
+		if snap.has("portals"):
+			_recreate_portals(wall, snap["portals"])
 		new_walls.append(wall)
 
 	if new_walls.size() > 0:
@@ -1283,6 +1828,8 @@ func _recreate_walls(snaps: Array) -> Array:
 					registered = true
 			if not registered:
 				_g.World.AssignNodeID(wall)
+		if snap.has("portals"):
+			_recreate_portals(wall, snap["portals"])
 		new_walls.append(wall)
 	return new_walls
 
@@ -1293,6 +1840,19 @@ func _destroy_walls(walls: Array) -> void:
 	for w in walls:
 		if w == null or not is_instance_valid(w):
 			continue
+		# Detacher + liberer les portals AVANT de retirer le wall, sinon
+		# crash "Parent node is busy" (meme pattern que portal_flatten_curves).
+		# Liste copiee car on mute le child set du wall dans la boucle.
+		var portals_list = w.get("Portals")
+		if portals_list != null:
+			var to_remove = []
+			for p in portals_list:
+				if p != null and is_instance_valid(p):
+					to_remove.append(p)
+			for p in to_remove:
+				if p.get_parent() != null:
+					p.get_parent().remove_child(p)
+				p.free()
 		var parent = w.get_parent()
 		if parent != null and is_instance_valid(parent):
 			parent.remove_child(w)
@@ -1441,32 +2001,85 @@ func _text_cut(tt: Object) -> void:
 	print("[ClipboardFix] Text cut done")
 
 
+# The visual (trimmed) centre of a text node, matching text_transform's own
+# hit-test/bbox logic (_text_aabb accounts for alignment padding and rotation).
+# The raw Control box (rect_size) is often much wider than the visible glyphs;
+# centring that box on the cursor pushes the visible text far to the side.
+func _text_visual_center(tt, t) -> Vector2:
+	if tt != null and tt.has_method("_text_aabb"):
+		var bb = tt.call("_text_aabb", t)
+		if bb is Rect2:
+			return bb.position + bb.size * 0.5
+	return t.rect_position + t.rect_size * t.rect_scale * 0.5
+
+
 func _save_text_copy_center(tt: Object) -> void:
 	var center = Vector2.ZERO
 	var count = 0
 	for t in tt._selected_texts:
 		if is_instance_valid(t):
-			center += t.rect_position + t.rect_size * t.rect_scale * 0.5
+			center += _text_visual_center(tt, t)
 			count += 1
+	_text_copy_offset = Vector2.ZERO
+	_has_text_copy_center = false
 	if count > 0:
-		_copy_center = center / count
+		_text_copy_center = center / count
+		_has_text_copy_center = true
+		# Texte-seul : ce centre sert de centre de copie. En mixte, le centre
+		# des assets DD l'écrasera et l'offset sera calculé dans _save_copy_center.
+		_copy_center = _text_copy_center
 		_has_copy_center = true
 
 
-func _move_pasted_texts_to_cursor() -> void:
+func _move_pasted_texts_to_cursor(is_resettle := false) -> void:
 	var tt = _tt()
 	if tt == null or tt._selected_texts.size() == 0: return
+	# First (non-resettle) call arms the settle window: re-apply this move on
+	# the next few frames so text_transform's deferred position timer can't
+	# leave the text stranded at its original spot.
+	if not is_resettle:
+		_text_settle_frames = 6
 	var texts = tt._selected_texts
 	var center = Vector2.ZERO
 	var count = 0
 	for t in texts:
 		if is_instance_valid(t):
-			center += t.rect_position + t.rect_size * t.rect_scale * 0.5
+			center += _text_visual_center(tt, t)
 			count += 1
 	if count == 0: return
 	center /= count
-	var target = _paste_cursor_target if not _paste_in_place else _copy_center
+	# Desired text-group center, in the text's own (viewport canvas) space.
+	var target: Vector2
+	if _paste_in_place:
+		# Return the group exactly to where it was copied.
+		target = _text_copy_center
+	elif _text_paste_mixed:
+		# Follow the DD asset/wall group. A displacement is identical in WorldUI
+		# and canvas space (they differ only by a translation), so no space
+		# conversion is needed here: _text_copy_center is canvas space and
+		# (_paste_cursor_target - _copy_center) is a WorldUI displacement that
+		# equals the canvas one.
+		target = _text_copy_center + (_paste_cursor_target - _copy_center)
+	else:
+		# Text-only: place the group at the paste target. _paste_cursor_target
+		# is WorldUI space; text lives in canvas space (drifts by a fixed
+		# UI-scale/DPI offset), so bridge with the measured offset. Without this
+		# the text lands ~(drift) away — off the map.
+		target = _paste_cursor_target + _text_space_offset()
+	target += _text_extra_offset
 	var delta = target - center
+	# --- DIAGNOSTIC (temporary) ---
+	if not is_resettle:
+		var _dbg_first := "?"
+		for t in texts:
+			if is_instance_valid(t):
+				_dbg_first = str(t.rect_position) + " size=" + str(t.rect_size) + " scale=" + str(t.rect_scale)
+				break
+		print("[ClipboardFix][DBG] in_place=%s mixed=%s | vis_center=%s target=%s delta=%s | paste_target=%s first_text=%s" % [
+			str(_paste_in_place), str(_text_paste_mixed),
+			str(center), str(target), str(delta),
+			str(_paste_cursor_target), _dbg_first])
+	# --- END DIAGNOSTIC ---
 	if delta.length() < 1.0: return
 	var ttf = _g.ModMapData.get("_ttf_handler")
 	for t in texts:
@@ -1474,3 +2087,25 @@ func _move_pasted_texts_to_cursor() -> void:
 		t.rect_position += delta
 		if ttf: ttf.update_anchor_after_move(t)
 	print("[ClipboardFix] Moved %d texts by %s" % [count, str(delta)])
+
+
+# Offset to add to a WorldUI-space point to obtain its position in the text
+# viewport's canvas space. text_transform places texts using
+# vp.canvas_transform.affine_inverse().xform(mouse); that space drifts from
+# WorldUI.MousePosition by a fixed UI-scale/DPI translation. The mouse position
+# cancels out (both terms describe the same point), so the result is
+# independent of where the cursor currently is.
+func _text_space_offset() -> Vector2:
+	if _g == null or _g.get("WorldUI") == null:
+		return Vector2.ZERO
+	var tt = _tt()
+	if tt == null:
+		return Vector2.ZERO
+	var vpath = tt.get("_viewport_path")
+	if vpath == null:
+		return Vector2.ZERO
+	var vp = _g.World.get_tree().root.get_node_or_null(vpath)
+	if vp == null or not is_instance_valid(vp):
+		return Vector2.ZERO
+	var canvas_mouse = vp.canvas_transform.affine_inverse().xform(vp.get_mouse_position())
+	return canvas_mouse - _g.WorldUI.MousePosition

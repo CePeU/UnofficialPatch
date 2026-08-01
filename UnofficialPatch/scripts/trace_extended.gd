@@ -217,8 +217,17 @@ func _unhandled_input(event) -> void:
 		handler._on_scroll(event)
 """
 	script.reload()
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_trace_listener"):
+		var _old_n = Engine.get_meta("up_trace_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	_input_listener = Node.new()
 	_input_listener.name = "TraceExtendedListener"
+	Engine.set_meta("up_trace_listener", _input_listener)
 	_input_listener.set_script(script)
 	_input_listener.handler = self
 	if _g.World and _g.World is Node:

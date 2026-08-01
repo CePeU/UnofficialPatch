@@ -38,8 +38,17 @@ func _is_lt_object_tool_like_enabled() -> bool:
 	return ms.is_enabled("light_tool_object_like")
 
 func _install_input_listener():
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_lighttool_listener"):
+		var _old_n = Engine.get_meta("up_lighttool_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	input_listener = Node.new()
 	input_listener.name = "LightToolFixListener"
+	Engine.set_meta("up_lighttool_listener", input_listener)
 	var listener_script = GDScript.new()
 	listener_script.source_code = """extends Node
 var handler = null
@@ -318,6 +327,21 @@ func _snap_preview_to_grid():
 func _cache_style_item_list():
 	if _lt_item_list and is_instance_valid(_lt_item_list):
 		return
+	
+	# Tool.Controls first: library_right_panel can move the style list out of
+	# the LightTool panel, and it is also more precise than picking index 1 of
+	# whatever ItemLists the panel happens to contain.
+	var tools = _g.Editor.get("Tools")
+	if tools and tools is Dictionary:
+		var lt = tools.get("LightTool")
+		if lt and is_instance_valid(lt):
+			var controls = lt.get("Controls")
+			if controls and controls is Dictionary:
+				var c = controls.get("Texture")
+				if c and is_instance_valid(c) and c is ItemList:
+					_lt_item_list = c
+					return
+	
 	var lt_panel = _g.Editor.Toolset.GetToolPanel("LightTool")
 	if lt_panel:
 		var all_lists = []

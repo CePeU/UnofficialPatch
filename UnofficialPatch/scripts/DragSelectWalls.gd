@@ -27,9 +27,17 @@ var _was_drawing := false
 var _last_box_begin = Vector2.ZERO
 var _last_box_end = Vector2.ZERO
 var _highlighted_walls := []
+var _highlighted_portals := []
 var _deferred_frames := -1
 var _deferred_box_start = Vector2.ZERO
 var _deferred_box_end = Vector2.ZERO
+# Shift+Alt drag-select box → deselect (remove from selection) instead
+# of adding. Mirrors alt_deselect.gd's Shift+Alt box-deselect combo,
+# which only handles native assets and never touches walls/portals.
+# _drag_deselect_sampled is refreshed each drawing frame; _deferred_deselect
+# latches the intent at drag end for the deferred selection pass.
+var _drag_deselect_sampled := false
+var _deferred_deselect := false
 
 # --- Group-transform state ---
 var _transforming := false
@@ -101,6 +109,8 @@ var _ci_scale_sy: float = 1.0
 # uniform-vs-non-uniform branch flip intermittently.
 var _ci_shift_held: bool = false
 var _ci_things: Array = []  # [{thing, type, snap}, ...]
+var _ci_tt = null           # instance text_transform si des textes suivent ce drag
+var _last_tt_sig := 0       # signature de la sélection de textes (re-fit de la box)
 # List of {node, was_visible} for dashed selection-indicator children
 # we hid during the drag; restored when the drag ends. Identified by
 # their `dotted_line.png` texture path. Hiding them avoids a desync
@@ -117,6 +127,10 @@ var _ci_box_half_size_initial: Vector2 = Vector2.ZERO
 var _ci_box_corner_initial: Vector2 = Vector2.ZERO  # initial world position of the dragged corner (scale only)
 
 const OVERLAY_COLOR = Color(0.18, 0.62, 1.0, 0.95)
+# Wall drag-highlight tints: blue while the box will SELECT walls,
+# red while a Shift+Alt box will REMOVE them from the selection.
+const HIGHLIGHT_SELECT_COLOR = Color(0.5, 0.7, 1.0, 1.0)
+const HIGHLIGHT_DESELECT_COLOR = Color(1.0, 0.5, 0.5, 1.0)
 const OVERLAY_WIDTH = 2.0
 const HANDLE_SCREEN_PX = 23.0   # default handle visual size (DD's handle_round.png is 23x23)
 const HANDLE_LINE_WIDTH = 2.0   # thickness of the white square outline at zoom=1
@@ -236,24 +250,41 @@ func _update_highlights() -> void:
 	if level == null:
 		return
 
+	# Shift+Alt drag → we'll REMOVE walls in the box, so tint them red and
+	# restrict the highlight to walls actually in the current selection
+	# (the only ones a removal affects). Otherwise, blue "will-select" tint.
+	var deselect = Input.is_key_pressed(KEY_ALT) and Input.is_key_pressed(KEY_SHIFT)
+	var selected_walls := {}
+	if deselect:
+		var sel = select_tool.get("Selected")
+		if sel != null:
+			for node in sel:
+				if node != null and is_instance_valid(node):
+					selected_walls[node] = true
+
 	var walls_in_box := []
 	for wall in level.Walls.get_children():
-		if is_wall_in_box(wall, box[0], box[1]):
-			walls_in_box.append(wall)
+		if not is_wall_in_box(wall, box[0], box[1]):
+			continue
+		if deselect and not selected_walls.has(wall):
+			continue
+		walls_in_box.append(wall)
 
 	for wall in _highlighted_walls:
 		if is_instance_valid(wall) and not (wall in walls_in_box):
 			_unhighlight_wall(wall)
+	# Re-apply the tint every frame (not just on entry) so it flips live
+	# when the user presses / releases Shift+Alt mid-drag.
 	for wall in walls_in_box:
-		if not (wall in _highlighted_walls):
-			_highlight_wall(wall)
+		_set_wall_highlight(wall, deselect)
 	_highlighted_walls = walls_in_box
 
 
-func _highlight_wall(wall) -> void:
+func _set_wall_highlight(wall, deselect: bool) -> void:
+	var col = HIGHLIGHT_DESELECT_COLOR if deselect else HIGHLIGHT_SELECT_COLOR
 	for child in wall.get_children():
 		if child is Line2D:
-			child.modulate = Color(0.5, 0.7, 1.0, 1.0)
+			child.modulate = col
 
 func _unhighlight_wall(wall) -> void:
 	for child in wall.get_children():
@@ -268,6 +299,81 @@ func _clear_highlights() -> void:
 
 #########################################################################################################
 ##
+## PORTAL HIGHLIGHT DURING DRAG-SELECT
+##
+##  Live feedback while the box is being dragged: wall portals whose world
+##  center enters the box light up in the blue SELECT color, mirroring the wall
+##  drag highlight and matching how they look once committed. DD skips
+##  HighlightThingAtPoint while drawing, so we own this feedback entirely — no
+##  conflict with DD's native hover. We drive Portal.Select() as a purely visual
+##  flag (it does not touch the tool's real selection), and never touch portals
+##  already in the real selection, so their committed box stays intact.
+##
+#########################################################################################################
+
+func _update_portal_highlights() -> void:
+	if not _is_portal_filter_active():
+		_clear_portal_highlights()
+		return
+	# In Shift+Alt (deselect) mode we don't paint a transient blue "will
+	# select" highlight — it would be misleading. Portals already in the
+	# real selection keep their own blue box; removal happens on release.
+	if Input.is_key_pressed(KEY_ALT) and Input.is_key_pressed(KEY_SHIFT):
+		_clear_portal_highlights()
+		return
+	var box = _normalize_box(select_tool.boxBegin, select_tool.boxEnd)
+	if box[0].distance_to(box[1]) < MIN_DISTANCE:
+		_clear_portal_highlights()
+		return
+	var level = _g.World.GetCurrentLevel()
+	if level == null:
+		return
+	var walls_node = level.get("Walls")
+	if walls_node == null:
+		return
+	# We draw the drag-time feedback in the blue SELECT color, not the yellow
+	# HIGHLIGHT color, to match how the portals look once the selection is
+	# committed (and to match the wall drag-highlight). Portal._Draw uses the
+	# blue SelectionSelectColor when isSelected is set, so we drive Select() as a
+	# purely visual flag here — it does NOT add the portal to the tool's real
+	# selection (that still happens in the deferred _add_portals_to_selection).
+	# Portals already in the real selection are left untouched (already blue).
+	var already = select_tool.Selected
+	var want := []
+	for wall in walls_node.get_children():
+		if wall == null or not is_instance_valid(wall):
+			continue
+		var portals = wall.get("Portals")
+		if portals == null:
+			continue
+		for portal in portals:
+			if not _is_portal_in_box(portal, box[0], box[1]):
+				continue
+			if already != null and already.has(portal):
+				continue
+			want.append(portal)
+	for portal in _highlighted_portals:
+		if is_instance_valid(portal) and not (portal in want):
+			if portal.has_method("Select"):
+				portal.Select(false)
+	for portal in want:
+		if not (portal in _highlighted_portals):
+			if portal.has_method("Select"):
+				portal.Select(true)
+	_highlighted_portals = want
+
+
+func _clear_portal_highlights() -> void:
+	# Only clears the purely-visual Select flag we set during the drag; portals
+	# genuinely in the tool selection were never in _highlighted_portals, so
+	# their real selection box is untouched.
+	for portal in _highlighted_portals:
+		if is_instance_valid(portal) and portal.has_method("Select"):
+			portal.Select(false)
+	_highlighted_portals = []
+
+#########################################################################################################
+##
 ## WALL ADDITION (deferred after DD finishes drag-select)
 ##
 #########################################################################################################
@@ -277,6 +383,11 @@ func _add_walls_to_selection() -> void:
 		return
 	var level = _g.World.GetCurrentLevel()
 	if level == null:
+		return
+	# Shift+Alt drag → remove walls in the box from the selection instead
+	# of adding them (mirrors alt_deselect.gd's native box-deselect).
+	if _deferred_deselect:
+		_deselect_walls_in_box(level)
 		return
 	var added = 0
 	for wall in level.Walls.get_children():
@@ -301,6 +412,194 @@ func _add_walls_to_selection() -> void:
 			var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
 			if panel != null and panel.has_method("OnSelect"):
 				panel.OnSelect(SELECTABLE_WALL)
+
+#########################################################################################################
+##
+## PORTAL ADDITION (deferred after DD finishes drag-select)
+##
+##  DD's SelectThingsInsideBox already box-selects FREESTANDING portals
+##  (World.Level.Portals, tested on portal.Position). What it never touches are
+##  WALL portals: those live in each wall's own Portals array (their parent is
+##  the wall, not level.Portals), so vanilla can only pick them by clicking.
+##  That's the gap we fill here — after DD finishes its box, we add every wall
+##  portal whose world center falls inside the box.
+##
+##  We box-test on portal.global_position (world), NOT portal.position, because
+##  a wall portal's position is local to its parent wall. SelectThing routes
+##  through GetSelectableType(), which returns PortalWall for a non-freestanding
+##  portal, so the selection gets the correct type.
+##
+#########################################################################################################
+
+# True if the SelectTool "Portals" type filter is enabled. Filter reaches
+# GDScript only as a copy, but reading it is fine (we never write it here).
+func _is_portal_filter_active() -> bool:
+	var filter = select_tool.get("Filter")
+	if typeof(filter) != TYPE_DICTIONARY:
+		return true
+	if not filter.has("Portals"):
+		return true
+	return bool(filter["Portals"])
+
+
+func _is_portal_in_box(portal, start: Vector2, end: Vector2) -> bool:
+	if portal == null or not is_instance_valid(portal) or not (portal is Node2D):
+		return false
+	var p = portal.global_position
+	return p.x >= start.x and p.x <= end.x and p.y >= start.y and p.y <= end.y
+
+
+func _add_portals_to_selection() -> void:
+	if not _is_portal_filter_active():
+		return
+	var level = _g.World.GetCurrentLevel()
+	if level == null:
+		return
+	var walls_node = level.get("Walls")
+	if walls_node == null:
+		return
+	# Shift+Alt drag → remove wall portals in the box instead of adding.
+	if _deferred_deselect:
+		_deselect_portals_in_box(walls_node)
+		return
+	# Snapshot the current selection once (Selected rebuilds a List each read),
+	# so we can skip wall portals DD may already hold without O(n^2) property hits.
+	var already = select_tool.Selected
+	var added = 0
+	for wall in walls_node.get_children():
+		if wall == null or not is_instance_valid(wall):
+			continue
+		var portals = wall.get("Portals")
+		if portals == null:
+			continue
+		for portal in portals:
+			if not _is_portal_in_box(portal, _deferred_box_start, _deferred_box_end):
+				continue
+			if already != null and already.has(portal):
+				continue
+			select_tool.SelectThing(portal, true)
+			added += 1
+	if added == 0:
+		return
+	outputlog("Added %d wall portal(s) to selection" % added)
+	# Refresh the panel only when the selection is exclusively portals, so we
+	# don't override controls already shown for a mixed selection (e.g. an
+	# object selected before the drag).
+	var only_portals = true
+	var raw = select_tool.RawSelectables
+	if raw != null:
+		for s in raw:
+			if s == null:
+				continue
+			if s.Type != SELECTABLE_PORTAL_FREE and s.Type != SELECTABLE_PORTAL_WALL:
+				only_portals = false
+				break
+	if only_portals:
+		var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+		if panel != null and panel.has_method("OnSelect"):
+			panel.OnSelect(SELECTABLE_PORTAL_WALL)
+
+#########################################################################################################
+##
+## BOX DESELECT (Shift+Alt drag) — remove walls / wall portals in the box
+##
+##  Runs in the same deferred pass as the add functions, a couple frames after
+##  alt_deselect.gd has already box-removed the native assets. We only touch
+##  Things already in the selection so a Shift+Alt drag over empty space (or
+##  over unselected walls) is a no-op.
+##
+#########################################################################################################
+
+func _deselect_walls_in_box(level) -> void:
+	var selected_walls := {}
+	var sel = select_tool.get("Selected")
+	if sel != null:
+		for node in sel:
+			if node != null and is_instance_valid(node):
+				selected_walls[node] = true
+	var removed = 0
+	for wall in level.Walls.get_children():
+		if not selected_walls.has(wall):
+			continue
+		if is_wall_in_box(wall, _deferred_box_start, _deferred_box_end):
+			# Reset transformMode before shrinking the selection to avoid
+			# DD's ApplyTransforms crash (same guard alt_deselect.gd uses).
+			select_tool.transformMode = 0
+			select_tool.SelectThing(wall, false)
+			removed += 1
+	if removed == 0:
+		return
+	outputlog("Removed %d wall(s) from selection" % removed)
+	_refresh_panel_after_deselect()
+
+
+func _deselect_portals_in_box(walls_node) -> void:
+	var selected := {}
+	var sel = select_tool.get("Selected")
+	if sel != null:
+		for node in sel:
+			if node != null and is_instance_valid(node):
+				selected[node] = true
+	var removed = 0
+	for wall in walls_node.get_children():
+		if wall == null or not is_instance_valid(wall):
+			continue
+		var portals = wall.get("Portals")
+		if portals == null:
+			continue
+		for portal in portals:
+			if not selected.has(portal):
+				continue
+			if _is_portal_in_box(portal, _deferred_box_start, _deferred_box_end):
+				select_tool.transformMode = 0
+				select_tool.SelectThing(portal, false)
+				removed += 1
+	if removed == 0:
+		return
+	outputlog("Removed %d wall portal(s) from selection" % removed)
+	_refresh_panel_after_deselect()
+
+
+# Shared cleanup after a box-deselect removed walls / portals: prune stale
+# initialRelativeTransforms entries, disable the box when nothing remains,
+# and refresh the panel for the remaining (uniform-type) selection.
+func _refresh_panel_after_deselect() -> void:
+	var irt = select_tool.get("initialRelativeTransforms")
+	if irt != null:
+		var valid := {}
+		for s in select_tool.RawSelectables:
+			valid[s] = true
+		var to_remove := []
+		for key in irt.keys():
+			if not valid.has(key):
+				to_remove.append(key)
+		for key in to_remove:
+			irt.erase(key)
+	var sel = select_tool.get("Selected")
+	var remaining = 0
+	if sel != null:
+		remaining = sel.size()
+	if remaining == 0:
+		select_tool.EnableTransformBox(false)
+		select_tool.DeselectAll()
+		return
+	# Determine a uniform selection type; OnSelect(0) on a mixed selection
+	# is a no-op, so we leave the panel as-is in that case.
+	var raw = select_tool.RawSelectables
+	var uniform_type := -1
+	if raw != null:
+		for s in raw:
+			if s == null:
+				continue
+			if uniform_type == -1:
+				uniform_type = s.Type
+			elif s.Type != uniform_type:
+				uniform_type = 0
+				break
+	if uniform_type > 0:
+		var panel = _g.Editor.Toolset.GetToolPanel("SelectTool")
+		if panel != null and panel.has_method("OnSelect"):
+			panel.OnSelect(uniform_type)
 
 #########################################################################################################
 ##
@@ -438,7 +737,10 @@ func _snapshot_wall(wall) -> Dictionary:
 # Apply a world-space Transform2D W to a wall using its pre-drag snapshot.
 # Note: we only move / rotate positions. We never scale wall thickness
 # nor sprite end-cap scale (per design — texture stays unchanged).
-func _apply_transform_to_wall(wall, snap: Dictionary, W: Transform2D) -> void:
+# remake_lines : les appelants qui appliquent la transformation à chaque
+# frame (drag des handles FT) passent false et déclenchent un unique
+# RemakeLines au commit — même optimisation que notre _ci_mode.
+func _apply_transform_to_wall(wall, snap: Dictionary, W: Transform2D, remake_lines := true) -> void:
 	# get_rotation() returns a spurious non-zero angle for a NON-UNIFORM
 	# scale applied around a rotated frame, because the basis (still
 	# symmetric, no actual rotation) projects onto a non-axis vector.
@@ -508,7 +810,7 @@ func _apply_transform_to_wall(wall, snap: Dictionary, W: Transform2D) -> void:
 	# drag. During a drag we apply transforms 60 times per second, and
 	# RemakeLines() is expensive (especially for walls with portals).
 	# We trigger a single RemakeLines at the end of the drag instead.
-	if _ci_mode == 0:
+	if remake_lines and _ci_mode == 0:
 		if wall.has_method("RemakeLines"):
 			wall.RemakeLines()
 		elif wall.has_method("RemakeLinesWhenAllPortalsReady"):
@@ -1122,6 +1424,10 @@ func rotate_selection_around(degrees: float, pivot: Vector2) -> void:
 	# Keep the locked overlay box rotated with the content (when active).
 	if _box_initialized:
 		box_rotate(rad, pivot)
+	# Textes sélectionnés (text_transform) : rotation identique, commit immédiat.
+	var tt_rot = _tt_mixed()
+	if tt_rot != null and tt_rot.has_method("dsw_apply_instant_W"):
+		tt_rot.dsw_apply_instant_W(W)
 	if record.wall_entries.size() > 0 or record.non_wall_entries.size() > 0:
 		_push_history_record(record)
 
@@ -1551,6 +1857,16 @@ func _is_wall_transform_enabled() -> bool:
 	return ms.is_enabled("wall_move_transform")
 
 
+# Vrai quand Free Transform est actif. La custom transform box des walls
+# est alors coupée (overlay + interactions) : c'est la box verte de FT qui
+# englobe les walls (visuel seul, transfos walls via la symétrie du menu
+# FT). Le drag-select et l'ajout différé des walls restent actifs.
+func _is_ft_active() -> bool:
+	if _g == null or not (_g.ModMapData is Dictionary):
+		return false
+	return bool(_g.ModMapData.get("_free_transform_active", false))
+
+
 # Mod-settings toggle "Snap Resize" (id: snap_resize_shift). When OFF,
 # Shift+resize falls back to plain uniform scale — no aspect-ratio
 # unlock, no grid snap. Used by both DragSelectWalls (custom box) and
@@ -1609,6 +1925,24 @@ func _box_world_to_local(world_pos: Vector2) -> Vector2:
 	var c := cos(-_box_rotation)
 	var s := sin(-_box_rotation)
 	return Vector2(c * v.x - s * v.y, s * v.x + c * v.y)
+
+
+# text_transform (Unofficial Patch) : instance publiée dans ModMapData.
+# Renvoie l'instance si des textes sont sélectionnés (bbox non vide) et que
+# les hooks dsw_* sont présents, sinon null. Sert à intégrer les textes à la
+# box custom : fit de l'AABB + application du même W pendant les drags.
+func _tt_mixed():
+	if not (_g.ModMapData is Dictionary):
+		return null
+	var tt = _g.ModMapData.get("_ttf_transform")
+	if tt == null or not (tt is Object) or not is_instance_valid(tt):
+		return null
+	if not tt.has_method("dsw_get_texts_bbox") or not tt.has_method("dsw_apply_W"):
+		return null
+	var bb = tt.dsw_get_texts_bbox()
+	if bb is Rect2 and bb.size != Vector2.ZERO:
+		return tt
+	return null
 
 
 # Build a current-selection set keyed by Thing instance ID. Used both
@@ -1701,11 +2035,16 @@ func _update_overlay() -> void:
 		_last_combined = Rect2()
 		_box_initialized = false
 		_last_selection_set = {}
+		_last_tt_sig = 0
 		return
 	# Detect selection change → re-fit. We use _selection_changed() (which
 	# compares Thing IDs) rather than always recomputing, so the box keeps
 	# its rotation/position across move/scale/rotate operations.
-	var sel_changed = _selection_changed()
+	# La sélection de TEXTES (text_transform) déclenche aussi un re-fit : les
+	# textes font partie de la box custom mais pas de RawSelectables.
+	var tt_fit = _tt_mixed()
+	var tt_sig = tt_fit.dsw_get_texts_signature() if (tt_fit != null and tt_fit.has_method("dsw_get_texts_signature")) else 0
+	var sel_changed = _selection_changed() or tt_sig != _last_tt_sig
 	if sel_changed or not _box_initialized:
 		var walls_rect: Rect2 = _compute_walls_aabb(walls)
 		if walls_rect.size == Vector2.ZERO:
@@ -1720,11 +2059,17 @@ func _update_overlay() -> void:
 			var nw_rect: Rect2 = _compute_non_walls_aabb()
 			if nw_rect.size != Vector2.ZERO:
 				combined = combined.merge(nw_rect)
+		# Textes sélectionnés (text_transform) : inclus dans la box custom.
+		if tt_fit != null:
+			var tt_rect = tt_fit.dsw_get_texts_bbox()
+			if tt_rect is Rect2 and tt_rect.size != Vector2.ZERO:
+				combined = combined.merge(tt_rect)
 		_box_pos = combined.position + combined.size * 0.5
 		_box_half_size = combined.size * 0.5
 		_box_rotation = 0.0
 		_box_initialized = true
 		_last_selection_set = _build_selection_set()
+		_last_tt_sig = tt_sig
 	# Compute world AABB of the (possibly rotated) box for hit testing
 	# convenience and external callers that read _last_combined.center.
 	_last_combined = _box_world_aabb()
@@ -2112,6 +2457,11 @@ func _custom_start_drag(world_pos: Vector2, hit: Dictionary) -> void:
 	# Keep DD's transformMode at None — we drive the transform ourselves.
 	select_tool.transformMode = 0
 
+	# Textes sélectionnés (text_transform) : ils suivent la box custom.
+	_ci_tt = _tt_mixed()
+	if _ci_tt != null and _ci_tt.has_method("dsw_begin_transform"):
+		_ci_tt.dsw_begin_transform()
+
 
 # Build the world-space transform W from the current mouse position
 # given the active drag mode + initial state. Returns identity if nothing
@@ -2338,6 +2688,10 @@ func _custom_apply_W(W: Transform2D) -> void:
 			)
 			_box_rotation = _ci_box_rotation_initial
 
+	# Textes sélectionnés (text_transform) : même W que le reste de la sélection.
+	if _ci_tt != null and is_instance_valid(_ci_tt) and _ci_tt.has_method("dsw_apply_W"):
+		_ci_tt.dsw_apply_W(W, _ci_mode, _ci_scale_sx, _ci_scale_sy, _ci_shift_held)
+
 
 func _custom_drag_motion(world_pos: Vector2) -> void:
 	if _ci_mode == 0:
@@ -2384,6 +2738,11 @@ func _custom_end_drag() -> void:
 	# at its pre-drag position until something (mouse hover) makes DD
 	# refresh its selection visuals.
 	_restore_dashed_selection_children()
+	# Commit des textes suivis (dataOnFocus + persistance + undo côté
+	# text_transform, en parallèle de notre GroupTransformRecord).
+	if _ci_tt != null and is_instance_valid(_ci_tt) and _ci_tt.has_method("dsw_end_transform"):
+		_ci_tt.dsw_end_transform()
+	_ci_tt = null
 	_g.ModMapData["_drag_select_walls_active"] = false
 	# Clear our custom cursor; the next on_process tick will pick the
 	# right hover cursor based on where the mouse is.
@@ -2573,6 +2932,10 @@ func on_input(event) -> void:
 	# qui n'a pas besoin de capturer les inputs ici.
 	if not _is_wall_transform_enabled():
 		return
+	# FT actif : la custom box est remplacée par la box verte de FT, on
+	# ne capture donc aucun input ici (pas de drag move/rotate/scale).
+	if _is_ft_active():
+		return
 	if event is InputEventMouseMotion:
 		_mouse_world = _screen_to_world(event.position)
 		if _ci_mode > 0:
@@ -2656,6 +3019,7 @@ func _on_process_impl(_delta):
 	if _g.Editor.ActiveToolName != "SelectTool":
 		if _was_drawing:
 			_clear_highlights()
+			_clear_portal_highlights()
 			_was_drawing = false
 		if _transforming:
 			_end_group_transform()
@@ -2678,15 +3042,25 @@ func _on_process_impl(_delta):
 		_was_drawing = true
 		_last_box_begin = select_tool.boxBegin
 		_last_box_end = select_tool.boxEnd
+		# Sample the Shift+Alt "deselect" modifier every drawing frame; the
+		# last value before mouse release is the intent we latch below.
+		_drag_deselect_sampled = Input.is_key_pressed(KEY_ALT) and Input.is_key_pressed(KEY_SHIFT)
 		_update_highlights()
+		_update_portal_highlights()
 	elif _was_drawing:
 		_was_drawing = false
 		_clear_highlights()
+		_clear_portal_highlights()
 		if _last_box_begin.distance_to(_last_box_end) > MIN_DISTANCE:
 			var box = _normalize_box(_last_box_begin, _last_box_end)
 			_deferred_box_start = box[0]
 			_deferred_box_end = box[1]
 			_deferred_frames = 2
+			# Latch deselect intent: OR the last sampled value with the
+			# current key state (keys may still be held on the release
+			# frame even if they lapsed during the final drawing frame).
+			_deferred_deselect = _drag_deselect_sampled or (Input.is_key_pressed(KEY_ALT) and Input.is_key_pressed(KEY_SHIFT))
+		_drag_deselect_sampled = false
 
 	# Deferred wall addition countdown
 	if _deferred_frames > 0:
@@ -2694,12 +3068,14 @@ func _on_process_impl(_delta):
 	elif _deferred_frames == 0:
 		_deferred_frames = -1
 		_add_walls_to_selection()
+		_add_portals_to_selection()
+		_deferred_deselect = false
 
 	# Tout ce qui suit (transform de groupe, custom box, cursor) ne doit
 	# pas s'executer quand "Move, Transform and Copy Walls" est OFF dans
 	# mod_settings : seul le drag-select doit rester. On nettoie d'abord
 	# l'etat residuel et on retourne.
-	if not _is_wall_transform_enabled():
+	if not _is_wall_transform_enabled() or _is_ft_active():
 		if _transforming:
 			_end_group_transform()
 		if _ci_mode > 0:

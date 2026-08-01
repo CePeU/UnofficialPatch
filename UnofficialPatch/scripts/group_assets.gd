@@ -37,6 +37,16 @@ var _was_pure_group_prev := false
 var _group_color := Color("E0AFFF")
 var _destroyed := false
 
+# ── Copie de groupes ───────────────────────────────────────────────────────────
+# Snapshot pris au Ctrl+C/X : structure de groupes de la sélection copiée, sous
+# forme de positions RELATIVES au centroïde (robuste à la relocalisation du
+# paste et au réordonnancement du clipboard par clipboard_fix). Les murs sont
+# exclus (position de node non significative + clipboard walls géré à part).
+var _copy_group_map : Array = []   # [{rel: Vector2, gid: int, type: int}]
+var _regroup_frames := 0           # compte à rebours avant re-groupage post-paste
+var _btn_hooked := false           # hook des boutons Copy/Paste du panel
+var _btn_hook_attempts := 0
+
 const CUSTOM_GROUP_MIN_ID = 10000
 
 func initialize() -> void:
@@ -330,6 +340,19 @@ func _on_input(event) -> void:
 				_on_ungroup_pressed()
 			else:
 				_on_group_pressed()
+		elif event.scancode == KEY_C or event.scancode == KEY_X:
+			if not event.echo:
+				# 1) Filet de sécurité : purger les Selectables en double AVANT
+				#    que DD ne sérialise (chaque doublon = un asset dupliqué au
+				#    paste). 2) Snapshot de la structure de groupes copiée pour
+				#    re-grouper les assets collés.
+				_dedupe_selection()
+				_snapshot_copy_groups()
+		elif event.scancode == KEY_V:
+			if not event.echo and _copy_group_map.size() > 0:
+				# Le paste + la relocalisation (clipboard_fix) prennent quelques
+				# frames : on re-groupe une fois la sélection collée stabilisée.
+				_regroup_frames = 12
 
 
 func _on_process(_delta) -> void:
@@ -356,6 +379,15 @@ func _on_process(_delta) -> void:
 	if _force_normal_frames > 0:
 		_force_normal_frames -= 1
 		_update_transform_box_color(false)
+
+	if _regroup_frames > 0:
+		_regroup_frames -= 1
+		if _regroup_frames == 0:
+			_regroup_pasted()
+
+	# Hook des boutons Copy/Paste du SelectTool panel (no-op une fois fait).
+	if not _btn_hooked:
+		_try_hook_panel_buttons()
 
 
 # -- Visibility -------------------------------------------
@@ -423,6 +455,159 @@ func _update_visibility() -> void:
 	_update_transform_box_color(is_pure_group)
 
 
+# -- Copie de groupes -------------------------------------
+
+const SELECTABLE_WALL_TYPE := 1
+
+# Snapshot pris juste avant la sérialisation (Ctrl+C/X) : pour chaque thing
+# sélectionné (hors murs), sa position relative au centroïde de la sélection,
+# son gid custom (ou -1) et son type de Selectable. Vidé si aucun groupe.
+func _snapshot_copy_groups() -> void:
+	_copy_group_map = []
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return
+	var seen = {}
+	var entries: Array = []
+	var centroid = Vector2.ZERO
+	var n = 0
+	for s in raw:
+		if s == null or s.Thing == null or not is_instance_valid(s.Thing):
+			continue
+		if int(s.Type) == SELECTABLE_WALL_TYPE:
+			continue
+		if not (s.Thing is Node2D):
+			continue
+		var id = s.Thing.get_instance_id()
+		if seen.has(id):
+			continue
+		seen[id] = true
+		var gid = _get_custom_gid(s.Thing)
+		entries.append({"pos": s.Thing.global_position,
+			"gid": gid if gid >= CUSTOM_GROUP_MIN_ID else -1,
+			"type": int(s.Type)})
+		centroid += s.Thing.global_position
+		n += 1
+	if n == 0:
+		return
+	centroid /= n
+	var any_group = false
+	for e in entries:
+		e["rel"] = e["pos"] - centroid
+		if e["gid"] >= CUSTOM_GROUP_MIN_ID:
+			any_group = true
+	if not any_group:
+		return
+	_copy_group_map = entries
+	print("[GroupAssets] Copy snapshot: %d things (with groups)" % entries.size())
+
+
+# Re-groupe les assets collés en répliquant la partition copiée. Le matching
+# copié → collé se fait par position relative au centroïde (par type de
+# Selectable) : robuste au décalage uniforme du paste et à l'ordre du clipboard.
+# Chaque gid copié reçoit un gid FRAIS (le collage forme de nouveaux groupes,
+# indépendants des originaux). Undo/redo via _restore_group_state.
+func _regroup_pasted() -> void:
+	if _copy_group_map.empty():
+		return
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return
+	var seen = {}
+	var pasted: Array = []
+	var centroid = Vector2.ZERO
+	var n = 0
+	for s in raw:
+		if s == null or s.Thing == null or not is_instance_valid(s.Thing):
+			continue
+		if int(s.Type) == SELECTABLE_WALL_TYPE:
+			continue
+		if not (s.Thing is Node2D):
+			continue
+		var id = s.Thing.get_instance_id()
+		if seen.has(id):
+			continue
+		seen[id] = true
+		pasted.append({"thing": s.Thing, "type": int(s.Type)})
+		centroid += s.Thing.global_position
+		n += 1
+	if n == 0:
+		return
+	centroid /= n
+	for p in pasted:
+		p["rel"] = p["thing"].global_position - centroid
+
+	# Matching glouton plus-proche-voisin, par type.
+	var base_gid = _generate_group_id()
+	var gid_map = {}          # gid copié → gid frais
+	var assignments: Array = []
+	var used = {}
+	for e in _copy_group_map:
+		if e["gid"] < CUSTOM_GROUP_MIN_ID:
+			continue
+		var best = -1
+		var best_d = 1e18
+		for i in range(pasted.size()):
+			if used.has(i):
+				continue
+			if pasted[i]["type"] != e["type"]:
+				continue
+			var d = pasted[i]["rel"].distance_squared_to(e["rel"])
+			if d < best_d:
+				best_d = d
+				best = i
+		if best < 0:
+			continue
+		used[best] = true
+		if not gid_map.has(e["gid"]):
+			# _generate_group_id scanne la map : tant que les metas ne sont pas
+			# posées, il renvoie la même valeur → allocation séquentielle.
+			gid_map[e["gid"]] = base_gid + gid_map.size()
+		assignments.append({"thing": pasted[best]["thing"], "gid": gid_map[e["gid"]]})
+	if assignments.empty():
+		return
+
+	var pre_state: Array = []
+	var post_state: Array = []
+	for a in assignments:
+		var thing = a["thing"]
+		if _is_real_prefab(thing):
+			continue
+		var old_pid = -1
+		if thing.has_meta("prefab_id"):
+			var v = thing.get_meta("prefab_id")
+			if v is int:
+				old_pid = v
+		pre_state.append({"ref": weakref(thing), "old_pid": old_pid})
+		post_state.append({"ref": weakref(thing), "old_pid": a["gid"]})
+		_remove_from_custom_group(thing)
+		thing.set_meta("prefab_id", a["gid"])
+		var group_name = str(a["gid"])
+		if not thing.is_in_group(group_name):
+			thing.add_to_group(group_name)
+	_save_groups()
+
+	# Re-sélection propre : couleur AVANT (les hoverboxes sont peintes au
+	# SelectThing), une seule sélection par thing (anti-doublon).
+	var all_things: Array = []
+	for p in pasted:
+		all_things.append(p["thing"])
+	var pure = _all_share_custom_group(all_things)
+	_update_transform_box_color(pure)
+	if pure:
+		_force_mauve_frames = 10
+	select_tool.DeselectAll()
+	_select_things_no_dup(all_things)
+	select_tool.EnableTransformBox(true)
+
+	var undo = _get_undo_lib()
+	if undo != null:
+		undo.record_callback(
+			self, "_restore_group_state", [pre_state],
+			self, "_restore_group_state", [post_state])
+	print("[GroupAssets] Regrouped %d pasted things into %d group(s)" % [assignments.size(), gid_map.size()])
+
+
 # -- Group ------------------------------------------------
 
 func _on_group_pressed() -> void:
@@ -476,10 +661,12 @@ func _on_group_pressed() -> void:
 		# in) doesn't trigger a repaint on those that come in via the
 		# group, so they kept the previous hover color.
 		select_tool.DeselectAll()
+		var to_sel: Array = []
 		for thing in things:
 			if _is_real_prefab(thing):
 				continue
-			select_tool.SelectThing(thing, true)
+			to_sel.append(thing)
+		_select_things_no_dup(to_sel)
 		select_tool.EnableTransformBox(true)
 		_save_groups()
 		# Register undo: pre_state captures the previous prefab_ids,
@@ -542,8 +729,7 @@ func _on_ungroup_pressed() -> void:
 		_update_transform_box_color(false)
 		_force_normal_frames = 10
 		select_tool.DeselectAll()
-		for t in to_reselect:
-			select_tool.SelectThing(t, true)
+		_select_things_no_dup(to_reselect)
 		if to_reselect.size() > 0:
 			select_tool.EnableTransformBox(true)
 		else:
@@ -617,9 +803,111 @@ func _apply_restored_selection(to_select: Array) -> void:
 	else:
 		_force_normal_frames = 10
 	select_tool.DeselectAll()
-	for thing in live:
-		select_tool.SelectThing(thing, true)
+	_select_things_no_dup(live)
 	select_tool.EnableTransformBox(true)
+
+
+# ── Sélection sans doublons ────────────────────────────────────────────────────
+# SelectTool.SelectThing(thing, true) crée TOUJOURS un nouveau Selectable
+# (aucun contrôle « déjà sélectionné » côté DD), et Select(true) étend la
+# sélection aux membres du groupe Godot — l'expansion, elle, a un guard
+# anti-doublon (c == null). Sélectionner chaque membre d'un groupe en boucle
+# produit donc des Selectables en double pour tous les membres déjà amenés par
+# l'expansion : Serialize() (Ctrl+C) les sérialise alors N fois → assets
+# dupliqués au paste (×2, ×3…). On ne sélectionne que les things ABSENTS de la
+# sélection courante ; l'expansion de groupe fait le reste (et repeint les
+# hoverboxes via le switch de Select()).
+func _select_things_no_dup(things: Array) -> void:
+	for thing in things:
+		if thing == null or not is_instance_valid(thing):
+			continue
+		if _is_thing_selected(thing):
+			continue
+		select_tool.SelectThing(thing, true)
+
+
+func _is_thing_selected(thing) -> bool:
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return false
+	for s in raw:
+		if s != null and s.Thing == thing:
+			return true
+	return false
+
+
+# Purge les Selectables en double (même Thing présent plusieurs fois) en
+# reconstruisant la sélection. NB : Select(s, false) sur un membre de groupe
+# cascade la désélection à tout le groupe (expansion), donc on ne peut pas
+# retirer les doublons un à un — on repart de zéro.
+func _dedupe_selection() -> bool:
+	var raw = select_tool.RawSelectables
+	if raw == null:
+		return false
+	var seen = {}
+	var unique: Array = []
+	var has_dup = false
+	for s in raw:
+		if s == null or s.Thing == null or not is_instance_valid(s.Thing):
+			continue
+		var id = s.Thing.get_instance_id()
+		if seen.has(id):
+			has_dup = true
+		else:
+			seen[id] = true
+			unique.append(s.Thing)
+	if not has_dup:
+		return false
+	select_tool.DeselectAll()
+	_select_things_no_dup(unique)
+	select_tool.EnableTransformBox(true)
+	print("[GroupAssets] Deduped selection: %d unique things" % unique.size())
+	return true
+
+
+# ── Boutons Copy/Paste du panel ────────────────────────────────────────────────
+# Les boutons appellent Copy()/Paste() en direct (pas d'InputEventKey) : les
+# chemins Ctrl+C/V ci-dessus ne les voient pas. DD a connecté ses boutons avant
+# nous, donc nos handlers "pressed" tournent APRÈS l'action native.
+func _try_hook_panel_buttons() -> void:
+	if _btn_hooked:
+		return
+	_btn_hook_attempts += 1
+	if _btn_hook_attempts > 600:
+		_btn_hooked = true  # abandon (panel introuvable)
+		return
+	if select_tool_panel == null or not is_instance_valid(select_tool_panel):
+		return
+	var copy_btn = select_tool_panel.get("copyButton")
+	if copy_btn == null or not (copy_btn is BaseButton):
+		return
+	if not copy_btn.is_connected("pressed", self, "_on_copy_button_pressed"):
+		copy_btn.connect("pressed", self, "_on_copy_button_pressed")
+	var paste_btn = select_tool_panel.get("pasteButton")
+	if paste_btn != null and paste_btn is BaseButton:
+		if not paste_btn.is_connected("pressed", self, "_on_paste_button_pressed"):
+			paste_btn.connect("pressed", self, "_on_paste_button_pressed")
+	_btn_hooked = true
+	print("[GroupAssets] SelectTool copy/paste buttons hooked")
+
+
+func _on_copy_button_pressed() -> void:
+	if _destroyed:
+		return
+	# La Copy() native a déjà tourné : si la sélection contenait des Selectables
+	# en double, le clipboard vient d'être sérialisé AVEC les doublons. On
+	# dédoublonne puis on re-copie proprement (même contenu, sans doublons).
+	var had_dups = _dedupe_selection()
+	_snapshot_copy_groups()
+	if had_dups:
+		select_tool.Copy()
+
+
+func _on_paste_button_pressed() -> void:
+	if _destroyed:
+		return
+	if _copy_group_map.size() > 0:
+		_regroup_frames = 12
 
 
 func _all_share_custom_group(things: Array) -> bool:
@@ -820,6 +1108,25 @@ func _load_groups() -> void:
 					node.add_to_group(group_name)
 				restored_count += 1
 
+	# Assainissement : chaque node ne doit appartenir qu'au groupe Godot
+	# correspondant à son meta prefab_id. Les memberships croisées résiduelles
+	# (autres groupes numériques >= 10000) sont purgées — elles chaînaient
+	# plusieurs groupes dans la sélection au clic sur un seul membre.
+	var cleaned = 0
+	for node in all_nodes:
+		var own_pid = -1
+		if node.has_meta("prefab_id"):
+			var v = node.get_meta("prefab_id")
+			if v is int and v >= CUSTOM_GROUP_MIN_ID:
+				own_pid = v
+		for gname in node.get_groups():
+			var s = str(gname)
+			if s.is_valid_integer() and int(s) >= CUSTOM_GROUP_MIN_ID and int(s) != own_pid:
+				node.remove_from_group(s)
+				cleaned += 1
+	if cleaned > 0:
+		print("[GroupAssets] Sanitized %d stale group membership(s)" % cleaned)
+
 	if restored_count > 0:
 		print("[GroupAssets] Restored %d node(s) in %d group(s) for '%s'" % [restored_count, groups.size(), map_key])
 
@@ -830,22 +1137,48 @@ func _save_color_settings() -> void:
 
 
 func _get_all_groupable_nodes() -> Array:
+	# TOUS les niveaux : l'expansion de groupe Godot (GetNodesInGroup) est
+	# tree-wide, un groupe peut donc s'étendre sur plusieurs niveaux. Scanner
+	# seulement World.Level sous-évaluait le max de _generate_group_id ->
+	# gids réalloués en collision avec un groupe existant d'un autre niveau
+	# (les assets collés se retrouvaient fusionnés avec ce groupe), et la
+	# persistance sidecar perdait les membres hors niveau courant.
 	var result = []
-	var level = _g.World.Level
-	if level == null:
-		return result
-	for cname in ["Objects", "Pathways", "Portals", "Lights"]:
-		var container = level.get_node_or_null(cname)
-		if container:
-			for child in container.get_children():
+	var levels = _all_levels()
+	if levels.empty() and _g.World.Level != null:
+		levels = [_g.World.Level]
+	for level in levels:
+		if level == null or not is_instance_valid(level):
+			continue
+		for cname in ["Objects", "Pathways", "Portals", "Lights", "Roofs"]:
+			var container = level.get_node_or_null(cname)
+			if container:
+				for child in container.get_children():
+					result.append(child)
+		# PatternShapes : les enfants directs sont des LAYERS, les shapes sont
+		# leurs enfants (elles peuvent porter un prefab_id de groupe custom).
+		var patterns = level.get_node_or_null("PatternShapes")
+		if patterns:
+			for layer in patterns.get_children():
+				for sh in layer.get_children():
+					result.append(sh)
+		var walls = level.get_node_or_null("Walls")
+		if walls:
+			for child in walls.get_children():
 				result.append(child)
-	var walls = level.get_node_or_null("Walls")
-	if walls:
-		for child in walls.get_children():
-			result.append(child)
-			for sub in child.get_children():
-				result.append(sub)
+				for sub in child.get_children():
+					result.append(sub)
 	return result
+
+
+func _all_levels() -> Array:
+	if _g == null:
+		return []
+	var w = _g.get("World")
+	if w == null or not is_instance_valid(w):
+		return []
+	var a = w.call("get_AllLevels")
+	return a if (a is Array) else []
 
 
 # -- Transform box color ----------------------------------
@@ -986,37 +1319,27 @@ func _remove_from_custom_group(thing) -> void:
 	if thing.has_meta("prefab_id"):
 		var pid = thing.get_meta("prefab_id")
 		if pid is int and pid >= CUSTOM_GROUP_MIN_ID:
-			var group_name = str(pid)
-			if thing.is_in_group(group_name):
-				thing.remove_from_group(group_name)
 			thing.remove_meta("prefab_id")
+	# Purger TOUTES les memberships de groupes custom, pas seulement celle du
+	# meta courant : des memberships croisées (héritées de vieilles sessions /
+	# de l'ancien bug de doublons) laissent un asset dans DEUX groupes Godot à
+	# la fois — un clic sur un membre chaîne alors les deux groupes entiers via
+	# l'expansion transitive de DD (Select → GetGroups → GetNodesInGroup), et la
+	# copie emporte les deux ("connected that part to the first group").
+	for gname in thing.get_groups():
+		var s = str(gname)
+		if s.is_valid_integer() and int(s) >= CUSTOM_GROUP_MIN_ID:
+			thing.remove_from_group(s)
 
 
 func _generate_group_id() -> int:
+	# Max sur TOUS les niveaux et TOUS les conteneurs (via
+	# _get_all_groupable_nodes) : voir le commentaire de cette fonction.
 	var max_gid = CUSTOM_GROUP_MIN_ID - 1
-	var level = _g.World.Level
-	if level == null:
-		return CUSTOM_GROUP_MIN_ID
-
-	for cname in ["Objects", "Pathways", "Portals", "Lights"]:
-		var container = level.get_node_or_null(cname)
-		if container:
-			for child in container.get_children():
-				var gid = _get_custom_gid(child)
-				if gid > max_gid:
-					max_gid = gid
-
-	var walls = level.get_node_or_null("Walls")
-	if walls:
-		for child in walls.get_children():
-			var gid = _get_custom_gid(child)
-			if gid > max_gid:
-				max_gid = gid
-			for sub in child.get_children():
-				gid = _get_custom_gid(sub)
-				if gid > max_gid:
-					max_gid = gid
-
+	for node in _get_all_groupable_nodes():
+		var gid = _get_custom_gid(node)
+		if gid > max_gid:
+			max_gid = gid
 	return max_gid + 1
 
 

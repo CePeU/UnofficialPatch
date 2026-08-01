@@ -113,8 +113,9 @@ func get_context_items(raw) -> Array:
 	if not ft_is_off:
 		return items
 
-	# Selection compatible avec FT : Objects (4), Pathways (5), PortalFree (2),
-	# PortalWall (3), PatternShape (7).
+	# Selection compatible avec FT : Wall (1, pour la symétrie), Objects (4),
+	# Pathways (5), PortalFree (2), PortalWall (3), Light (6, pour la
+	# symétrie), PatternShape (7).
 	var ft_compatible = false
 	for s in raw:
 		if s == null or not is_instance_valid(s):
@@ -123,7 +124,7 @@ func get_context_items(raw) -> Array:
 		if thing == null or not is_instance_valid(thing):
 			continue
 		var type = select_tool.GetSelectableType(thing)
-		if type in [2, 3, 4, 5, 7]:
+		if type in [1, 2, 3, 4, 5, 6, 7]:
 			ft_compatible = true
 			break
 

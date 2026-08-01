@@ -52,7 +52,7 @@ func update(_delta) -> void:
 	if _g == null or _g.Editor == null or _g.WorldUI == null:
 		_publish_true_top(null)
 		return
-	if str(_g.Editor.ActiveToolName) != "SelectTool":
+	if _active_tool_name() != "SelectTool":
 		_publish_true_top(null)
 		return
 	var st = _g.Editor.Tools.get("SelectTool")
@@ -206,6 +206,13 @@ func _on_input(event) -> void:
 		return
 	if _g == null or _g.Editor == null or _g.WorldUI == null:
 		return
+	# IMPORTANT : lecture LIVE de l'outil actif, PAS le cache _active_tool_name().
+	# Le cache n'est rafraichi qu'une fois par frame (Main.gd/_process) alors que
+	# _input est delivre AVANT _process : au 1er clic suivant un changement d'outil,
+	# le cache peut encore dire "SelectTool" alors qu'on est deja dans l'ObjectTool
+	# -> on selectionnait un objet et on activait la transform box HORS SelectTool.
+	# Un clic est un evenement rare : la lecture directe ne coute rien ici et doit
+	# rester exacte. Ne pas "optimiser" ceci vers le cache.
 	if str(_g.Editor.ActiveToolName) != "SelectTool":
 		return
 	var st = _g.Editor.Tools.get("SelectTool")
@@ -274,3 +281,43 @@ func _has_visible_popup(node: Node, depth: int) -> bool:
 		if _has_visible_popup(child, depth + 1):
 			return true
 	return false
+
+
+# ── Per-frame cached editor state (published by Main.gd, Engine metadata) ──
+# Reading native/C# editor properties marshals a fresh GDScript object across
+# the interop boundary on EVERY access; with dozens of submods polling every
+# frame this is a steady allocation stream (background commit-charge growth).
+# Main.gd reads ActiveToolName once per frame and publishes it; we read the
+# shared copy here. THREE rules, each learned from a measured failure:
+#   1. PRECONDITION: never serve a cached name when this mod's _g.Editor is
+#      unreachable — callers would reach into editor objects that are unsafe
+#      to touch (native access violation c0000005 on tool switch / map churn).
+#   2. MEMOIZATION: the _g.Editor null-check itself marshals a wrapper per
+#      access; doing it per call cost as much as the problem this cache
+#      solves (+0.037 MB/s, +12% main CPU over 600 s). One read per mod per
+#      process tick keeps the safety signal at ~1/10th the volume.
+#   3. FORCED COPY: never hand out a COW reference to the String stored in
+#      the shared Dictionary — hence "%s" % v.
+var _uu_ed_frame := -1
+var _uu_ed_ok := false
+
+
+func _active_tool_name() -> String:
+	if not _uu_editor_reachable():
+		return ""
+	if Engine.has_meta("_uu_editor_state"):
+		var s = Engine.get_meta("_uu_editor_state")
+		if s is Dictionary:
+			var v = s.get("active_tool_name")
+			if v is String:
+				return "%s" % v
+	return str(_g.Editor.ActiveToolName)
+
+
+func _uu_editor_reachable() -> bool:
+	var f = Engine.get_idle_frames()
+	if f == _uu_ed_frame:
+		return _uu_ed_ok
+	_uu_ed_frame = f
+	_uu_ed_ok = _g != null and _g.Editor != null
+	return _uu_ed_ok

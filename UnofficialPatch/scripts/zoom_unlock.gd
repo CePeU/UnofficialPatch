@@ -141,8 +141,17 @@ func _input(event) -> void:
 		handler._on_input(event)
 """
 	ls.reload()
+	# Cross-session guard: this node lives on the tree root, which persists
+	# across map reloads. Free the previous instance's node before creating
+	# ours -- otherwise one leaks on every reload.
+	if Engine.has_meta("up_zoomunlock_listener"):
+		var _old_n = Engine.get_meta("up_zoomunlock_listener")
+		if is_instance_valid(_old_n):
+			_old_n.set("handler", null)
+			_old_n.queue_free()
 	input_listener = Node.new()
 	input_listener.name = "ZoomUnlockListener"
+	Engine.set_meta("up_zoomunlock_listener", input_listener)
 	input_listener.set_script(ls)
 	input_listener.handler = self
 	if _g.World and _g.World is Node:

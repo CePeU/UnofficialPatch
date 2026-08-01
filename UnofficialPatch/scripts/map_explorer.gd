@@ -9,9 +9,16 @@ const DATA_DIR = "user://UnofficialPatch/map_explorer/"
 const INDEX_FILE = "user://UnofficialPatch/map_explorer/index.json"
 const THUMB_DIR = "user://UnofficialPatch/map_explorer/thumbnails/"
 const PREFS_FILE = "user://UnofficialPatch/map_explorer/prefs.json"
+# Shared registry of windows that must swallow right-clicks (see
+# right_click_util.gd). Keep this key in sync with that script.
+const BLOCK_WINDOWS_META = "_up_block_windows"
+# Marks the gallery as modal for right_click_util (see below).
+const BLOCK_ALL_META = "_up_block_all"
 
 var _map_index := {}
 var _explorer_window = null
+var _escape_was_pressed := false
+var _ctx_popup_layer = null  # CanvasLayer hosting the right-click context menu
 var _grid_container = null
 var _scroll_container = null
 var _search_bar = null
@@ -77,6 +84,14 @@ const SORT_PACKS_DESC = 14
 const SORT_PACKS_ASC = 15
 const SORT_DEFAULT_DESC = 16
 const SORT_DEFAULT_ASC = 17
+
+# Right-click context menu item ids
+const CTX_OPEN = 0
+const CTX_DUPLICATE = 1
+const CTX_MOVE = 2
+const CTX_VIEW_PACKS = 3
+const CTX_DELETE = 4
+const CTX_RENAME = 5
 
 var _current_sort := SORT_DATE_DESC
 var _list_sort_column := ""  # Current column being sorted in list view
@@ -165,6 +180,39 @@ func update(_delta: float) -> void:
 		_hook_save_button()
 	if not _menu_button_added:
 		_add_menu_button()
+	_poll_escape()
+
+
+# Escape closes the gallery. An exclusive popup ignores the ui_cancel action,
+# so the key is polled here. Ignored while one of our sub-dialogs (rename,
+# delete confirm, open confirm...) sits on top: Escape belongs to that dialog.
+func _poll_escape() -> void:
+	var esc = Input.is_key_pressed(KEY_ESCAPE)
+	if esc and not _escape_was_pressed:
+		if _explorer_window != null and is_instance_valid(_explorer_window) \
+				and _explorer_window.visible \
+				and not _other_blocking_window_visible():
+			_close_explorer_window()
+	_escape_was_pressed = esc
+
+
+# True when a registered blocking window other than the gallery itself is
+# visible (see _register_blocking_window).
+func _other_blocking_window_visible() -> bool:
+	if not Engine.has_meta(BLOCK_WINDOWS_META):
+		return false
+	var arr = Engine.get_meta(BLOCK_WINDOWS_META)
+	if not (arr is Array):
+		return false
+	for wr in arr:
+		if not (wr is WeakRef):
+			continue
+		var w = wr.get_ref()
+		if w == null or not is_instance_valid(w) or w == _explorer_window:
+			continue
+		if w is Control and w.is_visible_in_tree():
+			return true
+	return false
 
 
 func _load_icons() -> void:
@@ -841,6 +889,14 @@ func _show_explorer_window() -> void:
 	_explorer_window.window_title = "Map Gallery"
 	_explorer_window.rect_min_size = WINDOW_MIN_SIZE
 	_explorer_window.resizable = true
+	# An exclusive popup is not dismissed by a click outside of it, and that
+	# click is discarded instead of reaching the map below — so no accidental
+	# edit and no accidental close. Side effects, both handled: the built-in
+	# ui_cancel (Escape) close is disabled too, so update() polls the key; and
+	# right_click_util still sees the raw button press, so the gallery declares
+	# itself modal through BLOCK_ALL_META.
+	_explorer_window.popup_exclusive = true
+	_explorer_window.set_meta(BLOCK_ALL_META, true)
 	_explorer_window.connect("resized", self, "_on_window_resized")
 	
 	# Main horizontal split: folders panel (left) + content (right)
@@ -1717,7 +1773,8 @@ func _do_delete_selected(map_id: String, dialog: Node) -> void:
 func _on_open_selected() -> void:
 	if _selected_map_ids.size() == 0:
 		return
-	# Open the first selected map
+	# Act on the first selected map. Same confirmation step as a double-click:
+	# the actual opening happens in _do_open_map(), from the dialog.
 	var map_id = _selected_map_ids[0]
 	var info = _map_index.get(map_id)
 	if info == null:
@@ -1727,10 +1784,7 @@ func _on_open_selected() -> void:
 	if not f.file_exists(path):
 		_on_missing_map_clicked(map_id, info)
 		return
-	_close_explorer_window()
-	yield(_g.World.get_tree().create_timer(0.1), "timeout")
-	_g.Editor.ForceOpenMap(path)
-	print("[MapExplorer] Opening map: %s" % path)
+	_show_open_confirm_dialog(map_id)
 
 
 func _update_buttons_state() -> void:
@@ -2232,6 +2286,9 @@ func _on_card_gui_input(event: InputEvent, map_id: String, thumb_panel: Panel) -
 			break
 	
 	if event is InputEventMouseButton:
+		if event.button_index == BUTTON_RIGHT and event.pressed:
+			_show_card_context_menu(map_id, event.global_position)
+			return
 		if event.button_index == BUTTON_LEFT:
 			if event.pressed:
 				_drag_start_pos = event.position
@@ -2865,6 +2922,9 @@ func _on_card_hover(panel: Panel, is_hovering: bool) -> void:
 
 func _on_list_row_gui_input(event: InputEvent, map_id: String, panel: PanelContainer) -> void:
 	if event is InputEventMouseButton:
+		if event.button_index == BUTTON_RIGHT and event.pressed:
+			_show_card_context_menu(map_id, event.global_position)
+			return
 		if event.button_index == BUTTON_LEFT:
 			if event.pressed:
 				_drag_start_pos = event.global_position
@@ -3118,6 +3178,512 @@ func _do_open_map(map_id: String, dialog: Node) -> void:
 	print("[MapExplorer] Opening map: %s" % path)
 
 
+# ── Right-click context menu ─────────────────────────────────────────────────
+
+func _show_card_context_menu(map_id: String, global_pos: Vector2) -> void:
+	if not _map_index.has(map_id):
+		return
+	
+	# If the right-clicked card is part of an existing multi-selection, keep it.
+	# Otherwise select just this card so the menu acts on it.
+	if not (map_id in _selected_map_ids and _selected_map_ids.size() > 1):
+		_clear_selection()
+		var panel = _find_panel_for_map(map_id)
+		if panel != null:
+			_select_card(map_id, panel)
+		else:
+			_selected_map_ids = [map_id]
+		_last_selected_id = map_id
+		_update_buttons_state()
+	
+	# Work out what is available for the current selection.
+	var count = _selected_map_ids.size()
+	var single = (count == 1)
+	var f = File.new()
+	var any_exists = false
+	for mid in _selected_map_ids:
+		var p = str(_map_index.get(mid, {}).get("path", ""))
+		if p != "" and f.file_exists(p):
+			any_exists = true
+			break
+	var primary_exists = false
+	if count > 0:
+		var pp = str(_map_index.get(_selected_map_ids[0], {}).get("path", ""))
+		primary_exists = (pp != "" and f.file_exists(pp))
+	
+	var menu = PopupMenu.new()
+	_style_popup_menu(menu)
+	
+	menu.add_item("Open", CTX_OPEN)
+	menu.set_item_disabled(menu.get_item_index(CTX_OPEN), not (single and primary_exists))
+	
+	var dup_label = "Duplicate" if count <= 1 else "Duplicate (%d)" % count
+	menu.add_item(dup_label, CTX_DUPLICATE)
+	menu.set_item_disabled(menu.get_item_index(CTX_DUPLICATE), not any_exists)
+	
+	menu.add_item("Rename", CTX_RENAME)
+	menu.set_item_disabled(menu.get_item_index(CTX_RENAME), not (single and primary_exists))
+	
+	menu.add_item("Move", CTX_MOVE)
+	
+	menu.add_item("View Packs", CTX_VIEW_PACKS)
+	menu.set_item_disabled(menu.get_item_index(CTX_VIEW_PACKS), not (single and primary_exists))
+	
+	menu.add_separator()
+	
+	var del_label = "Delete" if count <= 1 else "Delete (%d)" % count
+	menu.add_item(del_label, CTX_DELETE)
+	
+	menu.connect("id_pressed", self, "_on_context_menu_id")
+	menu.connect("popup_hide", menu, "queue_free")
+	
+	# Host the menu on a top-most CanvasLayer and place it under the cursor.
+	# The gui_input event position is in the (scaled) UI canvas space, whereas
+	# a top-level popup expects raw viewport coordinates, so use the root
+	# viewport mouse position instead.
+	_get_ctx_popup_layer().add_child(menu)
+	_register_blocking_window(menu)
+	var mouse_pos = _g.World.get_tree().root.get_mouse_position()
+	menu.popup(Rect2(mouse_pos, Vector2(1, 1)))
+
+
+func _get_ctx_popup_layer() -> CanvasLayer:
+	if _ctx_popup_layer != null and is_instance_valid(_ctx_popup_layer):
+		return _ctx_popup_layer
+	_ctx_popup_layer = CanvasLayer.new()
+	_ctx_popup_layer.name = "MapExplorerContextLayer"
+	_ctx_popup_layer.layer = 128
+	_g.World.get_tree().root.add_child(_ctx_popup_layer)
+	return _ctx_popup_layer
+
+
+func _on_context_menu_id(id: int) -> void:
+	match id:
+		CTX_OPEN:
+			_on_open_selected()
+		CTX_DUPLICATE:
+			_on_duplicate_selected()
+		CTX_RENAME:
+			_on_rename_selected()
+		CTX_MOVE:
+			_show_assign_folder_dialog()
+		CTX_VIEW_PACKS:
+			_on_view_packs()
+		CTX_DELETE:
+			_on_delete_selected()
+
+
+func _style_popup_menu(menu: PopupMenu) -> void:
+	var panel_style = StyleBoxFlat.new()
+	panel_style.bg_color = Color(0.15, 0.15, 0.18, 1.0)
+	panel_style.border_color = Color(0.6, 0.6, 0.6, 0.8)
+	panel_style.set_border_width_all(1)
+	panel_style.set_corner_radius_all(3)
+	panel_style.content_margin_left = 4
+	panel_style.content_margin_right = 4
+	panel_style.content_margin_top = 4
+	panel_style.content_margin_bottom = 4
+	menu.add_stylebox_override("panel", panel_style)
+	
+	var hover_style = StyleBoxFlat.new()
+	hover_style.bg_color = Color(0.25, 0.35, 0.5, 1.0)
+	hover_style.set_corner_radius_all(2)
+	menu.add_stylebox_override("hover", hover_style)
+	
+	menu.add_color_override("font_color", Color(0.9, 0.9, 0.9, 1.0))
+	menu.add_color_override("font_color_hover", Color(1.0, 1.0, 1.0, 1.0))
+	menu.add_color_override("font_color_disabled", Color(0.5, 0.5, 0.5, 1.0))
+
+
+# ── Duplicate ────────────────────────────────────────────────────────────────
+
+func _on_duplicate_selected() -> void:
+	if _selected_map_ids.size() == 0:
+		return
+	
+	# Single map: ask the user for a name. Multiple maps: auto-name each copy.
+	if _selected_map_ids.size() == 1:
+		_show_duplicate_dialog(_selected_map_ids[0])
+		return
+	
+	var f = File.new()
+	var created = 0
+	var failed = 0
+	# Iterate over a copy: _map_index is mutated as copies are added.
+	for map_id in _selected_map_ids.duplicate():
+		var info = _map_index.get(map_id)
+		if info == null:
+			continue
+		var src_path = str(info.get("path", ""))
+		if src_path == "" or not f.file_exists(src_path):
+			failed += 1
+			continue
+		if _duplicate_map(map_id):
+			created += 1
+		else:
+			failed += 1
+	
+	if created > 0:
+		_save_index()
+		_refresh_folder_list()
+		_refresh_explorer_grid()
+	
+	if created == 0 and failed > 0:
+		_show_message("Duplicate", "Could not duplicate the selected map(s).")
+	print("[MapExplorer] Duplicated %d map(s), %d failed" % [created, failed])
+
+
+func _show_duplicate_dialog(map_id: String) -> void:
+	var info = _map_index.get(map_id)
+	if info == null:
+		return
+	var src_path = str(info.get("path", ""))
+	if src_path == "":
+		return
+	
+	# Suggest a non-colliding name (e.g. "<name> copy") as the default.
+	var suggested = _unique_duplicate_path(src_path).get_file().replace(".dungeondraft_map", "")
+	
+	var dialog = WindowDialog.new()
+	dialog.window_title = "Duplicate Map"
+	dialog.rect_min_size = Vector2(320, 0)
+	_style_dialog(dialog)
+	
+	var vbox = VBoxContainer.new()
+	vbox.anchor_right = 1.0
+	vbox.anchor_bottom = 1.0
+	vbox.margin_left = 12
+	vbox.margin_right = -12
+	vbox.margin_top = 8
+	vbox.margin_bottom = -8
+	vbox.set("custom_constants/separation", 10)
+	dialog.add_child(vbox)
+	
+	var msg = Label.new()
+	msg.text = "New map name:"
+	vbox.add_child(msg)
+	
+	var input = LineEdit.new()
+	input.text = suggested
+	input.placeholder_text = "Map name..."
+	input.connect("text_entered", self, "_on_duplicate_confirm", [input, map_id, dialog])
+	vbox.add_child(input)
+	
+	var btn_row = HBoxContainer.new()
+	btn_row.set("custom_constants/separation", 8)
+	btn_row.alignment = BoxContainer.ALIGN_CENTER
+	vbox.add_child(btn_row)
+	
+	var dup_btn = Button.new()
+	dup_btn.text = "Duplicate"
+	dup_btn.connect("pressed", self, "_on_duplicate_confirm", ["", input, map_id, dialog])
+	_style_button(dup_btn)
+	btn_row.add_child(dup_btn)
+	
+	var cancel_btn = Button.new()
+	cancel_btn.text = "Cancel"
+	cancel_btn.connect("pressed", dialog, "hide")
+	_style_button(cancel_btn)
+	btn_row.add_child(cancel_btn)
+	
+	dialog.connect("popup_hide", dialog, "queue_free")
+	_add_window(dialog)
+	
+	yield(_g.World.get_tree(), "idle_frame")
+	var h = vbox.rect_size.y + dialog.get_constant("title_height", "WindowDialog") + 16
+	dialog.rect_size = Vector2(320, h)
+	dialog.popup_centered()
+	input.grab_focus()
+	input.select_all()
+
+
+# Two entry points share this handler:
+#  - Button "pressed"   -> (input, map_id, dialog)
+#  - LineEdit "text_entered" -> (submitted_text, input, map_id, dialog)
+# We normalise by pulling the LineEdit out of the trailing args.
+func _on_duplicate_confirm(_submitted, input, map_id, dialog) -> void:
+	var raw_name = input.text.strip_edges()
+	var new_name = _sanitize_filename(raw_name)
+	if new_name == "":
+		return
+	
+	var info = _map_index.get(map_id)
+	if info == null:
+		dialog.hide()
+		return
+	var src_path = str(info.get("path", ""))
+	var dir_path = src_path.get_base_dir()
+	var new_path = dir_path.plus_file(new_name + ".dungeondraft_map")
+	
+	# Never overwrite an existing map: uniquify if the chosen name collides.
+	var f = File.new()
+	if f.file_exists(new_path):
+		var i = 2
+		while i < 1000:
+			var alt = dir_path.plus_file("%s %d.dungeondraft_map" % [new_name, i])
+			if not f.file_exists(alt):
+				new_path = alt
+				new_name = "%s %d" % [new_name, i]
+				break
+			i += 1
+	
+	dialog.hide()
+	
+	if _do_duplicate_map(map_id, new_path, new_name):
+		_save_index()
+		_refresh_folder_list()
+		_refresh_explorer_grid()
+	else:
+		_show_message("Duplicate", "Could not duplicate the map.")
+
+
+func _sanitize_filename(name: String) -> String:
+	var out = name.strip_edges()
+	for ch in ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"]:
+		out = out.replace(ch, "")
+	return out.strip_edges()
+
+
+func _duplicate_map(map_id: String) -> bool:
+	# Auto-named duplicate (used for multi-selection).
+	var info = _map_index.get(map_id)
+	if info == null:
+		return false
+	var src_path = str(info.get("path", ""))
+	if src_path == "":
+		return false
+	var new_path = _unique_duplicate_path(src_path)
+	if new_path == "":
+		return false
+	var new_name = new_path.get_file().replace(".dungeondraft_map", "")
+	return _do_duplicate_map(map_id, new_path, new_name)
+
+
+func _do_duplicate_map(map_id: String, new_path: String, new_name: String) -> bool:
+	var info = _map_index.get(map_id)
+	if info == null:
+		return false
+	var src_path = str(info.get("path", ""))
+	if src_path == "" or new_path == "":
+		return false
+	
+	var dir = Directory.new()
+	if dir.copy(src_path, new_path) != OK:
+		print("[MapExplorer] Copy failed: %s -> %s" % [src_path, new_path])
+		return false
+	
+	var new_id = _generate_map_id(new_path)
+	
+	# Duplicate the thumbnail so the copy shows the same preview immediately.
+	var new_thumb_file = ""
+	var src_thumb_file = str(info.get("thumb_file", ""))
+	if src_thumb_file != "":
+		var src_thumb = THUMB_DIR + src_thumb_file
+		var f = File.new()
+		if f.file_exists(src_thumb):
+			new_thumb_file = new_id + ".png"
+			dir.copy(src_thumb, THUMB_DIR + new_thumb_file)
+	
+	# Append the copy at the end of the custom order.
+	var max_order = 0
+	for mid in _map_index.keys():
+		var o = int(_map_index[mid].get("custom_order", 0))
+		if o >= max_order:
+			max_order = o + 1
+	
+	_map_index[new_id] = {
+		"path": new_path,
+		"name": new_name,
+		"thumb_file": new_thumb_file,
+		"last_saved": _get_datetime_string(),
+		"width": int(info.get("width", 0)),
+		"height": int(info.get("height", 0)),
+		"custom_order": max_order,
+		"folder": info.get("folder", "")
+	}
+	print("[MapExplorer] Duplicated map: %s -> %s" % [src_path, new_path])
+	return true
+
+
+# ── Rename ───────────────────────────────────────────────────────────────────
+
+func _on_rename_selected() -> void:
+	if _selected_map_ids.size() != 1:
+		return
+	_show_rename_dialog(_selected_map_ids[0])
+
+
+func _show_rename_dialog(map_id: String) -> void:
+	var info = _map_index.get(map_id)
+	if info == null:
+		return
+	var src_path = str(info.get("path", ""))
+	if src_path == "":
+		return
+	
+	var current_name = src_path.get_file().replace(".dungeondraft_map", "")
+	
+	var dialog = WindowDialog.new()
+	dialog.window_title = "Rename Map"
+	dialog.rect_min_size = Vector2(320, 0)
+	_style_dialog(dialog)
+	
+	var vbox = VBoxContainer.new()
+	vbox.anchor_right = 1.0
+	vbox.anchor_bottom = 1.0
+	vbox.margin_left = 12
+	vbox.margin_right = -12
+	vbox.margin_top = 8
+	vbox.margin_bottom = -8
+	vbox.set("custom_constants/separation", 10)
+	dialog.add_child(vbox)
+	
+	var msg = Label.new()
+	msg.text = "New map name:"
+	vbox.add_child(msg)
+	
+	var input = LineEdit.new()
+	input.text = current_name
+	input.placeholder_text = "Map name..."
+	input.connect("text_entered", self, "_on_rename_confirm", [input, map_id, dialog])
+	vbox.add_child(input)
+	
+	var btn_row = HBoxContainer.new()
+	btn_row.set("custom_constants/separation", 8)
+	btn_row.alignment = BoxContainer.ALIGN_CENTER
+	vbox.add_child(btn_row)
+	
+	var ok_btn = Button.new()
+	ok_btn.text = "Rename"
+	ok_btn.connect("pressed", self, "_on_rename_confirm", ["", input, map_id, dialog])
+	_style_button(ok_btn)
+	btn_row.add_child(ok_btn)
+	
+	var cancel_btn = Button.new()
+	cancel_btn.text = "Cancel"
+	cancel_btn.connect("pressed", dialog, "hide")
+	_style_button(cancel_btn)
+	btn_row.add_child(cancel_btn)
+	
+	dialog.connect("popup_hide", dialog, "queue_free")
+	_add_window(dialog)
+	
+	yield(_g.World.get_tree(), "idle_frame")
+	var h = vbox.rect_size.y + dialog.get_constant("title_height", "WindowDialog") + 16
+	dialog.rect_size = Vector2(320, h)
+	dialog.popup_centered()
+	input.grab_focus()
+	input.select_all()
+
+
+func _on_rename_confirm(_submitted, input, map_id, dialog) -> void:
+	var new_name = _sanitize_filename(input.text)
+	if new_name == "":
+		return
+	
+	var info = _map_index.get(map_id)
+	if info == null:
+		dialog.hide()
+		return
+	var src_path = str(info.get("path", ""))
+	
+	# No change requested.
+	var current_name = src_path.get_file().replace(".dungeondraft_map", "")
+	if new_name == current_name:
+		dialog.hide()
+		return
+	
+	# Refuse to rename the map that is currently open in the editor.
+	var open_path = str(_g.Editor.get("CurrentMapFile")) if _g.Editor else ""
+	if open_path != "" and open_path == src_path:
+		dialog.hide()
+		_show_message("Rename", "Cannot rename the map that is currently open.")
+		return
+	
+	var dir_path = src_path.get_base_dir()
+	var new_path = dir_path.plus_file(new_name + ".dungeondraft_map")
+	
+	var f = File.new()
+	if f.file_exists(new_path):
+		dialog.hide()
+		_show_message("Rename", "A map named '%s' already exists here." % new_name)
+		return
+	
+	dialog.hide()
+	
+	if _do_rename_map(map_id, new_path, new_name):
+		_refresh_folder_list()
+		_refresh_explorer_grid()
+	else:
+		_show_message("Rename", "Could not rename the map.")
+
+
+func _do_rename_map(map_id: String, new_path: String, new_name: String) -> bool:
+	var info = _map_index.get(map_id)
+	if info == null:
+		return false
+	var src_path = str(info.get("path", ""))
+	if src_path == "" or new_path == "":
+		return false
+	
+	var dir = Directory.new()
+	if dir.rename(src_path, new_path) != OK:
+		print("[MapExplorer] Rename failed: %s -> %s" % [src_path, new_path])
+		return false
+	
+	# The map_id is derived from the path, so the entry moves to a new id.
+	var new_id = _generate_map_id(new_path)
+	
+	# Rename the thumbnail to keep the "<map_id>.png" convention.
+	var thumb_file = str(info.get("thumb_file", ""))
+	if thumb_file != "":
+		var src_thumb = THUMB_DIR + thumb_file
+		var f = File.new()
+		if f.file_exists(src_thumb):
+			var new_thumb_file = new_id + ".png"
+			if dir.rename(src_thumb, THUMB_DIR + new_thumb_file) == OK:
+				thumb_file = new_thumb_file
+	
+	# Move the index entry to the new id, keeping all other fields.
+	var new_entry = info.duplicate()
+	new_entry["path"] = new_path
+	new_entry["name"] = new_name
+	new_entry["thumb_file"] = thumb_file
+	_map_index.erase(map_id)
+	_map_index[new_id] = new_entry
+	_save_index()
+	
+	# Migrate the favorite flag (keyed by map_id).
+	if _favorites.has(map_id):
+		_favorites.erase(map_id)
+		_favorites[new_id] = true
+		_save_prefs()
+	
+	print("[MapExplorer] Renamed map: %s -> %s" % [src_path, new_path])
+	return true
+
+
+func _unique_duplicate_path(src_path: String) -> String:
+	var dir_path = src_path.get_base_dir()
+	var ext = "." + src_path.get_extension()  # ".dungeondraft_map"
+	var stem = src_path.get_file()
+	if stem.ends_with(ext):
+		stem = stem.substr(0, stem.length() - ext.length())
+	
+	var f = File.new()
+	# First try "<name> copy", then "<name> copy 2", 3, ...
+	var candidate = dir_path.plus_file(stem + " copy" + ext)
+	if not f.file_exists(candidate):
+		return candidate
+	var i = 2
+	while i < 1000:
+		candidate = dir_path.plus_file("%s copy %d%s" % [stem, i, ext])
+		if not f.file_exists(candidate):
+			return candidate
+		i += 1
+	return ""
+
+
 func _format_date(datetime_str: String) -> String:
 	if datetime_str == "":
 		return ""
@@ -3244,6 +3810,29 @@ func _add_window(dialog: Node) -> void:
 		windows.add_child(dialog)
 	else:
 		_g.World.get_tree().root.add_child(dialog)
+	_register_blocking_window(dialog)
+
+
+# right_click_util polls the raw mouse state every frame, so it does not see
+# Godot consuming a right-click inside one of our windows: without this the
+# click "passes through" and the map context menu (Free Transform, Copy,
+# Favorites...) opens on top of the Map Gallery. Registering the window in the
+# shared registry (Engine meta, read by right_click_util) suppresses that.
+# Written directly through the meta key so this sub-mod needs no reference to
+# right_click_util.
+func _register_blocking_window(node) -> void:
+	if node == null or not (node is Control):
+		return
+	var arr := []
+	if Engine.has_meta(BLOCK_WINDOWS_META):
+		var stored = Engine.get_meta(BLOCK_WINDOWS_META)
+		if stored is Array:
+			arr = stored
+	for wr in arr:
+		if wr is WeakRef and wr.get_ref() == node:
+			return
+	arr.append(weakref(node))
+	Engine.set_meta(BLOCK_WINDOWS_META, arr)
 
 
 func _style_button(btn: Button) -> void:
@@ -3656,6 +4245,14 @@ func _pack_entry_id(pack: Dictionary) -> String:
 
 # ── Packs Window with Edit Mode ──────────────────────────────────────────────
 
+# Fixed-height vertical spacer for VBoxContainers.
+func _make_v_spacer(height: int) -> Control:
+	var spacer = Control.new()
+	spacer.rect_min_size = Vector2(0, height)
+	spacer.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return spacer
+
+
 var _packs_dialog = null
 var _packs_map_path := ""
 var _packs_edit_mode := false
@@ -3681,12 +4278,25 @@ func _show_packs_window(map_path: String, map_name: String, uses_default: bool, 
 	dialog.window_title = "Asset Packs - " + map_name
 	dialog.rect_min_size = Vector2(420, 180)
 	dialog.resizable = true
+	# popup_blur interactions (keep both keys in sync with popup_blur.gd):
+	# - _label_centered stops _center_dialog_label from force-centering and
+	#   vertically expanding packs_label/stats_label (they would eat all the
+	#   extra vertical space instead of the scroll list).
+	# - _up_title_overlay asks popup_blur for the opaque blue title overlay:
+	#   its blur pass makes the panel translucent and its blur rects only
+	#   cover the popup body, which would leave the title bar see-through.
+	dialog.set_meta("_label_centered", true)
+	dialog.set_meta("_up_title_overlay", true)
 	
 	# Add white border to the window
 	var panel_style = StyleBoxFlat.new()
 	panel_style.bg_color = Color(0.15, 0.15, 0.18, 1.0)
 	panel_style.border_color = Color(1.0, 1.0, 1.0, 1.0)
 	panel_style.set_border_width_all(1)
+	# No expand_margin_top on purpose: the border must frame only the popup
+	# body, below the title bar. The title-bar background is provided by
+	# popup_blur's overlay (see _up_title_overlay below) — without popup_blur
+	# the title bar has no background.
 	dialog.add_stylebox_override("panel", panel_style)
 	
 	var main_vbox = VBoxContainer.new()
@@ -3717,18 +4327,23 @@ func _show_packs_window(map_path: String, map_name: String, uses_default: bool, 
 	# Separator
 	main_vbox.add_child(HSeparator.new())
 	
-	# Packs section - reduced vertical margin
+	# Packs section — fixed 25 px breathing space above/below each label
+	main_vbox.add_child(_make_v_spacer(25))
 	var packs_label = Label.new()
 	packs_label.text = "Asset Packs (%d):" % packs.size()
 	packs_label.name = "PacksLabel"
+	packs_label.align = Label.ALIGN_CENTER
 	main_vbox.add_child(packs_label)
+	main_vbox.add_child(_make_v_spacer(25))
 	
 	# Asset count by type (instances placed on the map)
 	var stats_label = Label.new()
 	stats_label.text = _build_type_stats_text()
 	stats_label.autowrap = true
+	stats_label.align = Label.ALIGN_CENTER
 	stats_label.modulate = Color(0.6, 0.7, 0.85, 1.0)
 	main_vbox.add_child(stats_label)
+	main_vbox.add_child(_make_v_spacer(25))
 	main_vbox.add_child(HSeparator.new())
 	
 	# Scroll container for packs list
