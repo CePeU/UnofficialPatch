@@ -1,3 +1,4 @@
+const RG_VERSION = "RG-4"  # + optional layer filter (min_layer) and keep_holes output
 # region_geometry.gd  (library/)
 #
 # Moteur de géométrie partagé : calcule la région fermée (bornée par murs, paths
@@ -50,7 +51,12 @@ func compute_region(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, st
 # Renvoie {outer, holes, cancelled}. `progress` peut être null (pas d'UI/yield).
 # [p_from, p_to] : plage de progression allouée par l'appelant à cette phase
 # (permet une échelle UNIQUE quand l'appelant enchaîne d'autres phases).
-func compute_region_async(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool, progress, p_from := 0.0, p_to := 0.9) -> Dictionary:
+func compute_region_async(mouse_world: Vector2, stop_walls: bool, stop_paths: bool, stop_patterns: bool, progress, p_from := 0.0, p_to := 0.9, min_layer = null, keep_holes := false) -> Dictionary:
+	# min_layer : si non-null, les barrières strictement SOUS ce calque sont
+	# ignorées (usage pattern bucket : ce qui est sous le calque-cible sera
+	# recouvert par le pattern, donc ne doit pas le borner).
+	# keep_holes : si vrai, renvoie outer + holes séparés (sans bridge-cuts) —
+	# l'appelant fait son propre pontage (pattern bucket).
 	var map_rect = _get_map_bounds_polygon()
 	if map_rect.size() < 3:
 		return {"outer": [], "holes": [], "cancelled": false}
@@ -58,7 +64,7 @@ func compute_region_async(mouse_world: Vector2, stop_walls: bool, stop_paths: bo
 	# ~25 % de la plage pour la lecture/offset des barrières, le reste pour
 	# la fenêtre + l'union — la barre progresse dès le début.
 	var p_build_to = p_from + (p_to - p_from) * 0.25
-	var solids = _build_barrier_solids(stop_walls, stop_paths, stop_patterns, progress, tree, p_from, p_build_to)
+	var solids = _build_barrier_solids(stop_walls, stop_paths, stop_patterns, progress, tree, p_from, p_build_to, min_layer)
 	if solids is GDScriptFunctionState:
 		solids = yield(solids, "completed")
 	if solids == null:
@@ -141,6 +147,8 @@ func compute_region_async(mouse_world: Vector2, stop_walls: bool, stop_paths: bo
 			return {"outer": [], "holes": [], "cancelled": true}
 	if out_outer.size() < 3:
 		return {"outer": [], "holes": [], "cancelled": false}
+	if keep_holes:
+		return {"outer": out_outer, "holes": out_holes, "cancelled": false}
 	var final_poly = out_outer
 	if out_holes.size() > 0:
 		final_poly = _eliminate_holes(out_outer, out_holes)
@@ -682,7 +690,7 @@ func _find_hole_bridge(outer: Array, hole: Array, hi: int) -> int:
 # Si `progress` est fourni : publie la lecture des barrières sur [p_from, p_to]
 # et pompe l'UI (yield) — c'était la phase silencieuse responsable du saut
 # initial de la barre. Renvoie null si annulé ; synchrone sans progress.
-func _build_barrier_solids(stop_walls: bool, stop_paths: bool, stop_patterns: bool, progress = null, tree = null, p_from := 0.0, p_to := 0.0):
+func _build_barrier_solids(stop_walls: bool, stop_paths: bool, stop_patterns: bool, progress = null, tree = null, p_from := 0.0, p_to := 0.0, min_layer = null):
 	var solids = []
 	var level = _get_current_level()
 	if level == null: return solids
@@ -691,16 +699,25 @@ func _build_barrier_solids(stop_walls: bool, stop_paths: bool, stop_patterns: bo
 	var walls_node = level.get("Walls") if stop_walls else null
 	if walls_node != null:
 		for child in walls_node.get_children():
-			if is_instance_valid(child):
+			if is_instance_valid(child) and not _is_below_layer(child, min_layer):
 				items.append(["wall", child])
+	# Portails freestanding (WallID == -1) : traités comme des barrières "mur"
+	# (mêmes cases à cocher). Les portails attachés à un mur sont ignorés — la
+	# polyline du mur passe déjà dessus, ils ne créent pas d'ouverture.
+	var portals_node = level.get("Portals") if stop_walls else null
+	if portals_node != null:
+		for child in portals_node.get_children():
+			if is_instance_valid(child) and child.get("WallID") != null and int(child.get("WallID")) == -1 and not _is_below_layer(child, min_layer):
+				items.append(["portal", child])
 	var paths_node = level.get("Pathways") if stop_paths else null
 	if paths_node != null:
 		for child in paths_node.get_children():
-			if is_instance_valid(child):
+			if is_instance_valid(child) and not _is_below_layer(child, min_layer):
 				items.append(["path", child])
 	if stop_patterns:
 		for shape in _get_all_pattern_shapes():
-			items.append(["pattern", shape])
+			if not _is_below_layer(shape, min_layer):
+				items.append(["pattern", shape])
 
 	var total = max(1, items.size())
 	for idx in range(items.size()):
@@ -715,6 +732,10 @@ func _build_barrier_solids(stop_walls: bool, stop_paths: bool, stop_patterns: bo
 				for pp in pts_raw:
 					pts.append(xform.xform(pp))
 				_append_barrier_solids(pts, bool(node.get("Loop")), solids)
+		elif kind == "portal":
+			var seg = _get_freestanding_portal_segment(node)
+			if seg.size() == 2:
+				_append_barrier_solids(seg, false, solids)
 		elif kind == "path":
 			var pts = _get_path_polyline(node)
 			if pts.size() >= 2:
@@ -731,6 +752,34 @@ func _build_barrier_solids(stop_walls: bool, stop_paths: bool, stop_patterns: bo
 
 	return solids
 
+
+
+
+# Le nœud est-il strictement SOUS le calque min_layer ? Faux si min_layer est
+# null ou si le calque du nœud est indéterminable (on garde alors la barrière
+# par sécurité). Lecture du calque alignée sur path_fix : GetLayer() si dispo
+# (PatternShape), sinon _effective_z() (murs/paths — un Pathway n'expose PAS
+# GetLayer, son calque EST son z_index ; il faut sommer les z_index le long de
+# la chaîne parente).
+func _is_below_layer(node, min_layer) -> bool:
+	if min_layer == null: return false
+	if not (node is CanvasItem): return false
+	var l = node.GetLayer() if node.has_method("GetLayer") else _effective_z(node)
+	return int(l) < min_layer
+
+
+# z effectif d'un CanvasItem : somme des z_index le long de la chaîne parente
+# tant que z_as_relative est vrai (modèle DD : sous-conteneurs z_as_relative=true
+# qui héritent du z de la couche). Comparable à PatternShapeTool.ActiveLayer.
+func _effective_z(ci) -> int:
+	var z = 0
+	var n = ci
+	while n != null and n is CanvasItem:
+		z += n.z_index
+		if not n.z_as_relative:
+			break
+		n = n.get_parent()
+	return z
 
 # Simplification Ramer–Douglas–Peucker. Les points lissés (Chaikin) des paths
 # sont quasi colinéaires : les décimer avant l'offset réduit fortement la
@@ -789,25 +838,18 @@ func _strip_to_components(strip, out: Array):
 	var holes = []
 	for poly in strip:
 		if poly.size() < 3: continue
-		if Geometry.is_polygon_clockwise(poly):
-			holes.append(_ensure_ccw(_to_array(poly)))
-		else:
-			outers.append(_to_array(poly))
+		for ring in _split_ring_pinches_fast(_to_array(poly)):
+			if ring.size() < 3 or _polygon_area(ring) < 0.25:
+				continue
+			if Geometry.is_polygon_clockwise(PoolVector2Array(ring)):
+				holes.append(_ensure_ccw(ring))
+			else:
+				outers.append(ring)
 	var comps = []
 	for o in outers:
 		comps.append({"outer": o, "holes": []})
 	for h in holes:
-		var cen = _ring_centroid(h)
-		var best = -1
-		var best_a = INF
-		for ci in range(comps.size()):
-			if not _point_in_polygon(cen, comps[ci].outer): continue
-			var oa = _polygon_area(comps[ci].outer)
-			if oa < best_a:
-				best_a = oa
-				best = ci
-		if best >= 0:
-			comps[best].holes.append(h)
+		_attach_hole_robust(h, comps)
 	for c in comps:
 		out.append(c)
 
@@ -842,6 +884,24 @@ func _append_barrier_solids(pts_in: Array, loop: bool, solids: Array):
 		return
 	var band = Geometry.offset_polyline_2d(pts, BARRIER_THICKNESS, Geometry.JOIN_MITER, Geometry.END_JOINED)
 	_strip_to_components(band, solids)
+
+
+# Segment barrière d'un portail freestanding (porte posée hors mur) : le
+# portail expose GlobalPosition, Direction (unitaire, espace global — même
+# convention que Portal.Begin/End côté C#) et Radius (demi-largeur). Renvoie
+# [] si le nœud n'est pas exploitable.
+func _get_freestanding_portal_segment(portal) -> Array:
+	var radius = portal.get("Radius")
+	if radius == null: return []
+	var r = float(radius)
+	if r <= 0.5: return []
+	var dir = portal.get("Direction")
+	if dir is Vector2 and dir.length() > 0.001:
+		dir = dir.normalized()
+	else:
+		dir = Vector2.RIGHT.rotated(portal.global_rotation)
+	var pos = portal.global_position
+	return [pos - dir * r, pos + dir * r]
 
 
 func _append_solid_quads(pts: Array, closed: bool, solids: Array):
@@ -982,10 +1042,13 @@ func _merge_components(a: Dictionary, b: Dictionary) -> Array:
 	var new_holes = []
 	for p in m:
 		if p.size() < 3: continue
-		if Geometry.is_polygon_clockwise(p):
-			new_holes.append(_ensure_ccw(_to_array(p)))
-		else:
-			outers.append(_to_array(p))
+		for ring in _split_ring_pinches_fast(_to_array(p)):
+			if ring.size() < 3 or _polygon_area(ring) < 0.25:
+				continue
+			if Geometry.is_polygon_clockwise(PoolVector2Array(ring)):
+				new_holes.append(_ensure_ccw(ring))
+			else:
+				outers.append(ring)
 	if outers.size() == 0:
 		return [a]
 	for h in a.holes:
@@ -1009,17 +1072,7 @@ func _merge_components(a: Dictionary, b: Dictionary) -> Array:
 		comps.append({"outer": o, "holes": [], "bb": _aabb(o)})
 	for h in new_holes:
 		if _polygon_area(h) < 0.25: continue
-		var cen = _ring_centroid(h)
-		var best = -1
-		var best_a = INF
-		for ci in range(comps.size()):
-			if not _point_in_polygon(cen, comps[ci].outer): continue
-			var oa = _polygon_area(comps[ci].outer)
-			if oa < best_a:
-				best_a = oa
-				best = ci
-		if best >= 0:
-			comps[best].holes.append(h)
+		_attach_hole_robust(h, comps)
 	return comps
 
 
@@ -1142,3 +1195,67 @@ func _smallest_container_idx(idx: int, pool: Array) -> int:
 	return best
 
 
+
+
+# Attache un trou au comp le plus petit qui le contient. Le test par rayon
+# seul est instable quand la géométrie regorge d'arêtes quasi horizontales
+# (soleil à ~0°/180°) : un raté de parité JETAIT le trou en silence — une
+# poche éclairée se remplissait d'ombre. Échelle : test custom → test natif
+# Godot → rattachement au comp le plus proche (jamais d'abandon muet).
+func _attach_hole_robust(h: Array, comps: Array):
+	if comps.size() == 0 or h.size() < 3:
+		return
+	var cen = _ring_centroid(h)
+	for probe in range(2):
+		var best = -1
+		var best_a = INF
+		for ci in range(comps.size()):
+			var inside = _point_in_polygon(cen, comps[ci].outer) if probe == 0 \
+					else Geometry.is_point_in_polygon(cen, PoolVector2Array(comps[ci].outer))
+			if not inside:
+				continue
+			var oa = _polygon_area(comps[ci].outer)
+			if oa < best_a:
+				best_a = oa
+				best = ci
+		if best >= 0:
+			comps[best].holes.append(h)
+			return
+	var near = -1
+	var near_d = INF
+	for ci in range(comps.size()):
+		for p in comps[ci].outer:
+			var d = cen.distance_squared_to(p)
+			if d < near_d:
+				near_d = d
+				near = ci
+	if near >= 0:
+		comps[near].holes.append(h)
+
+
+# Scinde un anneau à chaque paire de sommets coïncidents (scan par hachage,
+# O(n)). Aux angles de soleil quasi horizontaux, Clipper peut fusionner un
+# outer et son trou tangent en UN SEUL anneau auto-tangent (« en huit ») :
+# classé CCW tel quel, la poche intérieure devient du plein. Scinder aux
+# pincements rend au lobe intérieur son enroulement CW → trou.
+func _split_ring_pinches_fast(pts: Array) -> Array:
+	var n = pts.size()
+	if n < 4:
+		return [pts]
+	var seen = {}
+	for idx in range(n):
+		var key = "%.1f_%.1f" % [pts[idx].x, pts[idx].y]
+		if seen.has(key):
+			var i = seen[key]
+			if idx > i + 1 and not (i == 0 and idx == n - 1) and pts[i].distance_to(pts[idx]) <= 0.03:
+				var r1 = []
+				for k in range(i, idx):
+					r1.append(pts[k])
+				var r2 = []
+				for k in range(idx, n):
+					r2.append(pts[k])
+				for k in range(0, i):
+					r2.append(pts[k])
+				return _split_ring_pinches_fast(r1) + _split_ring_pinches_fast(r2)
+		seen[key] = idx
+	return [pts]

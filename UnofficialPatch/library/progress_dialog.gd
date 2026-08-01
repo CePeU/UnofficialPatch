@@ -24,6 +24,11 @@
 
 var _g
 var cancelled := false
+# Liveness timestamp (ms): updated by start()/pump()/set_progress(). A healthy
+# fill coroutine pumps on every loop iteration, so a long silence on this value
+# while a fill is flagged as running means the coroutine died from a runtime
+# error. The owning mod's watchdog reads this to recover.
+var last_activity := 0
 
 # Seuil (ms) avant affichage de la boîte. En-dessous : aucune UI.
 var threshold_ms := 300
@@ -63,15 +68,17 @@ func start(title: String = "Filling…"):
 	_t_total = -1.0
 	_t_start = OS.get_ticks_msec()
 	_t_last = _t_start
+	last_activity = _t_start
 
 
 # À appeler à chaque itération de la boucle lourde. Renvoie true si l'appelant doit
 # rafraîchir la barre puis yield cette frame (soit parce qu'on vient d'afficher la
 # boîte, soit parce que l'intervalle de rafraîchissement est écoulé).
 func pump() -> bool:
+	last_activity = OS.get_ticks_msec()
 	if cancelled:
 		return false
-	var now = OS.get_ticks_msec()
+	var now = last_activity
 	if not _shown:
 		if now - _t_start < threshold_ms:
 			return false
@@ -86,6 +93,7 @@ func pump() -> bool:
 
 
 func set_progress(frac: float, status: String = ""):
+	last_activity = OS.get_ticks_msec()
 	_target = max(_target, clamp(frac, 0.0, 1.0) * 100.0)
 	if _label != null and is_instance_valid(_label) and status != "":
 		_label.text = status
@@ -131,6 +139,15 @@ func close():
 		var t = _g.Editor.get_tree().create_timer(1.2)
 		t.connect("timeout", self, "_finalize_close")
 		return
+	_finalize_close()
+
+
+# Watchdog escape hatch: tear the window down immediately (no closing
+# animation). Used when the owning fill coroutine died mid-operation and the
+# modal dialog would otherwise stay open forever, freezing the whole UI.
+func force_close():
+	cancelled = true
+	_closing = true
 	_finalize_close()
 
 
