@@ -29,14 +29,18 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Create versioned folder
+        run: mkdir -p UnofficialPatch_${{ needs.check-version.outputs.version }}
+      - name: Copy files recursively
+        run: cp -r UnofficialPatch/. UnofficialPatch_${{ needs.check-version.outputs.version }}/
       - name: Zip Release
-        run: zip -r UnofficialPatch.zip UnofficialPatch
+        run: zip -r UnofficialPatch_${{ needs.check-version.outputs.version }}.zip UnofficialPatch_${{ needs.check-version.outputs.version }}
       - name: Deploy Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ needs.check-version.outputs.version }}
           tag_name: ${{ needs.check-version.outputs.version }}
           prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
-          files: UnofficialPatch.zip
+          files: UnofficialPatch_${{ needs.check-version.outputs.version }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
